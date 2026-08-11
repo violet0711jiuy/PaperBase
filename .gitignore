@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Local storage
+storage/papers/*
+storage/parsed/*
+storage/staging/*
+storage/*.faiss
+storage/*.faiss.manifest.json
+storage/*.faiss.pending.json
+storage/*.db
+storage/*.sqlite3
+
+# Keep folders
+!storage/papers/.gitkeep
+!storage/parsed/.gitkeep
+!storage/staging/.gitkeep
+
+# Evaluation outputs
+eval/results/
+
+# Logs
+*.log
