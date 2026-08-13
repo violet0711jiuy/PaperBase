@@ -54,6 +54,9 @@ class FaissIndexStoreTests(unittest.TestCase):
                 embedding_output_dir=output_dir,
             )
             self.assertEqual(verified.vector_count, 2)
+            # 在线检索仅依赖已发布的 FAISS、manifest 和 SQLite，而非 Step 4 staging 工件。
+            online_verified = store.verify_published_index(database=database)
+            self.assertEqual(online_verified.vector_count, 2)
 
             import faiss
 
@@ -88,6 +91,26 @@ class FaissIndexStoreTests(unittest.TestCase):
                 )
             self.assertEqual(database.vector_index_state().vectorized_chunk_count, 0)
             self.assertFalse(store.index_path.exists())
+
+    def test_bibliography_chunk_is_not_assigned_a_main_faiss_vector(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database, output_dir, store = _prepare_database_artifact_and_store(root)
+            connection = sqlite3.connect(database.path)
+            try:
+                connection.execute(
+                    "UPDATE chunks SET section = 'References', section_type = 'bibliography' "
+                    "WHERE chunk_id = 'paper_test_chunk_0001'"
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            # 工件只含 content chunk，主 FAISS 也只给该 chunk 分配 vector_id。
+            artifact = load_embedding_artifact(output_dir)
+            self.assertEqual(len(artifact.records), 2)
+            with self.assertRaises(FaissIndexError):
+                store.build_initial_index(database=database, embedding_output_dir=output_dir)
 
     def test_recovery_publishes_candidate_after_sqlite_commit(self) -> None:
         """模拟 SQLite 已提交、FAISS 尚未发布的中断，恢复后两侧映射必须一致。"""

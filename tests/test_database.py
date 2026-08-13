@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 import sqlite3
@@ -14,6 +15,31 @@ from paperbase.parsing.base import FrontMatterBlock, ParsedPaper
 
 
 class MetadataDatabaseTests(unittest.TestCase):
+    def test_bibliography_is_preserved_but_excluded_from_main_fts_and_embedding_inputs(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            result = _sample_result(root)
+            bibliography_chunk = replace(
+                result.chunks[1],
+                raw_text="Graph WaveNet is cited here.",
+                embedding_text="Paper title: A test paper\nSection: References\nContent:\nGraph WaveNet is cited here.",
+                section="References",
+                content_kind="body",
+                front_matter_type=None,
+                section_type="bibliography",
+            )
+            result = replace(result, chunks=(result.chunks[0], bibliography_chunk))
+            database = MetadataDatabase(root / "paperbase.sqlite3")
+            database.import_chunking_result(result)
+
+            stored = database.list_chunks(bibliography_chunk.paper_id)
+            self.assertEqual(stored[1]["section_type"], "bibliography")
+            self.assertEqual(database.search_bm25("Graph WaveNet", top_k=5), ())
+            self.assertEqual(len(database.search_bibliography("Graph WaveNet", top_k=5)), 1)
+            self.assertEqual(
+                [row["chunk_id"] for row in database.list_embedding_inputs()],
+                [result.chunks[0].chunk_id],
+            )
     """验证 SQLite 不重复导入、外键关联和失败时原子回滚。"""
 
     def test_import_persists_document_and_typed_retrievable_chunks(self) -> None:
@@ -50,6 +76,17 @@ class MetadataDatabaseTests(unittest.TestCase):
             self.assertEqual(chunks[1]["prev_chunk_id"], chunks[0]["chunk_id"])
             self.assertIsNone(chunks[0]["vector_id"])
             self.assertEqual(chunks[0]["content_kind"], "front_matter")
+            # FTS5 只是一份可重建倒排索引；标题、section、raw_text 均可参与 BM25。
+            bm25_rows = database.search_bm25("First original chunk", top_k=5)
+            self.assertEqual([row["chunk_id"] for row in bm25_rows], [chunks[0]["chunk_id"]])
+            # 英文关键词组是一条 OR 型 BM25 查询；两个词分别命中不同 chunk 时都应进入候选。
+            keyword_group_rows = database.search_bm25_keyword_group(
+                ["First", "Second"], top_k=5
+            )
+            self.assertEqual(
+                {row["chunk_id"] for row in keyword_group_rows},
+                {chunks[0]["chunk_id"], chunks[1]["chunk_id"]},
+            )
             embedding_inputs = database.list_embedding_inputs()
             self.assertEqual(
                 [row["chunk_id"] for row in embedding_inputs],
@@ -154,7 +191,10 @@ class MetadataDatabaseTests(unittest.TestCase):
                 connection.executescript(
                     """
                     CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                    CREATE TABLE documents (paper_id TEXT PRIMARY KEY);
+                    CREATE TABLE documents (
+                        paper_id TEXT PRIMARY KEY,
+                        paper_title TEXT
+                    );
                     CREATE TABLE front_matter (
                         front_matter_id INTEGER PRIMARY KEY,
                         paper_id TEXT NOT NULL,
@@ -188,7 +228,9 @@ class MetadataDatabaseTests(unittest.TestCase):
                 connection.execute(
                     "INSERT INTO schema_info(key, value) VALUES('schema_version', '1')"
                 )
-                connection.execute("INSERT INTO documents(paper_id) VALUES('paper_legacy')")
+                connection.execute(
+                    "INSERT INTO documents(paper_id, paper_title) VALUES('paper_legacy', 'Legacy paper')"
+                )
                 connection.execute(
                     """
                     INSERT INTO front_matter (
@@ -257,8 +299,9 @@ class MetadataDatabaseTests(unittest.TestCase):
                 }
             finally:
                 connection.close()
-            self.assertEqual(version, "2")
+            self.assertEqual(version, "4")
             self.assertNotIn("front_matter", table_names)
+            self.assertIn("chunks_fts", table_names)
 
 
 def _sample_result(

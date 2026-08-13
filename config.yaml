@@ -112,3 +112,34 @@ indexing:
   backend: faiss_flat_ip
   index_path: storage/paperbase.faiss
   manifest_path: storage/paperbase.faiss.manifest.json
+
+# Step 6：LLM Query 改写 + Dense + SQLite FTS5/BM25 的混合召回。LLM 的 Token、
+# API 地址与模型名只放在 .env；这里仅保存可公开、可实验的检索策略参数。
+retrieval:
+  backend: hybrid_rrf
+  dense_top_k_per_query: 20
+  bm25_original_top_k: 10
+  bm25_rewrite_top_k: 20
+  fused_top_k: 40
+  rrf_k: 60
+
+  # RRF 不直接比较 FAISS 与 BM25 的原始数值，而是按排名融合。英文关键词组只构成一条
+  # Rewritten BM25 路径，因此不会因关键词数量增加而放大权重。
+  dense_original_weight: 1.0
+  dense_rewrite_weight: 1.0
+  bm25_original_weight: 0.7
+  bm25_rewrite_weight: 1.0
+
+  # Qwen Query 侧的任务提示，不发送给生成 LLM，也不加入文档 embedding。
+  query_instruction: >
+    Given a Chinese or English academic question, retrieve relevant passages
+    from a collection of scientific papers that answer the question.
+
+  query_rewrite:
+    enabled: true
+    max_lexical_keywords_en: 3
+    # 仅传入最近几条检索相关历史，用于消解“这个”“它”等追问指代。
+    max_context_turns: 4
+    # 明确询问引用/参考文献时，额外返回的 bibliography FTS5 候选数。
+    bibliography_top_k: 5
+    fallback_to_original: true

@@ -83,6 +83,7 @@ class FaissIndexStore:
         *,
         database: MetadataDatabase,
         embedding_output_dir: Path,
+        replace_existing: bool = False,
     ) -> IndexBuildSummary:
         """将已验证的 Step 4 工件写为第一次正式全库 FAISS 索引。
 
@@ -115,7 +116,7 @@ class FaissIndexStore:
             )
         if state.total_chunk_count == 0:
             raise FaissIndexError("Cannot build a FAISS index without SQLite chunks.")
-        if self._index_path.exists() or self._manifest_path.exists():
+        if (self._index_path.exists() or self._manifest_path.exists()) and not replace_existing:
             raise FaissIndexError(
                 "A FAISS index or manifest already exists while SQLite has no vector IDs. "
                 "Refusing to overwrite an unverified file."
@@ -301,6 +302,61 @@ class FaissIndexStore:
             recovered_pending_publish=False,
         )
 
+    def verify_published_index(self, *, database: MetadataDatabase) -> IndexBuildSummary:
+        """只依赖正式 FAISS 与 SQLite 验证线上检索映射，不读取 Step 4 staging 工件。
+
+        正式问答不能依赖 ``vectors.npy`` 或 ``records.jsonl``。SQLite 仍保存当前完整的
+        ``embedding_text``，因此可重新计算 assignment 指纹，证明 manifest、FAISS ID 集合与
+        当前业务数据来自同一版本。
+        """
+        if not self._index_path.is_file() or not self._manifest_path.is_file():
+            raise FaissIndexError("FAISS index or manifest is missing.")
+        state = database.vector_index_state()
+        if state.total_chunk_count == 0 or state.vectorized_chunk_count != state.total_chunk_count:
+            raise FaissIndexError(
+                "Published FAISS verification requires every current SQLite chunk to have vector_id."
+            )
+        assignments = tuple(
+            VectorAssignment(
+                chunk_id=str(row["chunk_id"]),
+                vector_id=int(row["vector_id"]),
+                embedding_text_sha256=hashlib.sha256(
+                    str(row["embedding_text"]).encode("utf-8")
+                ).hexdigest(),
+            )
+            for row in database.vector_id_assignments()
+        )
+        _validate_assignments(assignments)
+        manifest = _load_manifest(self._manifest_path)
+        dimension = int(manifest.get("dimension", 0))
+        if dimension < 1:
+            raise FaissIndexError("FAISS manifest has an invalid dimension.")
+        _validate_manifest(
+            manifest=manifest,
+            assignments=assignments,
+            dimension=dimension,
+            index_path=self._index_path,
+        )
+        _validate_index_file(
+            index_path=self._index_path,
+            expected_dimension=dimension,
+            expected_vector_ids={assignment.vector_id for assignment in assignments},
+        )
+        return IndexBuildSummary(
+            vector_count=len(assignments),
+            dimension=dimension,
+            vector_id_min=min(assignment.vector_id for assignment in assignments),
+            vector_id_max=max(assignment.vector_id for assignment in assignments),
+            index_path=self._index_path,
+            manifest_path=self._manifest_path,
+            recovered_pending_publish=False,
+        )
+
+    def load_for_search(self, *, database: MetadataDatabase) -> Any:
+        """验证正式映射后加载 FAISS 索引；调用方无需接触 staging 工件。"""
+        self.verify_published_index(database=database)
+        return _read_faiss_index(self._index_path)
+
     def _publish_from_journal(
         self,
         *,
@@ -469,8 +525,7 @@ def _index_file_matches(
     try:
         faiss = _import_faiss()
         # 同写入路径一样，避免调用 FAISS 的 Windows 路径 API，以支持含中文的用户目录。
-        serialized_index = np.frombuffer(index_path.read_bytes(), dtype=np.uint8)
-        index = faiss.deserialize_index(serialized_index)
+        index = _read_faiss_index(index_path)
         stored_ids = faiss.vector_to_array(index.id_map)
     except Exception:
         return False
@@ -480,6 +535,13 @@ def _index_file_matches(
         and len(stored_ids) == len(expected_vector_ids)
         and {int(vector_id) for vector_id in stored_ids} == expected_vector_ids
     )
+
+
+def _read_faiss_index(index_path: Path) -> Any:
+    """通过 Python 文件 I/O 读取标准 FAISS 二进制，避开 Windows 非 ASCII 路径限制。"""
+    faiss = _import_faiss()
+    serialized_index = np.frombuffer(index_path.read_bytes(), dtype=np.uint8)
+    return faiss.deserialize_index(serialized_index)
 
 
 def _validate_manifest(

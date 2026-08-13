@@ -166,6 +166,43 @@ class IndexingSettings(BaseModel):
         return _resolve_path(value, info)
 
 
+class QueryRewriteSettings(BaseModel):
+    """LLM Query 改写的边界参数；密钥与模型地址仍只从 ``.env`` 读取。
+
+    一次 LLM 调用只产生一条语义改写问题和一组英文关键词；关键词组会作为一条
+    Rewritten BM25 路径执行，而非拆成多条独立 BM25 路径。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    max_lexical_keywords_en: int = Field(default=3, ge=1, le=5)
+    # 只保留近期检索对话，避免较早历史覆盖当前用户问题；0 表示禁用历史上下文。
+    max_context_turns: int = Field(default=4, ge=0, le=16)
+    # 引用意图命中后，bibliography FTS5 最多提供的辅助候选数；不参与主 FAISS。
+    bibliography_top_k: int = Field(default=5, ge=1, le=20)
+    fallback_to_original: bool = True
+
+
+class RetrievalSettings(BaseModel):
+    """Step 6 混合召回与 RRF 融合的全部非敏感、可调参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: str = Field(min_length=1)
+    dense_top_k_per_query: int = Field(default=20, ge=1, le=200)
+    bm25_original_top_k: int = Field(default=10, ge=1, le=200)
+    bm25_rewrite_top_k: int = Field(default=20, ge=1, le=200)
+    fused_top_k: int = Field(default=40, ge=1, le=500)
+    rrf_k: int = Field(default=60, ge=1, le=1_000)
+    dense_original_weight: float = Field(default=1.0, gt=0, le=10)
+    dense_rewrite_weight: float = Field(default=1.0, gt=0, le=10)
+    bm25_original_weight: float = Field(default=0.7, gt=0, le=10)
+    bm25_rewrite_weight: float = Field(default=1.0, gt=0, le=10)
+    query_instruction: str = Field(min_length=20, max_length=1_000)
+    query_rewrite: QueryRewriteSettings = Field(default_factory=QueryRewriteSettings)
+
+
 class AppSettings(BaseModel):
     """PaperBase 当前阶段的完整、解析器无关配置根对象。"""
 
@@ -178,6 +215,7 @@ class AppSettings(BaseModel):
     database: DatabaseSettings
     embedding: EmbeddingSettings
     indexing: IndexingSettings
+    retrieval: RetrievalSettings
 
     # 配置文件路径不是用户在 YAML 中填写的业务参数，因此作为 Pydantic 私有属性保存。
     _config_path: Path = PrivateAttr()

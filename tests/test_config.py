@@ -33,6 +33,11 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(settings.embedding.normalize_embeddings)
         self.assertEqual(settings.indexing.backend, "faiss_flat_ip")
         self.assertEqual(settings.indexing.index_path.name, "paperbase.faiss")
+        self.assertEqual(settings.retrieval.backend, "hybrid_rrf")
+        self.assertEqual(settings.retrieval.dense_top_k_per_query, 20)
+        self.assertEqual(settings.retrieval.bm25_original_top_k, 10)
+        self.assertEqual(settings.retrieval.bm25_rewrite_top_k, 20)
+        self.assertTrue(settings.retrieval.query_rewrite.enabled)
         self.assertEqual(
             settings.database.path,
             project_root / "storage" / "paperbase.sqlite3",

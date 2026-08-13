@@ -94,6 +94,9 @@ class DoclingHybridPaperChunker(PaperChunker):
                 page_end=page_end,
                 front_matter_blocks=parsed_paper.front_matter,
             )
+            # 基于 Docling 已恢复的标题层级分类，而非在段落正文中搜索 “references”。
+            # 因此 “Related Work” 即使讨论引用，也仍然是正文 content。
+            section_type = _section_type_from_headings(docling_chunk.meta.headings)
             draft_chunks.append(
                 _DraftChunk(
                     raw_text=raw_text,
@@ -105,6 +108,7 @@ class DoclingHybridPaperChunker(PaperChunker):
                     embedding_token_count=self._tokenizer.count_tokens(embedding_text),
                     content_kind=("front_matter" if front_matter_type else "body"),
                     front_matter_type=front_matter_type,
+                    section_type=section_type,
                 )
             )
 
@@ -165,6 +169,7 @@ class _DraftChunk:
     embedding_token_count: int
     content_kind: str
     front_matter_type: str | None
+    section_type: str
 
 
 def _require_docling_document(parsed_paper: ParsedPaper) -> DoclingDocument:
@@ -221,6 +226,7 @@ def _to_paper_chunk(
         next_chunk_id=next_id,
         content_kind=draft.content_kind,
         front_matter_type=draft.front_matter_type,
+        section_type=draft.section_type,
     )
 
 
@@ -230,6 +236,28 @@ def _section_from_headings(headings: list[str] | None) -> str | None:
         _normalize_whitespace(heading) for heading in (headings or []) if heading.strip()
     ]
     return " > ".join(normalized_headings) if normalized_headings else None
+
+
+def _section_type_from_headings(headings: list[str] | None) -> str:
+    """依据 Docling 标题树的末级标题识别参考文献章节。
+
+    仅接受受控章节标题及其可选编号，例如 ``6. References``；不会在正文、图注或
+    ``Related Work`` 中搜索单词，避免把讨论既有工作的正文误判为 bibliography。
+    """
+    if not headings:
+        return "content"
+    heading = _normalize_whitespace(headings[-1])
+    # 删除章节编号、罗马数字或括号编号，保留真正的标题语义。
+    leaf = re.sub(
+        r"^(?:\d+(?:\.\d+)*(?:[.)]|\s+)|[IVXLC]+(?:[.)]|\s+))",
+        "",
+        heading,
+        flags=re.IGNORECASE,
+    )
+    normalized = _normalize_whitespace(leaf).casefold().rstrip(":")
+    if normalized in {"references", "bibliography", "works cited", "literature cited"}:
+        return "bibliography"
+    return "content"
 
 
 def _front_matter_type_for_chunk(

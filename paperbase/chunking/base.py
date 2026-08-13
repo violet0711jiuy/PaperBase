@@ -42,6 +42,8 @@ class PaperChunk:
     # 以便后续统一分配 vector_id 并通过 FAISS 回查，不再维护一份重复的 metadata 正文。
     content_kind: str = "body"
     front_matter_type: str | None = None
+    # 章节语义：content 可作为正文问答证据；bibliography 仅用于引用/参考文献查询。
+    section_type: str = "content"
 
 
 @dataclass(frozen=True)

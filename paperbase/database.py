@@ -26,7 +26,7 @@ from paperbase.parsing.factory import create_parser
 
 # 版本表用于未来的显式迁移。不要只靠 ``CREATE TABLE IF NOT EXISTS`` 猜测 schema
 # 是否兼容：一旦结构变化，必须提供可审计迁移，而不是静默让旧库以未知状态继续运行。
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 4
 
 _SCHEMA_INFO_SQL = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     section TEXT,
     content_kind TEXT NOT NULL,
     front_matter_type TEXT,
+    section_type TEXT NOT NULL DEFAULT 'content',
     page_start INTEGER,
     page_end INTEGER,
     raw_token_count INTEGER NOT NULL,
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     CHECK (length(trim(raw_text)) > 0),
     CHECK (length(trim(embedding_text)) > 0),
     CHECK (content_kind IN ('body', 'front_matter')),
+    CHECK (section_type IN ('content', 'bibliography')),
     CHECK (
         (content_kind = 'body' AND front_matter_type IS NULL)
         OR (content_kind = 'front_matter' AND front_matter_type IS NOT NULL)
@@ -92,6 +94,108 @@ CREATE INDEX IF NOT EXISTS idx_chunks_front_matter
     ON chunks(paper_id, content_kind, front_matter_type, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_chunks_vector_id
     ON chunks(vector_id);
+"""
+
+# FTS5 是派生检索索引，不是第二份业务真相：正式原文与元数据仍只以 chunks 表为准。
+# 索引文本被 SQLite 保存是 FTS5 提供倒排检索的实现需要，和 FAISS 保存向量的性质相同。
+_SCHEMA_V3_SQL = _SCHEMA_V2_SQL.replace(
+    "    section_type TEXT NOT NULL DEFAULT 'content',\n", ""
+) + """
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    chunk_id UNINDEXED,
+    paper_title,
+    section,
+    raw_text,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_after_insert
+AFTER INSERT ON chunks
+BEGIN
+    INSERT INTO chunks_fts (chunk_id, paper_title, section, raw_text)
+    VALUES (
+        NEW.chunk_id,
+        COALESCE((SELECT paper_title FROM documents WHERE paper_id = NEW.paper_id), ''),
+        COALESCE(NEW.section, ''),
+        NEW.raw_text
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_after_delete
+AFTER DELETE ON chunks
+BEGIN
+    DELETE FROM chunks_fts WHERE chunk_id = OLD.chunk_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_after_searchable_update
+AFTER UPDATE OF paper_id, section, raw_text ON chunks
+BEGIN
+    DELETE FROM chunks_fts WHERE chunk_id = OLD.chunk_id;
+    INSERT INTO chunks_fts (chunk_id, paper_title, section, raw_text)
+    VALUES (
+        NEW.chunk_id,
+        COALESCE((SELECT paper_title FROM documents WHERE paper_id = NEW.paper_id), ''),
+        COALESCE(NEW.section, ''),
+        NEW.raw_text
+    );
+END;
+"""
+
+
+# V4 将正文和参考文献拆成两个派生 FTS5 索引。chunks 仍是唯一业务事实源：
+# content 主索引服务普通问答，bibliography 索引只在明确 citation/reference intent 时查询。
+_SCHEMA_V4_SQL = _SCHEMA_V2_SQL + """
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    chunk_id UNINDEXED,
+    paper_title,
+    section,
+    raw_text,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS bibliography_fts USING fts5(
+    chunk_id UNINDEXED,
+    paper_title,
+    section,
+    raw_text,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_after_insert
+AFTER INSERT ON chunks WHEN NEW.section_type = 'content'
+BEGIN
+    INSERT INTO chunks_fts (chunk_id, paper_title, section, raw_text)
+    VALUES (NEW.chunk_id, COALESCE((SELECT paper_title FROM documents WHERE paper_id = NEW.paper_id), ''), COALESCE(NEW.section, ''), NEW.raw_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS bibliography_fts_after_insert
+AFTER INSERT ON chunks WHEN NEW.section_type = 'bibliography'
+BEGIN
+    INSERT INTO bibliography_fts (chunk_id, paper_title, section, raw_text)
+    VALUES (NEW.chunk_id, COALESCE((SELECT paper_title FROM documents WHERE paper_id = NEW.paper_id), ''), COALESCE(NEW.section, ''), NEW.raw_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_after_delete
+AFTER DELETE ON chunks
+BEGIN
+    DELETE FROM chunks_fts WHERE chunk_id = OLD.chunk_id;
+    DELETE FROM bibliography_fts WHERE chunk_id = OLD.chunk_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS chunks_fts_after_searchable_update
+AFTER UPDATE OF paper_id, section, raw_text, section_type ON chunks
+BEGIN
+    DELETE FROM chunks_fts WHERE chunk_id = OLD.chunk_id;
+    DELETE FROM bibliography_fts WHERE chunk_id = OLD.chunk_id;
+    INSERT INTO chunks_fts (chunk_id, paper_title, section, raw_text)
+    SELECT NEW.chunk_id, COALESCE((SELECT paper_title FROM documents WHERE paper_id = NEW.paper_id), ''), COALESCE(NEW.section, ''), NEW.raw_text
+    WHERE NEW.section_type = 'content';
+    INSERT INTO bibliography_fts (chunk_id, paper_title, section, raw_text)
+    SELECT NEW.chunk_id, COALESCE((SELECT paper_title FROM documents WHERE paper_id = NEW.paper_id), ''), COALESCE(NEW.section, ''), NEW.raw_text
+    WHERE NEW.section_type = 'bibliography';
+END;
 """
 
 
@@ -140,14 +244,14 @@ class MetadataDatabase:
         """创建 schema，或验证既有数据库版本与当前代码兼容。"""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            # 先只创建版本表，不能一上来执行 V2 的 ``CREATE TABLE IF NOT EXISTS``：
+            # 先只创建版本表，不能一上来执行 V3 的 ``CREATE TABLE IF NOT EXISTS``：
             # 对于 V1 的 chunks 表，它不会自动补齐新列，反而会掩盖需要迁移的事实。
             connection.executescript(_SCHEMA_INFO_SQL)
             stored_version = connection.execute(
                 "SELECT value FROM schema_info WHERE key = 'schema_version'"
             ).fetchone()
             if stored_version is None:
-                connection.executescript(_SCHEMA_V2_SQL)
+                connection.executescript(_SCHEMA_V4_SQL)
                 connection.execute(
                     "INSERT INTO schema_info(key, value) VALUES('schema_version', ?)",
                     (str(_SCHEMA_VERSION),),
@@ -157,12 +261,26 @@ class MetadataDatabase:
                 _migrate_v1_to_v2(connection)
                 connection.execute(
                     "UPDATE schema_info SET value = ? WHERE key = 'schema_version'",
+                    ("2",),
+                )
+                stored_version = {"value": "2"}
+            if stored_version["value"] == "2":
+                _migrate_v2_to_v3(connection)
+                connection.execute(
+                    "UPDATE schema_info SET value = ? WHERE key = 'schema_version'",
+                    ("3",),
+                )
+                stored_version = {"value": "3"}
+            if stored_version["value"] == "3":
+                _migrate_v3_to_v4(connection)
+                connection.execute(
+                    "UPDATE schema_info SET value = ? WHERE key = 'schema_version'",
                     (str(_SCHEMA_VERSION),),
                 )
                 return
             if stored_version["value"] == str(_SCHEMA_VERSION):
-                # 为已是 V2 的数据库补齐可安全重复创建的索引，便于从早期开发版本恢复。
-                connection.executescript(_SCHEMA_V2_SQL)
+                # 为已是 V3 的数据库补齐可安全重复创建的索引与 FTS trigger，便于恢复。
+                connection.executescript(_SCHEMA_V4_SQL)
                 return
             if stored_version["value"] != str(_SCHEMA_VERSION):
                 raise MetadataDatabaseError(
@@ -233,10 +351,10 @@ class MetadataDatabase:
                 """
                 INSERT INTO chunks (
                     chunk_id, vector_id, paper_id, chunk_index,
-                    raw_text, embedding_text, section, content_kind, front_matter_type,
+                    raw_text, embedding_text, section, content_kind, front_matter_type, section_type,
                     page_start, page_end,
                     raw_token_count, embedding_token_count, prev_chunk_id, next_chunk_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (_chunk_row(chunk) for chunk in result.chunks),
             )
@@ -314,6 +432,7 @@ class MetadataDatabase:
                     """
                     SELECT chunk_id, paper_id, chunk_index, embedding_text
                     FROM chunks
+                    WHERE section_type = 'content'
                     ORDER BY paper_id, chunk_index
                     """
                 ).fetchall()
@@ -333,6 +452,7 @@ class MetadataDatabase:
                        MIN(vector_id) AS min_vector_id,
                        MAX(vector_id) AS max_vector_id
                 FROM chunks
+                WHERE section_type = 'content'
                 """
             ).fetchone()
         return VectorIndexState(
@@ -380,7 +500,8 @@ class MetadataDatabase:
         self.initialize()
         with self._connect() as connection:
             existing_vectorized = connection.execute(
-                "SELECT COUNT(*) AS count FROM chunks WHERE vector_id IS NOT NULL"
+                "SELECT COUNT(*) AS count FROM chunks WHERE vector_id IS NOT NULL "
+                "AND section_type = 'content'"
             ).fetchone()["count"]
             if existing_vectorized:
                 raise MetadataDatabaseError(
@@ -395,7 +516,8 @@ class MetadataDatabase:
                 ((vector_id, chunk_id) for chunk_id, vector_id, _ in assignments),
             )
             updated_count = connection.execute(
-                "SELECT COUNT(*) AS count FROM chunks WHERE vector_id IS NOT NULL"
+                "SELECT COUNT(*) AS count FROM chunks WHERE vector_id IS NOT NULL "
+                "AND section_type = 'content'"
             ).fetchone()["count"]
             if updated_count != len(assignments):
                 raise MetadataDatabaseError(
@@ -411,9 +533,193 @@ class MetadataDatabase:
                     """
                     SELECT vector_id, chunk_id
                     FROM chunks
-                    WHERE vector_id IS NOT NULL
+                    WHERE vector_id IS NOT NULL AND section_type = 'content'
                     ORDER BY vector_id
                     """
+                ).fetchall()
+            )
+
+    def vector_id_assignments(self) -> tuple[sqlite3.Row, ...]:
+        """返回正式索引验证所需的 ``vector_id、chunk_id、embedding_text`` 快照。"""
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT vector_id, chunk_id, embedding_text
+                    FROM chunks
+                    WHERE vector_id IS NOT NULL AND section_type = 'content'
+                    ORDER BY vector_id
+                    """
+                ).fetchall()
+            )
+
+    def reset_vector_ids_for_rebuild(self) -> int:
+        """显式清空派生向量映射，为规则变更后的完整 Step 4/5 重建做准备。
+
+        不删除 documents、chunks、原始 PDF 或任一 FTS5 索引。旧 FAISS 文件会暂时失效，
+        调用方必须重新生成正文 embedding 并发布新索引，防止旧 References 向量继续参与召回。
+        """
+        self.initialize()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM chunks WHERE vector_id IS NOT NULL"
+            ).fetchone()
+            connection.execute("UPDATE chunks SET vector_id = NULL WHERE vector_id IS NOT NULL")
+        return int(row["count"])
+
+    def search_bm25(self, query: str, *, top_k: int) -> tuple[sqlite3.Row, ...]:
+        """使用 SQLite FTS5 对论文标题、章节和 chunk 原文执行词法召回。
+
+        ``query`` 被转成一个字面短语，而非直接拼接到 FTS5 语法中。这样用户问题中的括号、
+        连字符、引号与公式符号不会变成 SQLite 查询运算符；中文连续文本也能作为相邻词元
+        短语参与匹配。返回的 ``bm25_score`` 数值仅用于调试，跨通道融合必须使用排名而非它。
+        """
+        normalized_query = " ".join(query.split())
+        if not normalized_query:
+            raise MetadataDatabaseError("BM25 query must not be empty.")
+        if top_k < 1:
+            raise MetadataDatabaseError("BM25 top_k must be positive.")
+        fts_query = _fts5_literal_phrase(normalized_query)
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT
+                        chunks.*,
+                        documents.paper_title AS paper_title,
+                        bm25(chunks_fts, 1.2, 0.8, 1.0) AS bm25_score
+                    FROM chunks_fts
+                    JOIN chunks ON chunks.chunk_id = chunks_fts.chunk_id
+                    JOIN documents ON documents.paper_id = chunks.paper_id
+                    WHERE chunks_fts MATCH ? AND chunks.section_type = 'content'
+                    ORDER BY bm25_score ASC, chunks.chunk_id ASC
+                    LIMIT ?
+                    """,
+                    (fts_query, top_k),
+                ).fetchall()
+            )
+
+    def search_bm25_keyword_group(
+        self,
+        keywords: Sequence[str],
+        *,
+        top_k: int,
+    ) -> tuple[sqlite3.Row, ...]:
+        """用一组英文关键词执行**一条** BM25 查询，并以 OR 保留任一术语的候选。
+
+        关键词组逻辑上是单条 ``rewritten_bm25`` 路径，不能拆成多次检索再在 RRF 中
+        重复加分。SQL 中使用的是安全编译后的 FTS5 表达式，例如
+        ``"LSTM" OR "wind speed prediction" OR "author"``：多词术语会作为短语匹配，
+        任一术语命中即可进入候选，后续由 BM25 排名和 RRF 融合决定优先级。
+        """
+        normalized_keywords = tuple(
+            dict.fromkeys(" ".join(keyword.split()) for keyword in keywords if keyword.strip())
+        )
+        if not normalized_keywords:
+            return ()
+        if top_k < 1:
+            raise MetadataDatabaseError("BM25 top_k must be positive.")
+        fts_query = " OR ".join(_fts5_literal_phrase(keyword) for keyword in normalized_keywords)
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT
+                        chunks.*,
+                        documents.paper_title AS paper_title,
+                        bm25(chunks_fts, 1.2, 0.8, 1.0) AS bm25_score
+                    FROM chunks_fts
+                    JOIN chunks ON chunks.chunk_id = chunks_fts.chunk_id
+                    JOIN documents ON documents.paper_id = chunks.paper_id
+                    WHERE chunks_fts MATCH ? AND chunks.section_type = 'content'
+                    ORDER BY bm25_score ASC, chunks.chunk_id ASC
+                    LIMIT ?
+                    """,
+                    (fts_query, top_k),
+                ).fetchall()
+            )
+
+    def chunks_by_vector_ids(self, vector_ids: Sequence[int]) -> tuple[sqlite3.Row, ...]:
+        """按 FAISS 返回的 vector_id 批量回查完整 chunk 证据，不假设 SQLite 返回顺序。"""
+        unique_ids = tuple(dict.fromkeys(vector_ids))
+        if not unique_ids:
+            return ()
+        if any(vector_id < 1 for vector_id in unique_ids):
+            raise MetadataDatabaseError("FAISS vector IDs must be positive integers.")
+        placeholders = ", ".join("?" for _ in unique_ids)
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    f"""
+                    SELECT chunks.*, documents.paper_title AS paper_title
+                    FROM chunks
+                    JOIN documents ON documents.paper_id = chunks.paper_id
+                    WHERE chunks.vector_id IN ({placeholders})
+                      AND chunks.section_type = 'content'
+                    """,
+                    unique_ids,
+                ).fetchall()
+            )
+
+    def search_bibliography(self, query: str, *, top_k: int) -> tuple[sqlite3.Row, ...]:
+        """仅在 Query Rewrite 判断为 citation/reference intent 时检索参考文献 FTS5。"""
+        normalized_query = " ".join(query.split())
+        if not normalized_query:
+            raise MetadataDatabaseError("Bibliography query must not be empty.")
+        if top_k < 1:
+            raise MetadataDatabaseError("Bibliography top_k must be positive.")
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT chunks.*, documents.paper_title AS paper_title,
+                           bm25(bibliography_fts, 1.2, 0.8, 1.0) AS bm25_score
+                    FROM bibliography_fts
+                    JOIN chunks ON chunks.chunk_id = bibliography_fts.chunk_id
+                    JOIN documents ON documents.paper_id = chunks.paper_id
+                    WHERE bibliography_fts MATCH ? AND chunks.section_type = 'bibliography'
+                    ORDER BY bm25_score ASC, chunks.chunk_id ASC
+                    LIMIT ?
+                    """,
+                    (_fts5_literal_phrase(normalized_query), top_k),
+                ).fetchall()
+            )
+
+    def search_bibliography_keyword_group(
+        self,
+        keywords: Sequence[str],
+        *,
+        top_k: int,
+    ) -> tuple[sqlite3.Row, ...]:
+        """以一个英文关键词组查询 bibliography FTS5，通常比完整自然语言问句更适合引用条目。"""
+        normalized = tuple(
+            dict.fromkeys(" ".join(keyword.split()) for keyword in keywords if keyword.strip())
+        )
+        if not normalized:
+            return ()
+        if top_k < 1:
+            raise MetadataDatabaseError("Bibliography top_k must be positive.")
+        fts_query = " OR ".join(_fts5_literal_phrase(keyword) for keyword in normalized)
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT chunks.*, documents.paper_title AS paper_title,
+                           bm25(bibliography_fts, 1.2, 0.8, 1.0) AS bm25_score
+                    FROM bibliography_fts
+                    JOIN chunks ON chunks.chunk_id = bibliography_fts.chunk_id
+                    JOIN documents ON documents.paper_id = chunks.paper_id
+                    WHERE bibliography_fts MATCH ? AND chunks.section_type = 'bibliography'
+                    ORDER BY bm25_score ASC, chunks.chunk_id ASC
+                    LIMIT ?
+                    """,
+                    (fts_query, top_k),
                 ).fetchall()
             )
 
@@ -445,8 +751,9 @@ def _validate_embedding_records_in_connection(
     if len(set(record_ids)) != len(record_ids):
         raise MetadataDatabaseError("Embedding artifact contains duplicate chunk_id records.")
 
+    # Step 4 工件只覆盖正文 content；bibliography 仍留在 SQLite/FTS5，但不参与主 FAISS。
     database_rows = connection.execute(
-        "SELECT chunk_id, embedding_text FROM chunks"
+        "SELECT chunk_id, embedding_text FROM chunks WHERE section_type = 'content'"
     ).fetchall()
     database_text_by_chunk_id = {
         row["chunk_id"]: row["embedding_text"] for row in database_rows
@@ -464,6 +771,91 @@ def _validate_embedding_records_in_connection(
                 "Embedding artifact is stale because embedding_text changed for "
                 f"{chunk_id}."
             )
+
+
+def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+    """为既有 chunks 建立 FTS5/BM25 派生索引，并一次性回填当前全部记录。"""
+    connection.executescript(_SCHEMA_V3_SQL)
+    # 旧 V2 库此前没有 trigger，因此先清空再从 documents/chunks 的正式真相重建。
+    # 该函数运行在 initialize 的同一个事务中，任何失败都会保留迁移前的 V2 数据库。
+    connection.execute("DELETE FROM chunks_fts")
+    connection.execute(
+        """
+        INSERT INTO chunks_fts (chunk_id, paper_title, section, raw_text)
+        SELECT chunks.chunk_id,
+               COALESCE(documents.paper_title, ''),
+               COALESCE(chunks.section, ''),
+               chunks.raw_text
+        FROM chunks
+        JOIN documents ON documents.paper_id = chunks.paper_id
+        ORDER BY chunks.paper_id, chunks.chunk_index
+        """
+    )
+
+
+def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+    """把既有 V3 chunks 分类后重建两个派生 FTS5 索引，不删除原始 PDF 或 chunks。"""
+    connection.execute(
+        "ALTER TABLE chunks ADD COLUMN section_type TEXT NOT NULL DEFAULT 'content' "
+        "CHECK (section_type IN ('content', 'bibliography'))"
+    )
+    # 只依据已存 section 的末级标题分类；不扫描 raw_text，因此正文引用 References 不会误判。
+    for row in connection.execute("SELECT chunk_id, section FROM chunks"):
+        if _is_bibliography_section(str(row["section"] or "")):
+            connection.execute(
+                "UPDATE chunks SET section_type = 'bibliography' WHERE chunk_id = ?",
+                (row["chunk_id"],),
+            )
+    # 旧 V3 trigger 只维护 chunks_fts，先删除再按 V4 规则重建两个索引。
+    for trigger in (
+        "chunks_fts_after_insert",
+        "chunks_fts_after_delete",
+        "chunks_fts_after_searchable_update",
+    ):
+        connection.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    connection.executescript(_SCHEMA_V4_SQL)
+    connection.execute("DELETE FROM chunks_fts")
+    connection.execute("DELETE FROM bibliography_fts")
+    connection.execute(
+        """
+        INSERT INTO chunks_fts (chunk_id, paper_title, section, raw_text)
+        SELECT chunks.chunk_id, COALESCE(documents.paper_title, ''), COALESCE(chunks.section, ''), chunks.raw_text
+        FROM chunks JOIN documents ON documents.paper_id = chunks.paper_id
+        WHERE chunks.section_type = 'content'
+        ORDER BY chunks.paper_id, chunks.chunk_index
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO bibliography_fts (chunk_id, paper_title, section, raw_text)
+        SELECT chunks.chunk_id, COALESCE(documents.paper_title, ''), COALESCE(chunks.section, ''), chunks.raw_text
+        FROM chunks JOIN documents ON documents.paper_id = chunks.paper_id
+        WHERE chunks.section_type = 'bibliography'
+        ORDER BY chunks.paper_id, chunks.chunk_index
+        """
+    )
+
+
+def _is_bibliography_section(section: str) -> bool:
+    """为数据库迁移复用切块阶段相同的受控标题规则。"""
+    leaf = section.rsplit(">", maxsplit=1)[-1].strip()
+    leaf = re.sub(
+        r"^(?:\d+(?:\.\d+)*(?:[.)]|\s+)|[IVXLC]+(?:[.)]|\s+))",
+        "",
+        leaf,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", leaf).strip().casefold().rstrip(":") in {
+        "references",
+        "bibliography",
+        "works cited",
+        "literature cited",
+    }
+
+
+def _fts5_literal_phrase(text: str) -> str:
+    """将外部输入转为 FTS5 字面短语，避免用户文本意外触发布尔/列过滤语法。"""
+    return '"' + text.replace('"', '""') + '"'
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
@@ -592,6 +984,10 @@ def _validate_chunking_result(result: ChunkingResult) -> tuple[str, str]:
                 "front_matter_type must be present exactly for front_matter chunks: "
                 f"{chunk.chunk_id}"
             )
+        if chunk.section_type not in {"content", "bibliography"}:
+            raise MetadataDatabaseError(
+                f"Unsupported section_type for {chunk.chunk_id}: {chunk.section_type!r}"
+            )
         if chunk.prev_chunk_id is not None and chunk.prev_chunk_id not in known_chunk_ids:
             raise MetadataDatabaseError(
                 f"Unknown prev_chunk_id for {chunk.chunk_id}: {chunk.prev_chunk_id}"
@@ -615,6 +1011,7 @@ def _chunk_row(chunk: PaperChunk) -> tuple[object, ...]:
         chunk.section,
         chunk.content_kind,
         chunk.front_matter_type,
+        chunk.section_type,
         chunk.page_start,
         chunk.page_end,
         chunk.raw_token_count,

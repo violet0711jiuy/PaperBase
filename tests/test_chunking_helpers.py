@@ -10,6 +10,7 @@ from paperbase.chunking.docling_hybrid_chunker import (
     _front_matter_type_for_chunk,
     _is_layout_noise_chunk,
     _section_from_headings,
+    _section_type_from_headings,
 )
 from paperbase.parsing.base import FrontMatterBlock
 
@@ -31,6 +32,12 @@ class ChunkingHelperTests(unittest.TestCase):
             "3. Results > 3.1. Evaluation",
         )
         self.assertIsNone(_section_from_headings(None))
+
+    def test_only_controlled_reference_headings_are_bibliography(self) -> None:
+        self.assertEqual(_section_type_from_headings(["2. Related Work"]), "content")
+        self.assertEqual(_section_type_from_headings(["7. References"]), "bibliography")
+        self.assertEqual(_section_type_from_headings(["Works Cited"]), "bibliography")
+        self.assertEqual(_section_type_from_headings(["Literature Cited"]), "bibliography")
 
     def test_embedding_text_adds_context_without_changing_raw_text(self) -> None:
         """检索文本应显式带标题与章节，正文内容完整保留。"""
