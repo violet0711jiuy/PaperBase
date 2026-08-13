@@ -971,3 +971,41 @@ embedding 输入指纹和 ID 分配指纹。
 CLI 的 FAISS—SQLite—embedding 工件交叉验证通过；前 10 条向量的 self-search 均返回自身 ID，最低分为
 `0.99999994`，没有遗留 pending journal。新增首次建库、陈旧 embedding 拒绝、SQLite 已提交后的恢复发布
 三项索引测试；全项目回归测试为 `30/30` 通过。
+
+---
+
+# Step 6：混合检索、受约束 Query 改写与可降级在线链路
+
+## 目标与边界
+
+在不改变 Step 1–5 的 PDF、解析、chunk、SQLite 正文和 FAISS 向量的前提下，把用户问题召回成带来源证据的 chunks。此阶段不生成最终答案、不引入 reranker，也不将 LLM 生成文本写入数据库。这样可以把“召回是否正确”和“回答是否正确”分开评估。
+
+## 初版方案：五类逻辑通道 + 加权 RRF
+
+原始问题始终走两条基础路径：Qwen 稠密检索 Top-20 和 SQLite FTS5/BM25 Top-10。LLM 只作为补充查询规划器，返回严格 JSON：最多一条完整语义改写、最多三条中文短关键词、最多三条英文短关键词。语义改写走第二条稠密路径；中英文关键词分别走两组 BM25 路径。
+
+不同模型的原始分数不可混加，因此结果按 `weight / (rrf_k + rank)` 做 RRF 融合，默认 `rrf_k=60`。同类中的多条关键词会均分该类总权重，避免模型因为多输出关键词而篡改排序。结果保存每一次命中的 route、query、rank、原始分数和实际权重，方便后续离线评估或接入 cross-encoder reranker。
+
+## 工程契约
+
+1. 正式线上检索只依赖 `paperbase.faiss`、FAISS manifest 和 SQLite；不读取 `vectors.npy`/`records.jsonl`。启动时根据 SQLite 的 `vector_id` 和 `embedding_text` 重算映射指纹，校验三者一致。
+2. SQLite schema V3 新增 FTS5 派生表 `chunks_fts`，索引论文标题、章节和 raw_text。其内容由 `chunks` 触发器维护，正文事实源仍只有 `documents`、`chunks`。
+3. Prompt 从业务代码剥离到 `paperbase/prompts/query_rewrite.py`，将同一用途的 system prompt、user 模板、JSON 修复 prompt 放在同一个 Python 文件，便于版本管理和 A/B 实验。
+4. `.env` 只存 API Key、模型地址和运行时参数；`config.yaml` 只存非敏感检索阈值、权重和开关。`.env.example` 提供可提交模板。
+5. LLM 网络失败、空响应或 JSON 不合约时，默认 `fallback_to_original=true`，无声但可观测地退化为原始稠密 + 原始 BM25，不阻断查询。
+
+## 验证与一次真实问题的发现
+
+新增 Query 改写 JSON 契约与失败降级测试、RRF 去重/证据保留测试、FTS5 检索测试、正式索引不依赖 staging 的验证；全量回归由 `30/30` 增至 `33/33` 通过。实际数据库由 schema V2 原子迁移至 V3，迁移前备份，结果仍为 `documents=3`、`chunks=265`，BM25 能正常返回候选。
+
+以“LSTM 风速预测论文的作者是谁？”做端到端检查时，FAISS—SQLite 路径成功执行；但 ModelScope 的最小 Chat Completions 请求返回空 `choices`（无响应 ID），改写器按契约降级。因此本次结果仅来自原始稠密路径，并偏向包含 LSTM 的实验表，而未能验证“作者”前置 metadata 的 LLM 关键词召回。这是一次重要的工程结论：必须把外部 LLM 不可用视为正常分支，并在 Prompt/HTTP 可用性与检索质量两层分别记录。
+
+下一步应先在 ModelScope 控制台确认当前模型的推理服务权限和可调用 model ID；服务正常后，以作者、摘要、数据集、方法缩写、中英混合问题各做一组召回评测，再决定是否进入 rerank 与最终回答生成阶段。
+
+---
+
+## Step 6 方案收敛：四路召回与英文关键词组
+
+在确认知识库当前以英文论文为主后，删除中文关键词 BM25 路径，避免低命中率通道增加复杂度。LLM 的 JSON 契约收敛为一个 `semantic_query` 和一个 `lexical_keywords_en` 列表；前者只做一次 Rewritten Dense Top-20，后者共同编译为一条 OR 型 Rewritten BM25 Top-20，例如 `LSTM OR "wind speed prediction" OR author`，不再把三个关键词拆成三次 BM25 调用。
+
+最终候选来自四条固定路径：Original Dense Top-20、Original BM25 Top-10、Rewritten Dense Top-20、Rewritten BM25 Top-20。它们按 `chunk_id` 聚合去重，并采用加权 RRF 得到 Top-40；下一阶段才将这 40 条送入本地 BGE Reranker，输出 Top-5。这样先稳定并评测召回，再独立评测重排，不把两个变量混在同一次改动中。

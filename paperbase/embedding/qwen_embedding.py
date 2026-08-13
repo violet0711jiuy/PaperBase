@@ -31,16 +31,41 @@ class QwenSentenceTransformerEmbedder:
 
     def embed_documents(self, texts: list[str]) -> np.ndarray:
         """批量生成保持输入顺序的单位化 ``float32`` 文档向量。"""
+        return self._encode(texts, prompt_name="document")
+
+    def embed_queries(self, texts: list[str], *, instruction: str) -> np.ndarray:
+        """用调用方配置的检索任务说明编码 Query，不污染文档侧 embedding。
+
+        Qwen 建议使用 ``Instruct: ...\nQuery:`` 格式。这里把 instruction 作为模型 encode
+        的 prompt 传入，而不是把它写回用户问题或保存到 SQLite；这样既能用于中文/英文问题，
+        也能在检索实验中仅改配置比较不同任务说明。
+        """
+        normalized_instruction = " ".join(instruction.split())
+        if not normalized_instruction:
+            raise EmbeddingModelError("Query embedding instruction must not be empty.")
+        return self._encode(
+            texts,
+            prompt=f"Instruct: {normalized_instruction}\nQuery:",
+        )
+
+    def _encode(
+        self,
+        texts: list[str],
+        *,
+        prompt_name: str | None = None,
+        prompt: str | None = None,
+    ) -> np.ndarray:
+        """执行文档或 Query 侧共有的模型调用与矩阵安全校验。"""
         if not texts:
-            raise EmbeddingModelError("Cannot embed an empty document batch.")
+            raise EmbeddingModelError("Cannot embed an empty text batch.")
         if any(not text.strip() for text in texts):
             raise EmbeddingModelError("Embedding input contains an empty text.")
 
         model = self._load_model()
         vectors = model.encode(
             texts,
-            # 文档侧不添加检索问题 instruction；Qwen 模型工件中该 prompt 定义为空字符串。
-            prompt_name="document",
+            prompt_name=prompt_name,
+            prompt=prompt,
             batch_size=self._settings.batch_size,
             convert_to_numpy=True,
             normalize_embeddings=self._settings.normalize_embeddings,

@@ -154,6 +154,36 @@ indexing:
 
 完整的 FAISS—SQLite 关系、恢复机制和命令见 [indexing.md](indexing.md)。
 
+## Step 6 混合检索参数
+
+```yaml
+retrieval:
+  backend: hybrid_rrf
+  dense_top_k_per_query: 20
+  bm25_original_top_k: 10
+  bm25_rewrite_top_k: 20
+  fused_top_k: 40
+  rrf_k: 60
+  dense_original_weight: 1.0
+  dense_rewrite_weight: 1.0
+  bm25_original_weight: 0.7
+  bm25_rewrite_weight: 1.0
+  query_instruction: >
+    Given a Chinese or English academic question, retrieve relevant passages
+    from a collection of scientific papers that answer the question.
+  query_rewrite:
+    enabled: true
+    max_lexical_keywords_en: 3
+    max_context_turns: 4
+    fallback_to_original: true
+```
+
+- 四个 `*_weight` 分别对应原始 Dense、原始 BM25、改写 Dense、改写 BM25 四条路径。英文关键词组只执行一次改写 BM25，不能靠增加关键词数量放大分数。
+- `rrf_k` 是 RRF 的平滑常数。检索器只融合名次，绝不直接混加 FAISS 余弦相似度和 BM25 分数。
+- `query_instruction` 只用于 Qwen 的 Query 编码，不写入论文、不修改文档侧向量，也不发送给生成 LLM。
+- `query_rewrite` 控制 LLM 产生一条英文 `semantic_query`、一组英文 `lexical_keywords_en` 的上限，以及 `max_context_turns` 条最近上下文。上下文只用于消解追问指代；关闭 `enabled` 后仍可运行原始稠密 + 原始 BM25。
+- API Key、模型地址、模型名、超时等不属于该文件，统一由根目录 `.env` 提供；模板见 `.env.example`。完整链路见 [retrieval.md](retrieval.md)。
+
 运行分块检查：
 
 ```powershell

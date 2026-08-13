@@ -21,6 +21,7 @@ storage/*.faiss.manifest.json
 storage/*.faiss.pending.json
 storage/*.db
 storage/*.sqlite3
+storage/*.sqlite3.*.bak
 
 # Keep folders
 !storage/papers/.gitkeep

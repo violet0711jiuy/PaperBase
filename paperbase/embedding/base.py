@@ -36,3 +36,11 @@ class DocumentEmbedder(Protocol):
 
     def embed_documents(self, texts: list[str]) -> np.ndarray:
         """返回与输入顺序完全一致的二维 ``float32`` 向量矩阵。"""
+
+
+@runtime_checkable
+class QueryEmbedder(Protocol):
+    """Query 侧 embedding 接口；与文档侧分开以避免误把 instruction 加入论文文本。"""
+
+    def embed_queries(self, texts: list[str], *, instruction: str) -> np.ndarray:
+        """返回与输入顺序一致、适合余弦检索的单位化 Query 向量矩阵。"""
