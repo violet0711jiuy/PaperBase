@@ -245,6 +245,23 @@ class AnswerGenerationSettings(BaseModel):
     max_evidence_units: int = Field(default=8, ge=1, le=30)
 
 
+class PaperOverviewSettings(BaseModel):
+    """v0.2 单篇论文速览的章节级上下文预算。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 每类核心章节最多选取的 chunk 数，防止 Introduction 或 Experiments 独占 Prompt。
+    max_chunks_per_section: int = Field(default=3, ge=1, le=10)
+    # 一个 chunk 写入 Prompt 时允许保留的最大字符数，超出时只截取前段并显式标注。
+    max_chars_per_chunk: int = Field(default=2_000, ge=300, le=12_000)
+    # 所有章节内容的总字符预算；标题与 Prompt 固定说明不计入此预算。
+    max_total_context_chars: int = Field(default=18_000, ge=2_000, le=80_000)
+    # 无法匹配核心章节名称时，最多保留多少个前序正文 chunk 作为受控兜底。
+    max_fallback_chunks: int = Field(default=2, ge=0, le=10)
+    # Overview 有八个带来源字段，所需 JSON 通常比 Query Rewrite 的全局默认输出更长。
+    max_output_tokens: int = Field(default=1_600, ge=400, le=8_000)
+
+
 class AppSettings(BaseModel):
     """PaperBase 当前阶段的完整、解析器无关配置根对象。"""
 
@@ -264,6 +281,9 @@ class AppSettings(BaseModel):
     )
     answer_generation: AnswerGenerationSettings = Field(
         default_factory=AnswerGenerationSettings
+    )
+    paper_overview: PaperOverviewSettings = Field(
+        default_factory=PaperOverviewSettings
     )
 
     # 配置文件路径不是用户在 YAML 中填写的业务参数，因此作为 Pydantic 私有属性保存。

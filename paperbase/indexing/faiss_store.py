@@ -426,7 +426,7 @@ class FaissIndexStore:
         )
 
 
-def _write_faiss_index(*, path: Path, vectors: np.ndarray, vector_ids: np.ndarray) -> None:
+def write_flat_ip_index(*, path: Path, vectors: np.ndarray, vector_ids: np.ndarray) -> None:
     """构建并自校验 ``IndexIDMap2(IndexFlatIP)`` 候选文件。"""
     if vectors.dtype != np.float32 or vectors.ndim != 2:
         raise FaissIndexError("FAISS input vectors must be a two-dimensional float32 matrix.")
@@ -448,6 +448,10 @@ def _write_faiss_index(*, path: Path, vectors: np.ndarray, vector_ids: np.ndarra
         expected_dimension=int(vectors.shape[1]),
         expected_vector_ids={int(vector_id) for vector_id in vector_ids},
     )
+
+
+# 兼容 v0.1 内部调用；临时工作区通过上面的公开函数复用完全相同的 FAISS 写入逻辑。
+_write_faiss_index = write_flat_ip_index
 
 
 def _build_manifest(
