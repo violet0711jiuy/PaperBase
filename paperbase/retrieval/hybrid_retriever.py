@@ -7,10 +7,11 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from paperbase.config import RetrievalSettings
+from paperbase.config import RerankingSettings, RetrievalSettings
 from paperbase.database import MetadataDatabase
 from paperbase.embedding.base import QueryEmbedder
 from paperbase.indexing import FaissIndexStore
+from paperbase.reranking import Reranker
 
 from .query_rewriter import QueryRewritePlan, QueryRewriter
 
@@ -42,6 +43,10 @@ class RetrievedChunk:
     page_start: int | None
     page_end: int | None
     raw_text: str
+    # 进入 Step 7 前在正文 RRF 队列中的名次；bibliography 直出候选为 None。
+    pre_rerank_rank: int | None
+    # Cross-Encoder 相关性分数；未重排或 bibliography 直出候选为 None。
+    rerank_score: float | None
     fused_score: float
     source_matches: tuple[RetrievalSourceMatch, ...]
 
@@ -52,6 +57,8 @@ class RetrievalResult:
 
     query: str
     rewrite_plan: QueryRewritePlan
+    # reranking 状态：success、disabled 或 fallback；失败时正文仍按 RRF 顺序输出。
+    reranking_status: str
     chunks: tuple[RetrievedChunk, ...]
 
 
@@ -61,6 +68,8 @@ class _Candidate:
 
     row: Any
     score: float = 0.0
+    # Step 7 Cross-Encoder 分数；None 表示未参与正文重排序。
+    rerank_score: float | None = None
     sources: list[RetrievalSourceMatch] = field(default_factory=list)
 
 
@@ -80,11 +89,15 @@ class HybridRetriever:
         index_store: FaissIndexStore,
         settings: RetrievalSettings,
         query_rewriter: QueryRewriter,
+        reranker: Reranker | None = None,
+        reranking_settings: RerankingSettings | None = None,
     ) -> None:
         self._database = database
         self._query_embedder = query_embedder
         self._settings = settings
         self._query_rewriter = query_rewriter
+        self._reranker = reranker
+        self._reranking_settings = reranking_settings
         # 启动时验证索引、清单、SQLite 映射三者一致；不读取 staging 工件。
         self._index = index_store.load_for_search(database=database)
 
@@ -93,6 +106,7 @@ class HybridRetriever:
         query: str,
         *,
         conversation_context: Sequence[str] | None = None,
+        result_limit: int | None = None,
     ) -> RetrievalResult:
         """运行四路召回并返回按 chunk_id 去重后的 Top-K chunk。
 
@@ -104,6 +118,8 @@ class HybridRetriever:
             query,
             conversation_context=conversation_context,
         )
+        if result_limit is not None and result_limit < 1:
+            raise ValueError("result_limit must be positive when provided.")
         candidates: dict[str, _Candidate] = {}
 
         self._add_dense_matches(
@@ -130,40 +146,103 @@ class HybridRetriever:
             keywords=plan.lexical_keywords_en,
             weight=self._settings.bm25_rewrite_weight,
         )
+        bibliography_candidates: tuple[_Candidate, ...] = ()
         if plan.search_bibliography:
-            self._add_bibliography_matches(
-                candidates=candidates,
+            # 先从正文混合召回中定位“这篇论文”的最强候选，再把参考文献检索限制在该论文内。
+            # 无法定位目标论文时宁可不查 bibliography，也不能退化为全库宽泛主题词匹配。
+            target_paper_id = _select_bibliography_target_paper_id(candidates)
+            bibliography_candidates = self._collect_bibliography_candidates(
                 query=(plan.semantic_query or plan.original_query),
                 keywords=plan.lexical_keywords_en,
+                target_paper_id=target_paper_id,
             )
 
-        ordered = sorted(
+        rrf_ordered_content = sorted(
             candidates.values(),
             key=lambda item: (-item.score, str(item.row["chunk_id"])),
         )
+        reranking_status = "disabled"
+        ordered_content, reranking_status = self._rerank_content_candidates(
+            query=(plan.semantic_query or plan.original_query),
+            candidates=rrf_ordered_content,
+        )
         if plan.search_bibliography:
-            bibliography_limit = self._settings.query_rewrite.bibliography_top_k
-            content_limit = max(self._settings.fused_top_k - bibliography_limit, 0)
-            content_candidates = [
-                item for item in ordered if str(item.row["section_type"]) == "content"
-            ][:content_limit]
-            bibliography_candidates = [
-                item for item in ordered if str(item.row["section_type"]) == "bibliography"
-            ][:bibliography_limit]
-            ordered = sorted(
-                (*content_candidates, *bibliography_candidates),
-                key=lambda item: (-item.score, str(item.row["chunk_id"])),
-            )
+            # bibliography 候选不参与正文 RRF 或 Cross-Encoder；正文和参考文献分别按自身排序后直接拼接。
+            # --top-k 显式指定时它表示总数；未指定时默认输出正文 final_top_k 加参考文献配额。
+            output_limit = result_limit or self._default_output_limit(include_bibliography=True)
+            direct_bibliography = bibliography_candidates[
+                : min(self._settings.query_rewrite.bibliography_top_k, output_limit)
+            ]
+            content_output_limit = output_limit - len(direct_bibliography)
+            ordered = [
+                *ordered_content[:content_output_limit],
+                *direct_bibliography,
+            ]
         else:
-            ordered = ordered[: self._settings.fused_top_k]
+            output_limit = result_limit or self._default_output_limit(include_bibliography=False)
+            content_output_limit = output_limit
+            ordered = ordered_content[:content_output_limit]
         return RetrievalResult(
             query=plan.original_query,
             rewrite_plan=plan,
+            reranking_status=reranking_status,
             chunks=tuple(
-                _to_retrieved_chunk(candidate, rank=index + 1)
+                _to_retrieved_chunk(
+                    candidate,
+                    rank=index + 1,
+                    pre_rerank_rank=(
+                        _find_pre_rerank_rank(rrf_ordered_content, candidate)
+                        if str(candidate.row["section_type"]) == "content"
+                        else None
+                    ),
+                    rerank_score=_find_rerank_score(candidate),
+                )
                 for index, candidate in enumerate(ordered)
             ),
         )
+
+    def _rerank_content_candidates(
+        self,
+        *,
+        query: str,
+        candidates: list[_Candidate],
+    ) -> tuple[list[_Candidate], str]:
+        """只对正文 RRF 候选进行 Cross-Encoder 重排；模型异常时无声退回原 RRF 顺序。"""
+        if self._reranker is None:
+            return candidates, "disabled"
+        if self._reranking_settings is None or not self._reranking_settings.enabled:
+            return candidates, "disabled"
+        candidate_limit = min(len(candidates), self._reranking_settings.candidate_top_k)
+        rerank_candidates = candidates[:candidate_limit]
+        passages = [_build_rerank_passage(candidate.row) for candidate in rerank_candidates]
+        try:
+            scores = self._reranker.rerank(query, passages)
+            if len(scores) != len(rerank_candidates):
+                raise ValueError("Reranker score count does not match candidate count.")
+            scores_by_index = {item.input_index: item.score for item in scores}
+            if set(scores_by_index) != set(range(len(rerank_candidates))):
+                raise ValueError("Reranker returned invalid candidate indexes.")
+            # 将分数放入临时属性前先保留 RRF 原分，便于按分数相同的情况稳定回退到原排序。
+            for input_index, candidate in enumerate(rerank_candidates):
+                candidate.rerank_score = scores_by_index[input_index]
+            reranked = sorted(
+                rerank_candidates,
+                key=lambda item: (-item.rerank_score, -item.score, str(item.row["chunk_id"])),
+            )
+            return [*reranked, *candidates[candidate_limit:]], "success"
+        except Exception:
+            # Reranker 是可选增强环节；本地模型缺失、显存不足等不能阻断已可靠运行的 Step 6 召回。
+            return candidates, "fallback"
+
+    def _default_output_limit(self, *, include_bibliography: bool) -> int:
+        """未指定 CLI --top-k 时，按 Step 7 配置决定正文与参考文献的默认输出配额。"""
+        if self._reranking_settings is None or not self._reranking_settings.enabled:
+            content_limit = self._settings.fused_top_k
+        else:
+            content_limit = self._reranking_settings.final_top_k
+        if include_bibliography:
+            return content_limit + self._settings.query_rewrite.bibliography_top_k
+        return content_limit
 
     def _add_dense_matches(
         self,
@@ -268,32 +347,48 @@ class HybridRetriever:
                 effective_weight=weight,
             )
 
-    def _add_bibliography_matches(
+    def _collect_bibliography_candidates(
         self,
         *,
-        candidates: dict[str, _Candidate],
         query: str,
         keywords: tuple[str, ...],
-    ) -> None:
-        """将参考文献作为少量辅助候选，绝不进入主 Dense/正文 BM25 索引。"""
+        target_paper_id: str | None,
+    ) -> tuple[_Candidate, ...]:
+        """返回目标论文内按 BM25 排序的参考文献候选，不把它们加入正文 RRF。"""
+        if target_paper_id is None:
+            return ()
+        # 与正文 Rewritten BM25 一致：关键词组合为一条 OR 查询，并如实写入调试来源字段。
+        rendered_query = " OR ".join(keywords) if keywords else query
         rows = (
             self._database.search_bibliography_keyword_group(
                 keywords,
+                paper_id=target_paper_id,
                 top_k=self._settings.query_rewrite.bibliography_top_k,
             )
             if keywords
             else self._database.search_bibliography(
                 query,
+                paper_id=target_paper_id,
                 top_k=self._settings.query_rewrite.bibliography_top_k,
             )
         )
-        self._add_bm25_rows(
-            candidates=candidates,
-            rows=rows,
-            route="bm25_bibliography",
-            query=query,
-            # 作为辅助证据采用较低权重，避免少量 bibliography 候选压过正文证据。
-            weight=0.35,
+        return tuple(
+            _Candidate(
+                row=row,
+                # 参考文献不参加 RRF；保留 0 明确表示 fused_score 对它不适用。
+                score=0.0,
+                sources=[
+                    RetrievalSourceMatch(
+                        route="bm25_bibliography",
+                        query=rendered_query,
+                        rank=result_index + 1,
+                        raw_score=float(row["bm25_score"]),
+                        # 0 表示此来源直接输出而非加入 RRF 权重计算。
+                        effective_weight=0.0,
+                    )
+                ],
+            )
+            for result_index, row in enumerate(rows)
         )
 
     def _add_candidate(
@@ -322,7 +417,13 @@ class HybridRetriever:
         )
 
 
-def _to_retrieved_chunk(candidate: _Candidate, *, rank: int) -> RetrievedChunk:
+def _to_retrieved_chunk(
+    candidate: _Candidate,
+    *,
+    rank: int,
+    pre_rerank_rank: int | None,
+    rerank_score: float | None,
+) -> RetrievedChunk:
     """将 SQLite 行转换为 API 稳定的数据类，避免上层依赖 sqlite3.Row。"""
     row = candidate.row
     return RetrievedChunk(
@@ -340,6 +441,58 @@ def _to_retrieved_chunk(candidate: _Candidate, *, rank: int) -> RetrievedChunk:
         page_start=int(row["page_start"]) if row["page_start"] is not None else None,
         page_end=int(row["page_end"]) if row["page_end"] is not None else None,
         raw_text=str(row["raw_text"]),
+        pre_rerank_rank=pre_rerank_rank,
+        rerank_score=rerank_score,
         fused_score=candidate.score,
         source_matches=tuple(candidate.sources),
     )
+
+
+def _find_pre_rerank_rank(
+    rrf_ordered_candidates: Sequence[_Candidate],
+    candidate: _Candidate,
+) -> int:
+    """返回正文候选进入 Cross-Encoder 之前的 RRF 名次，从 1 开始。"""
+    for index, item in enumerate(rrf_ordered_candidates, start=1):
+        if item is candidate:
+            return index
+    raise ValueError("Content candidate is absent from the pre-rerank RRF ordering.")
+
+
+def _find_rerank_score(candidate: _Candidate) -> float | None:
+    """只暴露正文候选的 Cross-Encoder 分数；参考文献直出候选不具有该分数。"""
+    return candidate.rerank_score
+
+
+def _build_rerank_passage(row: Any) -> str:
+    """为 Cross-Encoder 生成紧凑、可读的正文输入，不复用 embedding_text 的检索模板。"""
+    title = " ".join(str(row["paper_title"] or "").split())
+    section = " ".join(str(row["section"] or "").split())
+    raw_text = " ".join(str(row["raw_text"] or "").split())
+    if not raw_text:
+        raise ValueError("Cannot rerank a chunk without raw_text.")
+    context_lines = []
+    if title:
+        context_lines.append(f"Paper title: {title}")
+    if section:
+        context_lines.append(f"Section: {section}")
+    context_lines.append(f"Passage: {raw_text}")
+    return "\n".join(context_lines)
+
+
+def _select_bibliography_target_paper_id(candidates: dict[str, _Candidate]) -> str | None:
+    """从正文融合候选中选择证据最强的论文，作为 bibliography FTS5 的唯一检索范围。
+
+    这里使用 chunk 的既有 RRF 分数而非新增一套主题分类器：同一分数下按 paper_id 稳定排序，
+    不会因数据库返回顺序变化而更换目标论文。后续若支持用户显式选择论文，可直接以显式 paper_id 覆盖本函数。
+    """
+    scores_by_paper_id: dict[str, float] = {}
+    for candidate in candidates.values():
+        if str(candidate.row["section_type"]) != "content":
+            continue
+        paper_id = str(candidate.row["paper_id"])
+        scores_by_paper_id[paper_id] = scores_by_paper_id.get(paper_id, 0.0) + candidate.score
+    if not scores_by_paper_id:
+        return None
+    # 多个正文 chunk 共同支持同一篇论文时，累积证据强度，而不是只看某一条 chunk 的最高分。
+    return min(scores_by_paper_id, key=lambda paper_id: (-scores_by_paper_id[paper_id], paper_id))

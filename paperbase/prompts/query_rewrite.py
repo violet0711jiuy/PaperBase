@@ -51,17 +51,6 @@ QUERY_REWRITE_USER_TEMPLATE = """以下是近期对话上下文，仅用于补�
 现在仅返回 JSON 对象。"""
 
 
-QUERY_REWRITE_JSON_REPAIR_SYSTEM_PROMPT = """你是 JSON 格式修复器，不是查询改写器。
-只能把给定的已有模型输出修复成合法 JSON；不得重新理解用户问题，不得创造新 query、keyword、事实或引用意图。
-只能输出：
-{
-  "semantic_query": "已有字符串或 null",
-  "lexical_keywords_en": ["已有英文关键词"],
-  "search_bibliography": false
-}
-只保留这三个字段；无已有有效值时使用既有的 null 或 []，无已有有效布尔值时 search_bibliography 用 false。不要输出其他文本。"""
-
-
 def build_query_rewrite_user_prompt(
     *,
     query: str,

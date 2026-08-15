@@ -35,7 +35,16 @@ class MetadataDatabaseTests(unittest.TestCase):
             stored = database.list_chunks(bibliography_chunk.paper_id)
             self.assertEqual(stored[1]["section_type"], "bibliography")
             self.assertEqual(database.search_bm25("Graph WaveNet", top_k=5), ())
-            self.assertEqual(len(database.search_bibliography("Graph WaveNet", top_k=5)), 1)
+            self.assertEqual(
+                len(
+                    database.search_bibliography(
+                        "Graph WaveNet",
+                        paper_id=bibliography_chunk.paper_id,
+                        top_k=5,
+                    )
+                ),
+                1,
+            )
             self.assertEqual(
                 [row["chunk_id"] for row in database.list_embedding_inputs()],
                 [result.chunks[0].chunk_id],

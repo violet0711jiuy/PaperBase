@@ -209,6 +209,18 @@ weather-dependent  → weather-dependent
 
 重新解析后，Saeed 修复 86 个文本项，Markdown 中 U+00AD 数量从 150 降为 0；Shao 本来就是 0。
 
+### 普通 ASCII 连字符造成的跨行断词（后续补充）
+
+新增单栏论文暴露出另一种 PDF 文本层问题：`low-pres-\nsure`、`humid-\nity` 使用的是普通
+ASCII 连字符，而非 U+00AD。原先只清理软连字符，因此错误会同时进入解析 Markdown、Step 2
+的 `raw_text`、FTS5 与 embedding；这不是 HybridChunker 的 token 硬切问题。
+
+修复放在 Step 1 的 Docling 原生文档清洗阶段，覆盖同一文本项内的换行，也覆盖
+`humid-` / `ity` 这类被拆成两个相邻 Docling TextItem 的情形。对高置信度英语构词片段移除行末
+连字符并拼词；对 `model-\nbased`、`state-of-the-\nart` 等歧义的真实复合词，仅去掉排版换行、
+保留连字符。公式对象不参与该规则。这样所有后续模块消费同一份修复结果，不需要在 FTS、embedding
+或回答阶段各补一次。
+
 ## 9. 复杂表格与行内公式的失败对照实验
 
 ### 业务问题
@@ -962,6 +974,11 @@ Query vector → FAISS vector_id → SQLite chunk → raw_text / page / section 
 是安全清理未提交候选，还是补完已提交映射对应的索引发布。manifest 绑定索引校验和、维度、数量、
 embedding 输入指纹和 ID 分配指纹。
 
+后续一次“文本修复后全库重建”验证了另一个恢复边界：旧索引和新候选索引可能拥有完全相同的
+`vector_id` 集合，却对应不同的向量内容。因此发布恢复不能只比对维度和 ID；现在还必须比对候选
+journal 记录的索引 SHA-256。若正式索引内容旧、候选索引校验正确，就原子替换正式索引；两者都不匹配
+才停止发布。该规则避免 SQLite 新映射误连到旧 embedding。
+
 测试还发现 FAISS 1.15 的 Windows 路径 I/O 在包含中文用户名的临时目录失败。因此改用 FAISS 的内存
 序列化与 Python 文件写入，输出仍是标准 FAISS 二进制格式，同时避开路径编码问题。
 
@@ -1009,3 +1026,45 @@ CLI 的 FAISS—SQLite—embedding 工件交叉验证通过；前 10 条向量�
 在确认知识库当前以英文论文为主后，删除中文关键词 BM25 路径，避免低命中率通道增加复杂度。LLM 的 JSON 契约收敛为一个 `semantic_query` 和一个 `lexical_keywords_en` 列表；前者只做一次 Rewritten Dense Top-20，后者共同编译为一条 OR 型 Rewritten BM25 Top-20，例如 `LSTM OR "wind speed prediction" OR author`，不再把三个关键词拆成三次 BM25 调用。
 
 最终候选来自四条固定路径：Original Dense Top-20、Original BM25 Top-10、Rewritten Dense Top-20、Rewritten BM25 Top-20。它们按 `chunk_id` 聚合去重，并采用加权 RRF 得到 Top-40；下一阶段才将这 40 条送入本地 BGE Reranker，输出 Top-5。这样先稳定并评测召回，再独立评测重排，不把两个变量混在同一次改动中。
+
+---
+
+## Step 6 补充：Bibliography-aware Retrieval 与规则优先路由
+
+**问题**：参考文献中的论文名、作者名和年份具有很强的词法匹配能力，容易在 Dense/BM25 中压过正文；但它们通常不能单独回答“方法如何构建、为何有效、用了哪些 baseline”等正文问题。反过来，“有没有引用 Graph WaveNet？”或“[15] 是哪篇论文？”又必须查看参考文献条目。
+
+**解决方案**：Chunk 在解析结构中标记为 `content` 或 `bibliography`。正文进入主 FAISS 与正文 FTS5；参考文献仅保留在 SQLite 和独立 bibliography FTS5。普通检索不触碰参考文献索引；`search_bibliography=true` 时仍先走完整正文 Hybrid Retrieval，再追加受 `bibliography_top_k` 限制的少量参考文献候选。
+
+引用路由采用“高精度规则优先、LLM 兜底”：明确的“是否/有没有引用”“参考文献”“[15] 是哪篇”等直接为 `true`；明确的方法比较、baseline、构建机制问题直接为 `false`；其余问题才使用 Query Rewriter 的结构化判断。规则结果会覆盖 LLM 的误判，因此 LLM 失败或禁用时，明确引用问题仍可查询 bibliography FTS5。`作者为什么引用 Graph WaveNet？` 属于 `true`，但不是 bibliography-only：正文用于回答“为什么”，参考文献用于确认被引条目。
+
+**验证**：单元测试覆盖 `Related Work → content`、`References → bibliography`、普通问题不查询 bibliography、明确引用/编号问题开启该索引、比较问题强制关闭该索引，以及 LLM 失败时的引用检索降级路径。
+
+**进一步收敛**：对于“风速预测那篇论文的参考文献中哪些也是风速预测”这类“某篇论文 + 宽主题”问题，仅用 `wind speed prediction` 全库检索会过宽。现在先由正文四路召回按 RRF 证据聚合出目标 `paper_id`，再将 bibliography FTS5 的关键词 OR 查询限制在该论文内；无法定位目标论文时不退化为全库 bibliography 搜索。来源记录的 `bm25_bibliography.query` 同时改为真实的英文关键词串，便于检查实际检索词。
+
+**输出队列调整**：参考文献 BM25 不再写入正文 RRF 候选池，也不使用低权重参与融合。明确引用问题中，先输出剩余名额的正文 RRF 结果，再直接追加最多 `bibliography_top_k` 条、按 bibliography BM25 排序的参考文献；`--top-k 20` 且命中 5 条时即为正文 Top-15 + 参考文献 Top-5。这样既不扰动正文排序，也不会让参考文献因 RRF 分数过低在截断前消失。
+
+---
+
+## Step 7：本地 Cross-Encoder Reranking
+
+**目标**：Step 6 的 Dense/BM25/RRF 优先保证召回覆盖，但高位候选仍可能只是词语相近。Step 7 使用本地 `BAAI/bge-reranker-v2-m3` 对“完整检索问题 + 论文标题/章节/原文”成对打分，只调整正文候选的相关性顺序。
+
+**实现与边界**：正文 RRF Top-40 进入 Cross-Encoder，默认输出正文 Top-5；每条输出保留 `pre_rerank_rank`、`rerank_score`、原 RRF `fused_score` 和全部 `source_matches`，从而可以区分召回问题与重排问题。参考文献继续是独立 bibliography BM25 队列，不输入 Cross-Encoder、不参与 RRF；明确引用问题仍以正文证据解释语义、以参考文献确认条目。模型仅从 D 盘本地目录离线加载，加载/显存/推理异常时自动回退到 Step 6 RRF 顺序。
+
+**验证**：使用 CUDA 对一条风速预测实验正文与一条无关参考文献进行离线打分，归一化相关性分别为 `0.746212` 与 `0.002436`。单元测试覆盖正文实际重排、重排前名次保留、参考文献不参与重排和故障回退。
+
+---
+
+## Step 8：同节邻居扩展与受证据约束的论文问答
+
+**问题**：Reranker 命中的 chunk 可能只包含一个方法步骤或一段结论的后半部分，直接发送给 LLM 容易丢失限定条件；粗暴拼接前后 chunk 又会跨章节，甚至混入 References。
+
+**方案**：把 Reranker 正文结果视为种子。系统只从 SQLite 的 `chunks` 真相表读取相同 `paper_id + section` 且 `section_type='content'` 的连续 `chunk_index`，以 `neighbor_window=1` 构成相邻窗口、合并重叠窗口，并用完整 chunk 计入 token 预算。参考文献始终独立为 `R#`，不做邻居扩展。
+
+**回答约束**：新增业务型 Prompt，分别约束方法、比较、数据集/实验和引用问题；其中 R# 只证明书目信息，引用原因必须由正文 E# 支持。回答采用 JSON Schema + Pydantic 校验，所有 `[E#]/[R#]` 都必须属于本次证据集合；模型失败、结构不合法或伪造引用时只回退到可审阅证据，绝不生成无依据结论。
+
+**额外保护**：在无论文选择器的 CLI 中，“这篇论文/本文”若同时召回多篇论文，程序直接要求用户明确标题，而不是让 LLM 任意选择候选论文。
+
+**结构化输出取舍（2026-08-15）**：移除了 Query Rewrite 与最终回答中的 JSON Repair Prompt 和第二次 LLM 修复调用。现在由 OpenAI-compatible API 的 `response_format=json_schema` 尽可能约束字段，再由 Pydantic 的严格模型（字段类型、必填字段、`extra="forbid"`）进行本地验证。原因是 Repair 仍是一次新的生成，可能改写原有语义、增加调用成本，并使失败行为难以复现；当结构不合法时，Query Rewrite 直接回退原始 Query，回答生成直接回退可审阅证据。新增测试确认错误 JSON 只触发一次模型调用。
+
+**验证**：离线测试覆盖同节连续扩展、章节/References 隔离、完整组 token 预算和伪造引用回退；全量 55 项测试通过。该阶段是纯读取链路，不需要重新 parse、chunk、ingest 或重建 FAISS。

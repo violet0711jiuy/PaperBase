@@ -11,6 +11,8 @@ from paperbase.parsing.docling_parser import (
     _LIST_STYLE_ITEM,
     _have_stable_provenance_positions,
     _has_next_list_item,
+    _join_adjacent_hard_word_break,
+    _normalize_pdf_word_breaks_in_text,
 )
 
 
@@ -117,6 +119,49 @@ class DoclingParserHelperTests(unittest.TestCase):
         ]
         self.assertTrue(_have_stable_provenance_positions(stable_items))
         self.assertFalse(_have_stable_provenance_positions(moved_items))
+
+    def test_pdf_line_end_word_breaks_are_repaired_before_chunking(self) -> None:
+        """硬连字符断词应在 Step 1 修复，供 Markdown 与全部下游共用。"""
+        self.assertEqual(
+            _normalize_pdf_word_breaks_in_text(
+                "relative humid-\nity and low-pres-\n\nsure conditions"
+            ),
+            "relative humidity and low-pressure conditions",
+        )
+        self.assertEqual(
+            _normalize_pdf_word_breaks_in_text("The fore-\ncasting error declined."),
+            "The forecasting error declined.",
+        )
+
+    def test_existing_compound_hyphen_is_preserved_while_line_break_is_removed(self) -> None:
+        """模糊情形优先保留真实术语的连字符，不能为修复断词制造新错误。"""
+        self.assertEqual(
+            _normalize_pdf_word_breaks_in_text("a model-\nbased state-of-the-\nart system"),
+            "a model-based state-of-the-art system",
+        )
+
+    def test_adjacent_text_items_restore_one_split_word_without_joining_sentences(self) -> None:
+        """跨 Docling 文本项的断词需合并；无强断词证据时禁止拼接。"""
+        self.assertEqual(
+            _join_adjacent_hard_word_break(
+                left_text="2 m relative humid-",
+                right_text="ity, and 10 m wind speed",
+            ),
+            "2 m relative humidity, and 10 m wind speed",
+        )
+        self.assertEqual(
+            _join_adjacent_hard_word_break(
+                left_text="a model-",
+                right_text="based approach",
+            ),
+            "a model-based approach",
+        )
+        self.assertIsNone(
+            _join_adjacent_hard_word_break(
+                left_text="The first sentence ends.",
+                right_text="the next item begins here.",
+            )
+        )
 
 
 if __name__ == "__main__":

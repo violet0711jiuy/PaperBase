@@ -184,6 +184,46 @@ retrieval:
 - `query_rewrite` 控制 LLM 产生一条英文 `semantic_query`、一组英文 `lexical_keywords_en` 的上限，以及 `max_context_turns` 条最近上下文。上下文只用于消解追问指代；关闭 `enabled` 后仍可运行原始稠密 + 原始 BM25。
 - API Key、模型地址、模型名、超时等不属于该文件，统一由根目录 `.env` 提供；模板见 `.env.example`。完整链路见 [retrieval.md](retrieval.md)。
 
+## Step 7 重排序参数
+
+```yaml
+reranking:
+  backend: bge_cross_encoder
+  enabled: true
+  model_id: BAAI/bge-reranker-v2-m3
+  model_path: D:/AI_Workspace/AI_Models/hf_models/bge-reranker-v2-m3
+  device: cuda
+  batch_size: 8
+  candidate_top_k: 40
+  final_top_k: 5
+  max_length: 1024
+  normalize_scores: true
+```
+
+- `candidate_top_k`：正文 RRF 候选中实际交给 Cross-Encoder 打分的最大数量；参考文献不参与重排序。
+- `final_top_k`：未传入命令行 `--top-k` 时默认输出的正文证据数量。
+- `max_length`：单个“问题 + 标题/章节/正文”配对的最大 token 数，过长正文在尾部截断。
+- `normalize_scores`：将模型原始 logit 转为 0 到 1 的相关性分数，方便人工检查；排序方向不受影响。
+- 重排序模型只从 `model_path` 离线加载。若模型缺失、显存不足或推理失败，系统会保留 Step 6 的 RRF 排序，并在 JSON 中标记 `reranking_status: "fallback"`。
+
+## Step 8 上下文扩展与回答参数
+
+```yaml
+context_expansion:
+  enabled: true
+  neighbor_window: 1
+  max_total_tokens: 6000
+
+answer_generation:
+  enabled: true
+  max_evidence_units: 8
+```
+
+- `neighbor_window`：命中 chunk 左右可纳入的连续同节邻居数量；`1` 对应“前一块 + 命中块 + 后一块”。
+- `max_total_tokens`：所有正文证据组总预算；重叠窗口合并后仍保留全部命中种子，预算不足时跳过整个完整组，不截断块中间的文本。
+- `max_evidence_units`：实际交给回答 LLM 的 `E#` 正文证据与 `R#` 参考文献证据总数上限。
+- LLM、JSON Schema 或引用编号校验失败后，命令固定安全降级为检索和扩展证据，不输出未经验证的回答。
+
 运行分块检查：
 
 ```powershell

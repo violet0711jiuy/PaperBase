@@ -173,6 +173,75 @@ class FaissIndexStoreTests(unittest.TestCase):
                 2,
             )
 
+    def test_recovery_replaces_old_index_even_when_vector_ids_are_the_same(self) -> None:
+        """重建时不能只比较 ID 集合，旧向量内容必须被候选索引替换。"""
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database, output_dir, store = _prepare_database_artifact_and_store(root)
+            artifact = load_embedding_artifact(output_dir)
+            assignments = tuple(
+                VectorAssignment(
+                    chunk_id=record.chunk_id,
+                    vector_id=index + 1,
+                    embedding_text_sha256=record.embedding_text_sha256,
+                )
+                for index, record in enumerate(artifact.records)
+            )
+
+            # 模拟旧正式索引：ID 仍是 1、2，但两个向量内容已经与新工件不一致。
+            _write_faiss_index(
+                path=store.index_path,
+                vectors=np.asarray([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+                vector_ids=np.asarray([1, 2], dtype=np.int64),
+            )
+            candidate_path = store._candidate_index_path("replace-old-index")
+            _write_faiss_index(
+                path=candidate_path,
+                vectors=artifact.vectors,
+                vector_ids=np.asarray([1, 2], dtype=np.int64),
+            )
+            manifest = _build_manifest(
+                artifact=artifact,
+                assignments=assignments,
+                index_sha256=_sha256_file(candidate_path),
+            )
+            _write_json_atomic(
+                store._journal_path,
+                {
+                    "journal_schema_version": 1,
+                    "operation_id": "replace-old-index",
+                    "phase": "database_committed",
+                    "index_path": str(store.index_path),
+                    "manifest_path": str(store.manifest_path),
+                    "candidate_index_path": str(candidate_path),
+                    "assignments": [asdict(assignment) for assignment in assignments],
+                    "manifest": manifest,
+                },
+            )
+            database.assign_vector_ids(
+                [
+                    (
+                        assignment.chunk_id,
+                        assignment.vector_id,
+                        assignment.embedding_text_sha256,
+                    )
+                    for assignment in assignments
+                ]
+            )
+
+            self.assertTrue(store.recover_pending_publish(database))
+            self.assertEqual(
+                _sha256_file(store.index_path),
+                manifest["index_sha256"],
+            )
+            self.assertEqual(
+                store.verify_against_sqlite(
+                    database=database,
+                    embedding_output_dir=output_dir,
+                ).vector_count,
+                2,
+            )
+
 
 def _prepare_database_artifact_and_store(
     root: Path,

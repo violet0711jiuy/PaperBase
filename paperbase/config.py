@@ -203,6 +203,48 @@ class RetrievalSettings(BaseModel):
     query_rewrite: QueryRewriteSettings = Field(default_factory=QueryRewriteSettings)
 
 
+class RerankingSettings(BaseModel):
+    """Step 7 本地 Cross-Encoder 重排序的非敏感、可替换运行参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: str = Field(min_length=1)
+    enabled: bool = True
+    model_id: str = Field(min_length=1)
+    model_path: Path
+    device: str = Field(min_length=1)
+    batch_size: int = Field(ge=1, le=128)
+    candidate_top_k: int = Field(ge=1, le=200)
+    final_top_k: int = Field(ge=1, le=50)
+    max_length: int = Field(ge=64, le=8192)
+    normalize_scores: bool = True
+
+    @field_validator("model_path", mode="after")
+    @classmethod
+    def resolve_reranker_model_path(cls, value: Path, info: ValidationInfo) -> Path:
+        """将本地 reranker 模型目录统一解析为绝对路径，避免运行时隐式联网下载。"""
+        return _resolve_path(value, info)
+
+
+class ContextExpansionSettings(BaseModel):
+    """Step 8 按论文与章节边界扩展相邻证据块的可调参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    neighbor_window: int = Field(default=1, ge=0, le=8)
+    max_total_tokens: int = Field(default=6_000, ge=256, le=32_000)
+
+
+class AnswerGenerationSettings(BaseModel):
+    """Step 8 基于已检索证据生成答案的非敏感运行参数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    max_evidence_units: int = Field(default=8, ge=1, le=30)
+
+
 class AppSettings(BaseModel):
     """PaperBase 当前阶段的完整、解析器无关配置根对象。"""
 
@@ -215,7 +257,14 @@ class AppSettings(BaseModel):
     database: DatabaseSettings
     embedding: EmbeddingSettings
     indexing: IndexingSettings
+    reranking: RerankingSettings
     retrieval: RetrievalSettings
+    context_expansion: ContextExpansionSettings = Field(
+        default_factory=ContextExpansionSettings
+    )
+    answer_generation: AnswerGenerationSettings = Field(
+        default_factory=AnswerGenerationSettings
+    )
 
     # 配置文件路径不是用户在 YAML 中填写的业务参数，因此作为 Pydantic 私有属性保存。
     _config_path: Path = PrivateAttr()

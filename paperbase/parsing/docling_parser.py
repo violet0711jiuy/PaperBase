@@ -69,6 +69,102 @@ _ABSTRACT_COLUMN_ALIGNMENT_TOLERANCE = 36.0
 # 连字符；Docling 提取文本时可能保留为不可见字符，或在其后带一个普通空格。
 _SOFT_HYPHEN_AND_FOLLOWING_SPACE = re.compile(r"\u00ad\s*")
 
+# 有些 PDF 不使用 U+00AD，而是直接在行尾保留普通 ASCII 连字符。例如
+# ``humid-\nity``、``low-pres-\nsure``。Markdown 导出时它们会变成看似正常、实际
+# 被断开的单词，进而同时影响 raw_text、FTS5 词法检索和 embedding。该正则只处理
+# "英文字母 + 连字符 + 真实换行 + 小写英文字母" 这一种明确的版面断行形态：公式中的
+# ``n-1``、负数、URL、Markdown 表格列和普通行内连字符均不会命中。
+_HARD_LINE_BREAK_HYPHEN = re.compile(
+    r"(?P<left>[A-Za-z]+(?:-[A-Za-z]+)*)-"
+    r"[ \t]*\r?\n(?:[ \t]*\r?\n)?[ \t]*"
+    r"(?P<right>[a-z][A-Za-z]*)"
+)
+
+# 同一自然段有时被 PDF 文本层拆成两个相邻 Docling TextItem：前一项以 ``humid-``
+# 结束，后一项从 ``ity`` 开始。这种跨对象断词不会命中上面的“同一字符串内换行”规则，
+# 因而需在保留 Docling 阅读顺序的前提下单独拼接。
+_TRAILING_HARD_WORD_BREAK = re.compile(
+    r"(?P<left>[A-Za-z]+(?:-[A-Za-z]+)*)-$"
+)
+_LEADING_LOWERCASE_WORD = re.compile(r"^\s*(?P<right>[a-z][A-Za-z]*)")
+
+# 仅凭 PDF 文本层无法 100% 分辨 ``forecast-\ning``（应去掉连字符）和
+# ``model-\nbased``（应保留连字符）。为避免用激进规则损坏原有术语，以下集合列出在
+# 学术英语中高度稳定、通常构成真正复合词的后半部分；遇到它们时仅移除排版换行并保留
+# 连字符。其余候选会再经过 `_is_likely_word_split` 的高置信度判断。
+_COMMON_HYPHENATED_CONTINUATIONS = frozenset(
+    {
+        "based",
+        "dependent",
+        "driven",
+        "related",
+        "aware",
+        "specific",
+        "level",
+        "term",
+        "scale",
+        "state",
+        "time",
+        "free",
+        "less",
+        "like",
+        "wise",
+        "pressure",
+        "speed",
+        "resolution",
+        "dimensional",
+        "linear",
+        "linearized",
+        "end",
+    }
+)
+
+# 这些后缀出现在换行后的单词开头时，前半部分与后半部分拼接为一个单词的置信度很高。
+# 例如 ``humid-\nity``、``regulari-\nzation``、``forecast-\ning``。这是通用英语形态
+# 规则，不依赖某篇论文、作者或数据集名称。
+_WORD_CONTINUATION_SUFFIXES = (
+    "ability",
+    "ation",
+    "ations",
+    "ibility",
+    "ically",
+    "ication",
+    "ications",
+    "ified",
+    "ification",
+    "ifications",
+    "ifying",
+    "ing",
+    "ities",
+    "ity",
+    "ization",
+    "izations",
+    "ized",
+    "izing",
+    "ment",
+    "ments",
+    "ness",
+    "sion",
+    "sions",
+    "tion",
+    "tions",
+)
+
+# 当行前半部分正好以这些常见的英语构词前缀结束时，换行后的长词通常是同一单词的
+# 延续。例如 ``fore-\ncasting``、``inter-\npretability``。此列表只放入独立前缀，
+# 不把任意短词都视为可拼接片段，从而降低误改复合词的风险。
+_WORD_SPLIT_PREFIXES = frozenset(
+    {
+        "fore",
+        "inter",
+        "intra",
+        "macro",
+        "micro",
+        "multi",
+        "semi",
+    }
+)
+
 # 审稿或预印本 PDF 有时保留了不可见的旧文本层。该标记并非正式论文内容；但只有与
 # 同页、同坐标带的碎片共同出现时，才将它们视为可删除的叠加层，不能凭普通重复文本猜测。
 _PEER_REVIEW_MARKER = re.compile(r"\bFOR\s+PEER\s+REVIEW\b", re.IGNORECASE)
@@ -187,6 +283,84 @@ _AFFILIATION_SIGNAL = re.compile(
 _MAX_AUTHORSHIP_BLOCK_CHARS = 1800
 
 
+def _normalize_pdf_word_breaks_in_text(text: str) -> str:
+    """修复一个非公式文本项内的软/硬连字符断行。
+
+    这个函数是纯文本函数，单元测试可以不加载 Docling 模型即可覆盖。返回值只会修复
+    明确存在的排版换行，不会重写正常句子、增加模型生成内容，亦不会把表格或公式中的
+    数值表达式作为英文单词处理。
+    """
+    # U+00AD 的含义就是“此处允许断行”，不属于词语本身，因此可以无条件删除。
+    normalized = _SOFT_HYPHEN_AND_FOLLOWING_SPACE.sub("", text)
+
+    def replace_hard_line_break(match: re.Match[str]) -> str:
+        left = match.group("left")
+        right = match.group("right")
+        if _is_likely_word_split(left=left, right=right):
+            # 例如 humid-\nity -> humidity；低置信度情形不会走到这里。
+            return f"{left}{right}"
+        # 例如 model-\nbased -> model-based。虽然换行被移除，但原始复合词语义保留。
+        return f"{left}-{right}"
+
+    return _HARD_LINE_BREAK_HYPHEN.sub(replace_hard_line_break, normalized)
+
+
+def _is_likely_word_split(*, left: str, right: str) -> bool:
+    """判断 ASCII 行末连字符是否高置信度地属于同一英文单词。
+
+    这不是词典或 LLM 猜测：只有明显的构词后缀，或“一个已开始的连字符复合词中的
+    第二个词又被排版拆开”时才删除连字符。其余模糊情况保留连字符，宁可得到
+    ``fore-casting``，也不把原本正确的 ``model-based`` 破坏成 ``modelbased``。
+    """
+    normalized_right = right.casefold()
+    if normalized_right in _COMMON_HYPHENATED_CONTINUATIONS:
+        return False
+
+    # ``state-of-the-\nart`` 已有两个真实连字符，应保留最后一个；
+    # ``low-pres-\nsure`` 则只有一个已有连字符，且最后的 ``pres`` 显然是
+    # ``pressure`` 的半个词，可安全拼回 ``low-pressure``。
+    hyphen_count = left.count("-")
+    trailing_fragment = left.rsplit("-", maxsplit=1)[-1]
+    if hyphen_count == 1 and len(trailing_fragment) >= 3 and len(right) <= 4:
+        return True
+    if hyphen_count >= 2:
+        return False
+
+    if trailing_fragment.casefold() in _WORD_SPLIT_PREFIXES:
+        return True
+
+    # ``ity``、``tion``、``ing`` 等是学术英语里极稳定的词尾，能避免将
+    # humid-\nity、forecast-\ning、normaliza-\ntion 留成两个检索词。
+    return normalized_right.startswith(_WORD_CONTINUATION_SUFFIXES)
+
+
+def _join_adjacent_hard_word_break(
+    *, left_text: str, right_text: str
+) -> str | None:
+    """尝试连接两个相邻文本项之间被 PDF 拆开的一个单词。
+
+    返回 ``None`` 表示两项之间不存在“行末连字符 + 下一项小写字母”的强证据；调用方
+    必须保持两个原对象完全不动。成功时返回合并后的完整文本，右侧文本项可安全删除。
+    这里不会猜测两个普通句子是否相关，也不会跨标题、公式、表格或列表项连接。
+    """
+    left_match = _TRAILING_HARD_WORD_BREAK.search(left_text)
+    right_match = _LEADING_LOWERCASE_WORD.match(right_text)
+    if left_match is None or right_match is None:
+        return None
+
+    left = left_match.group("left")
+    right = right_match.group("right")
+    connector = "" if _is_likely_word_split(left=left, right=right) else "-"
+    # right_match.start("right") 之后保留右侧所有原始字符，包括逗号、空格和句子余量。
+    # 因此只修复边界的一个词，不会吞掉后续内容或重排句子。
+    return (
+        left_text[: left_match.start("left")]
+        + left
+        + connector
+        + right_text[right_match.start("right") :]
+    )
+
+
 @dataclass(frozen=True)
 class ParserSettings:
     """运行本地Docling模型所需的非机密设置。"""
@@ -232,7 +406,7 @@ class DoclingParser(PaperParser):
         document = self._converter.convert(stream).document
         corrected_formula_table_count = self._convert_formula_like_tables(document)
         self._clean_enriched_formula_text(document)
-        normalized_hyphenation_count = self._normalize_soft_hyphens(document)
+        normalized_hyphenation_count = self._normalize_pdf_word_breaks(document)
         normalized_heading_count = self._normalize_heading_spacing(document)
         split_merged_heading_count = self._split_merged_numbered_headings(document)
         converted_list_style_heading_count = (
@@ -482,16 +656,18 @@ class DoclingParser(PaperParser):
         return normalized_count
 
     @staticmethod
-    def _normalize_soft_hyphens(document: DoclingDocument) -> int:
-        """移除因 PDF 断行遗留的软连字符，恢复完整单词。
+    def _normalize_pdf_word_breaks(document: DoclingDocument) -> int:
+        """在创建 Markdown 和 Chunk 前修复 PDF 自动换行造成的断词。
 
-        例如页面末尾 ``al-``、下一行 ``ternatives`` 在 PDF 文本层中常被编码为
-        ``al\\u00ad ternatives``。软连字符仅表示排版时可以断行，删除它及其后的
-        空白后会得到 ``alternatives``。真正的 ASCII 连字符完全不处理，因此
-        ``state-of-the-art``、``weather-dependent`` 等复合词会原样保留。
+        PDF 的文本层常将同一单词拆成两行。常见的软连字符 ``U+00AD`` 可以无条件
+        删除；普通 ASCII 连字符则存在歧义，因此交由
+        `_is_likely_word_split` 采用保守的英语形态规则判断。无论是否
+        去掉连字符，换行本身都会被消除，避免词法检索把一个词分成两段。
 
-        ``orig`` 保存着 Docling 的原始抽取文本；这里仅规范化供 Markdown、嵌入与
-        检索使用的 ``text``。公式由独立的 LaTeX 富化模型生成，避免在此处修改。
+        此处修改的是 Docling 原生对象的 ``text``，所以 Markdown、Step 2 的
+        ``raw_text``、SQLite FTS5 以及 embedding 会同步使用同一份干净文本；不会在
+        各下游环节复制一套容易不一致的补丁。``orig`` 仍保留 Docling 的原始抽取内容
+        以便审计。公式对象由独立的 LaTex 富化模型产生，绝不在这里改写。
         """
         normalized_count = 0
         for item, _level in document.iterate_items():
@@ -499,14 +675,45 @@ class DoclingParser(PaperParser):
                 continue
 
             original_text = getattr(item, "text", "") or ""
-            normalized_text = _SOFT_HYPHEN_AND_FOLLOWING_SPACE.sub(
-                "", original_text
-            )
+            normalized_text = _normalize_pdf_word_breaks_in_text(original_text)
             if normalized_text != original_text:
                 item.text = normalized_text
                 normalized_count += 1
 
+        # 文本层还可能把一个自然段拆为两个相邻 TextItem。这里仅接受前项以连字符结束、
+        # 后项从小写英文词开始的强证据；标题、公式、表格或列表项会中断候选链，绝不会
+        # 被跨越。合并后把右项 provenance 一并附到左项，页码追溯仍覆盖原始两端来源。
+        previous_text_item: object | None = None
+        items_to_delete: list[object] = []
+        for item, _level in document.iterate_items():
+            if getattr(item, "label", None) != DocItemLabel.TEXT:
+                previous_text_item = None
+                continue
+            if previous_text_item is None:
+                previous_text_item = item
+                continue
+
+            merged_text = _join_adjacent_hard_word_break(
+                left_text=getattr(previous_text_item, "text", "") or "",
+                right_text=getattr(item, "text", "") or "",
+            )
+            if merged_text is None:
+                previous_text_item = item
+                continue
+
+            previous_text_item.text = merged_text
+            previous_provenance = getattr(previous_text_item, "prov", None)
+            if isinstance(previous_provenance, list):
+                # provenance 是来源页与坐标的列表。把右项来源附给合并后的左项，确保
+                # Step 2 计算 page_start/page_end 时仍能看到跨页句子的完整来源范围。
+                previous_provenance.extend(getattr(item, "prov", []) or [])
+            items_to_delete.append(item)
+            normalized_count += 1
+
+        if items_to_delete:
+            document.delete_items(node_items=items_to_delete)
         return normalized_count
+
 
     @staticmethod
     def _split_merged_numbered_headings(document: DoclingDocument) -> int:

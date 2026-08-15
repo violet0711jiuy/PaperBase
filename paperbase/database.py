@@ -410,6 +410,34 @@ class MetadataDatabase:
                 ).fetchall()
             )
 
+    def list_content_chunks_in_section(
+        self,
+        *,
+        paper_id: str,
+        section: str,
+    ) -> tuple[sqlite3.Row, ...]:
+        """返回同一论文、同一章节的正文块，供 Step 8 安全扩展相邻上下文。
+
+        该查询从 ``chunks`` 真相表读取，不依赖 FAISS 或 FTS5。``section_type``
+        的过滤确保 References/Bibliography 永远不会被当作正文邻居拼入回答证据。
+        """
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT chunks.*, documents.paper_title
+                    FROM chunks
+                    INNER JOIN documents ON documents.paper_id = chunks.paper_id
+                    WHERE chunks.paper_id = ?
+                      AND chunks.section = ?
+                      AND chunks.section_type = 'content'
+                    ORDER BY chunks.chunk_index
+                    """,
+                    (paper_id, section),
+                ).fetchall()
+            )
+
     def list_embedding_inputs(self) -> tuple[sqlite3.Row, ...]:
         """按稳定顺序返回 Step 4 所需的文档 embedding 输入快照。
 
@@ -665,8 +693,14 @@ class MetadataDatabase:
                 ).fetchall()
             )
 
-    def search_bibliography(self, query: str, *, top_k: int) -> tuple[sqlite3.Row, ...]:
-        """仅在 Query Rewrite 判断为 citation/reference intent 时检索参考文献 FTS5。"""
+    def search_bibliography(
+        self,
+        query: str,
+        *,
+        paper_id: str,
+        top_k: int,
+    ) -> tuple[sqlite3.Row, ...]:
+        """在指定论文内部检索参考文献 FTS5，避免宽泛主题词命中其他论文的引用条目。"""
         normalized_query = " ".join(query.split())
         if not normalized_query:
             raise MetadataDatabaseError("Bibliography query must not be empty.")
@@ -682,11 +716,13 @@ class MetadataDatabase:
                     FROM bibliography_fts
                     JOIN chunks ON chunks.chunk_id = bibliography_fts.chunk_id
                     JOIN documents ON documents.paper_id = chunks.paper_id
-                    WHERE bibliography_fts MATCH ? AND chunks.section_type = 'bibliography'
+                    WHERE bibliography_fts MATCH ?
+                      AND chunks.section_type = 'bibliography'
+                      AND chunks.paper_id = ?
                     ORDER BY bm25_score ASC, chunks.chunk_id ASC
                     LIMIT ?
                     """,
-                    (_fts5_literal_phrase(normalized_query), top_k),
+                    (_fts5_literal_phrase(normalized_query), paper_id, top_k),
                 ).fetchall()
             )
 
@@ -694,9 +730,10 @@ class MetadataDatabase:
         self,
         keywords: Sequence[str],
         *,
+        paper_id: str,
         top_k: int,
     ) -> tuple[sqlite3.Row, ...]:
-        """以一个英文关键词组查询 bibliography FTS5，通常比完整自然语言问句更适合引用条目。"""
+        """以英文关键词组查询指定论文的 bibliography FTS5，通常比完整问句更适合引用条目。"""
         normalized = tuple(
             dict.fromkeys(" ".join(keyword.split()) for keyword in keywords if keyword.strip())
         )
@@ -715,11 +752,13 @@ class MetadataDatabase:
                     FROM bibliography_fts
                     JOIN chunks ON chunks.chunk_id = bibliography_fts.chunk_id
                     JOIN documents ON documents.paper_id = chunks.paper_id
-                    WHERE bibliography_fts MATCH ? AND chunks.section_type = 'bibliography'
+                    WHERE bibliography_fts MATCH ?
+                      AND chunks.section_type = 'bibliography'
+                      AND chunks.paper_id = ?
                     ORDER BY bm25_score ASC, chunks.chunk_id ASC
                     LIMIT ?
                     """,
-                    (fts_query, top_k),
+                    (fts_query, paper_id, top_k),
                 ).fetchall()
             )
 

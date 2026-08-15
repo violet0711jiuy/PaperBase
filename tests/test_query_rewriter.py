@@ -10,8 +10,10 @@ from paperbase.config import QueryRewriteSettings
 from paperbase.llm.client import LLMRequestError
 from paperbase.retrieval.query_rewriter import (
     LLMQueryRewriter,
+    NoopQueryRewriter,
     QueryRewriteResult,
     normalize_query_rewrite,
+    resolve_bibliography_search_rule,
 )
 
 
@@ -30,7 +32,8 @@ class _FakeClient:
         json_schema: dict[str, object],
         schema_name: str,
     ) -> str:
-        # 记录调用顺序，用于验证首次失败后才进入 JSON Repair fallback。
+        # 记录每一次模型调用的参数。这里主要用于确认结构化输出失败时不会悄悄再发起
+        # 第二次“修复 JSON”调用；这样测试能防止未来修改又把不可控的修复路径加回来。
         self.calls.append(
             {
                 "schema_name": schema_name,
@@ -80,13 +83,12 @@ class QueryRewriterTests(unittest.TestCase):
             {"semantic_query", "lexical_keywords_en", "search_bibliography"},
         )
 
-    def test_invalid_first_output_uses_json_repair_then_revalidates(self) -> None:
+    def test_invalid_structured_output_falls_back_without_a_second_llm_call(self) -> None:
         client = _FakeClient(
             [
-                # 额外字段违反 extra=forbid，首次 Pydantic 校验必须失败。
+                # extra 字段违反 QueryRewriteResult 的 extra="forbid" 契约。
+                # 即使 API 层已请求 JSON Schema，本地仍必须把供应商返回视为外部输入并校验。
                 '{"semantic_query": null, "lexical_keywords_en": [], "search_bibliography": false, "extra": true}',
-                # Repair 返回的内容再次经过同一个 Pydantic Schema 校验。
-                '{"semantic_query": null, "lexical_keywords_en": ["LSTM"], "search_bibliography": false}',
             ]
         )
         rewriter = LLMQueryRewriter(
@@ -96,19 +98,17 @@ class QueryRewriterTests(unittest.TestCase):
 
         plan = rewriter.rewrite("作者是谁？")
 
-        self.assertEqual(plan.status, "success")
+        # 结构化输出不合法时不再启动 JSON Repair。Query Rewrite 是可选增强功能，
+        # 所以系统应只使用一次 LLM 调用后退回原始问题，不让错误 JSON 中断检索。
+        self.assertEqual(plan.status, "fallback")
         self.assertIsNone(plan.semantic_query)
-        self.assertEqual(plan.lexical_keywords_en, ("LSTM",))
-        self.assertEqual(
-            [call["schema_name"] for call in client.calls],
-            ["query_rewrite_result", "query_rewrite_result_repair"],
-        )
+        self.assertEqual(plan.lexical_keywords_en, ())
+        self.assertEqual([call["schema_name"] for call in client.calls], ["query_rewrite_result"])
 
-    def test_invalid_structured_output_and_repair_failure_always_fall_back_to_original_query(self) -> None:
+    def test_invalid_structured_output_always_falls_back_to_original_query(self) -> None:
         client = _FakeClient(
             [
                 '{"semantic_query": 123, "lexical_keywords_en": [], "search_bibliography": false}',
-                '{"semantic_query": [], "lexical_keywords_en": [], "search_bibliography": false}',
             ]
         )
         rewriter = LLMQueryRewriter(
@@ -121,8 +121,9 @@ class QueryRewriterTests(unittest.TestCase):
 
         self.assertEqual(plan.status, "fallback")
         self.assertEqual(plan.original_query, "作者是谁？")
+        self.assertEqual(len(client.calls), 1)
 
-    def test_unavailable_llm_falls_back_to_original_query_without_repair(self) -> None:
+    def test_unavailable_llm_falls_back_to_original_query(self) -> None:
         client = _FakeClient([LLMRequestError("network unavailable")])
         rewriter = LLMQueryRewriter(
             settings=QueryRewriteSettings(fallback_to_original=True),
@@ -171,6 +172,52 @@ class QueryRewriterTests(unittest.TestCase):
             settings=QueryRewriteSettings(), client=comparison_client
         ).rewrite("Graph WaveNet 和本文模型有什么区别？")
         self.assertFalse(comparison_plan.search_bibliography)
+
+    def test_bibliography_rules_classify_explicit_true_false_and_ambiguous_queries(self) -> None:
+        # 明确询问参考文献、引用关系或编号条目时，不依赖 LLM 的不稳定判断。
+        self.assertTrue(resolve_bibliography_search_rule("这篇论文有没有引用 Graph WaveNet？"))
+        self.assertTrue(resolve_bibliography_search_rule("作者为什么引用 Graph WaveNet？"))
+        self.assertTrue(resolve_bibliography_search_rule("[15] 是哪篇论文？"))
+        # 方法比较、baseline 和实现机制问题应优先从正文找证据。
+        self.assertFalse(resolve_bibliography_search_rule("Graph WaveNet 和本文方法有什么区别？"))
+        self.assertFalse(resolve_bibliography_search_rule("这篇论文用了哪些 baseline？"))
+        self.assertFalse(resolve_bibliography_search_rule("动态图是怎么构建的？"))
+        # 不包含高精度信号的问题不由规则猜测，保留给 LLM 结合上下文判断。
+        self.assertIsNone(resolve_bibliography_search_rule("请解释 Graph WaveNet 的作用。"))
+
+    def test_explicit_rule_overrides_llm_bibliography_decision(self) -> None:
+        # 即使 LLM 漏判引用意图，正向规则仍强制开启 bibliography FTS5。
+        citation_client = _FakeClient(
+            ['{"semantic_query": "Does this paper cite Graph WaveNet?", '
+             '"lexical_keywords_en": ["Graph WaveNet"], "search_bibliography": false}']
+        )
+        citation_plan = LLMQueryRewriter(
+            settings=QueryRewriteSettings(), client=citation_client
+        ).rewrite("这篇论文有没有引用 Graph WaveNet？")
+        self.assertTrue(citation_plan.search_bibliography)
+
+        # 即使 LLM 因论文名误判为引用问题，明确的正文比较规则仍强制关闭该索引。
+        comparison_client = _FakeClient(
+            ['{"semantic_query": "How does Graph WaveNet differ from the proposed model?", '
+             '"lexical_keywords_en": ["Graph WaveNet"], "search_bibliography": true}']
+        )
+        comparison_plan = LLMQueryRewriter(
+            settings=QueryRewriteSettings(), client=comparison_client
+        ).rewrite("Graph WaveNet 和本文方法有什么区别？")
+        self.assertFalse(comparison_plan.search_bibliography)
+
+    def test_explicit_citation_rule_survives_llm_failure_and_disabled_rewriter(self) -> None:
+        # 外部 LLM 不可用时，引用问题仍走正文检索加 bibliography FTS5，不会退化为正文-only。
+        fallback_plan = LLMQueryRewriter(
+            settings=QueryRewriteSettings(),
+            client=_FakeClient([LLMRequestError("network unavailable")]),
+        ).rewrite("这篇论文有没有引用 Graph WaveNet？")
+        self.assertEqual(fallback_plan.status, "fallback")
+        self.assertTrue(fallback_plan.search_bibliography)
+
+        disabled_plan = NoopQueryRewriter().rewrite("[15] 是哪篇论文？")
+        self.assertEqual(disabled_plan.status, "disabled")
+        self.assertTrue(disabled_plan.search_bibliography)
 
     def test_recent_context_is_bounded_and_passed_to_rewrite_prompt(self) -> None:
         client = _FakeClient(

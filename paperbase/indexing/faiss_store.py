@@ -383,27 +383,34 @@ class FaissIndexStore:
         manifest = journal["manifest"]
         dimension = int(manifest["dimension"])
         candidate_index_path = Path(journal["candidate_index_path"])
-        # 若上一次中断已经移动了候选文件，正式索引也可作为恢复来源；两者都必须通过同一套
-        # ID 集合和维度验证，绝不只因为文件存在就信任它。
-        if not _index_file_matches(
-            self._index_path,
-            expected_dimension=dimension,
-            expected_vector_ids=expected_vector_ids,
-        ):
-            if not _index_file_matches(
-                candidate_index_path,
+        # 旧正式索引可能恰好拥有相同的维度和 vector_id 集合，却对应旧的向量内容。
+        # 因此“ID 集合正确”不足以证明它就是本次候选索引；发布前还必须比较 journal
+        # 中记录的候选文件 SHA-256。否则重建后可能把新 SQLite 映射错误地配回旧向量。
+        published_is_expected = (
+            _index_file_matches(
+                self._index_path,
                 expected_dimension=dimension,
                 expected_vector_ids=expected_vector_ids,
-            ):
+            )
+            and _file_sha256(self._index_path) == manifest.get("index_sha256")
+        )
+        if not published_is_expected:
+            candidate_is_expected = (
+                _index_file_matches(
+                    candidate_index_path,
+                    expected_dimension=dimension,
+                    expected_vector_ids=expected_vector_ids,
+                )
+                and _file_sha256(candidate_index_path) == manifest.get("index_sha256")
+            )
+            if not candidate_is_expected:
                 raise FaissIndexError(
                     "Neither the published nor candidate FAISS file matches the pending journal."
                 )
             self._index_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(candidate_index_path, self._index_path)
 
-        # 只有正式索引文件的校验和与 journal 中的候选索引一致，才允许公开新的 manifest。
-        if _file_sha256(self._index_path) != manifest.get("index_sha256"):
-            raise FaissIndexError("Published FAISS file checksum does not match the pending journal.")
+        # 到此正式索引已通过候选 journal 的内容校验，才允许公开与之绑定的 manifest。
         _write_json_atomic(self._manifest_path, manifest)
         _validate_manifest(
             manifest=manifest,

@@ -1,145 +1,182 @@
 # PaperBase 的非敏感、可调运行参数。
-#
-# 路径可使用相对路径（相对于本文件所在的项目根目录）或绝对路径。模型缓存继续
-# 固定使用 D 盘，不要把模型目录改到 C 盘。API Key、Token 等敏感信息未来放在 .env，
-# 不写入本文件，也不提交到 Git。
+# 路径可使用相对路径（相对本文件所在的项目根目录）或绝对路径；API Key、Token 等敏感信息只放在 .env。
 
+# 项目的基础标识信息。
 project:
+  # 项目名称：用于日志、检查产物等位置标识当前项目。
   name: PaperBase
 
-# 所有业务数据目录集中在这里。后续 SQLite、FAISS、评测等模块会继续在本文件增加
-# 对应的小节，而不是在业务代码中分散硬编码路径与参数。
+# 项目本地数据的统一存储位置。
 storage:
+  # 原始论文 PDF 的存放目录。
   papers_dir: storage/papers
+  # 解析后的 Markdown、检查报告等产物目录。
   parsed_dir: storage/parsed
+  # 可重新生成的中间产物目录，例如 embedding 文件。
   staging_dir: storage/staging
 
+# Step 1：论文解析相关配置。
 parsing:
-  # 解析器选择项。当前已实现 docling；未来接入 MinerU 等工具时，只需增加适配器和
-  # 对应的配置小节，再将此值改为新的解析器标识。
+  # 解析器后端标识；未来接入其他解析工具时可在此切换。
   backend: docling
-
-  # 解析检查产物（Markdown、原生 JSON、检查报告）的输出位置。保留公式模型名称，
-  # 便于未来比较不同解析器或模型的同一篇论文结果。
+  # 供人工检查的解析产物输出目录。
   inspection_output_dir: storage/parsed/granite_docling
 
-  # 论文首页的作者、单位、摘要、关键词和出版信息不应依赖出版社是否把它们标成正文
-  # section。Parser 会以受控标签、首页位置和内容特征输出统一 front_matter 语义块。
-  # 该配置属于解析器无关的 ParsedPaper 契约；未来替换 MinerU 等工具时仍继续使用。
+  # 论文前置元数据（标题、作者、摘要、关键词等）的识别配置。
   front_matter:
+    # 是否启用前置元数据的统一识别与整理。
     enabled: true
+    # 最多扫描前几页以识别论文前置元数据。
     max_pages: 2
 
+  # Docling 解析器专用配置。
   docling:
-    # 已下载的 Docling 本地模型目录。必须保留在 D 盘的统一模型缓存中。
+    # 已下载的 Docling 本地模型目录。
     artifacts_path: D:/AI_Workspace/AI_Models/docling_models
+    # 模型推理设备；cuda 表示使用 NVIDIA GPU。
     device: cuda
-
-    # 当前论文为可提取文本的数字 PDF，因此关闭 OCR；扫描版论文需要在单独验证后再开。
+    # 是否对扫描版或无文本层 PDF 启用 OCR。
     enable_ocr: false
-
-    # 保留当前已验证的公式识别配置。该选项并不能保证所有行内公式正确，具体限制仍需
-    # 通过 inspection 报告和 Markdown 抽样检查。
+    # 是否启用公式增强识别。
     enable_formula_enrichment: true
+    # 公式增强所使用的预设模型。
     formula_preset: granite_docling
-
-    # Windows 下编译模型会触发 GBK 编码问题，当前必须保持关闭。
+    # 是否编译版面分析模型；Windows 当前保持关闭以避免编码兼容问题。
     compile_layout_model: false
+    # 是否编译公式模型；Windows 当前保持关闭以避免编码兼容问题。
     compile_formula_model: false
-
-    # 解析器会把被 Docling 明确标注的页眉、页脚从 Markdown 与后续分块中移除；期刊名、
-    # 卷期等非页码信息会保存到 ParsedPaper.page_furniture 供来源展示或存储层使用。
+    # 是否从正文 Markdown 中移除 Docling 已明确标注的页眉和页脚。
     remove_page_furniture: true
-
-    # 有些 PDF 带有不可见的审稿文本层。本开关只清理同时含 FOR PEER REVIEW 标记、且
-    # 位于完全相同坐标带的碎片；没有充分证据的重复正文不会被自动删除。
+    # 是否清理 PDF 中与正文重叠的匿名审稿标记等无效文本碎片。
     remove_peer_review_artifacts: true
-
-    # 超长 ``1) ...`` 项若还被紧随正文中的 ``2) ...`` 连续项证实为列表，会在 Parser
-    # 阶段从错误的 section_header 转回 ListItem。短括号编号标题不会改写。
+    # 将疑似列表项而非标题的长“1) ...”文本恢复为列表项时使用的最小字符数阈值。
     list_style_heading_min_chars: 80
 
-# Step 2：结构感知分块。token 上限使用之后真正生成向量的 Qwen tokenizer 计数，而非
-# Docling 默认 MiniLM tokenizer；这样不会触发 C 盘缓存下载，也避免两个模型的切词差异。
+# Step 2：结构感知分块配置。
 chunking:
+  # 分块器后端标识。
   backend: docling_hybrid
-
-  # embedding_text 的总长度上限。HybridChunker 会预留下面的标题/章节元数据预算，
-  # 因此正文分块的实际预算为 512 - 64 = 448 tokens。
+  # 每个 embedding_text 的最大 token 数。
   max_tokens: 512
+  # 为标题、章节等嵌入元数据预留的 token 数。
   embedding_metadata_reserve_tokens: 64
-
-  # Qwen3-Embedding-0.6B 已下载到 D 盘。本阶段只加载其 tokenizer，不加载模型权重，
-  # 所以不占用 GPU 显存；Step 4 才会用同一路径加载 embedding 模型。
+  # 用于 token 计数的本地 tokenizer 路径，不会在此步骤加载完整 embedding 模型。
   tokenizer_path: D:/AI_Workspace/AI_Models/hf_models/Qwen3-Embedding-0.6B
-
-  # 仅供人工检查的分块 JSONL 与报告。它不是正式 metadata 存储；SQLite 在 Step 3 引入。
+  # 供人工检查的分块 JSONL 与报告输出目录。
   inspection_output_dir: storage/parsed/chunks/qwen3_embedding_0_6b
-
-  # 跨页表格分块时重复表头，避免孤立的后续行失去列语义；相邻同级项目允许合并，
-  # 由 HybridChunker 在 token 上限内决定，不使用固定字符数切分。
+  # 跨页表格分块时是否在后续块中重复表头。
   repeat_table_header: true
+  # 是否在 token 上限允许时合并相邻、同层级的分块。
   merge_peers: true
 
-# Step 3：正式元数据存储。SQLite 是一个本地单文件数据库，不需要下载、安装或启动
-# 服务端；此处只存论文、前置元数据和 chunk，绝不把 PDF 二进制或后续的向量写入其中。
+# Step 3：SQLite 元数据数据库配置。
 database:
+  # SQLite 数据库文件路径；其中存储论文、分块、元数据和 FTS 索引。
   path: storage/paperbase.sqlite3
-
-  # 多次导入不会并发执行，但为以后 Streamlit 上传与查询同时发生的场景保留短暂等待。
+  # SQLite 遇到短暂锁定时的最长等待时间，单位为毫秒。
   busy_timeout_ms: 5000
 
-# Step 4：仅生成可审计的本地 embedding 产物。向量不写入 SQLite；Step 5 建立统一
-# FAISS 索引成功后，才会为 chunks.vector_id 分配正式 ID。
+# Step 4：向量生成配置。
 embedding:
-  # 通过 backend 工厂选择适配器。未来替换模型时新增适配器与配置，而不是改业务调用方。
+  # embedding 模型适配器后端标识。
   backend: qwen_sentence_transformers
+  # 模型的 Hugging Face 标识，用于记录模型来源与版本语义。
   model_id: Qwen/Qwen3-Embedding-0.6B
+  # 已下载的本地 embedding 模型目录。
   model_path: D:/AI_Workspace/AI_Models/hf_models/Qwen3-Embedding-0.6B
+  # 生成向量时使用的推理设备。
   device: cuda
-
-  # RTX 5060 8GB 显存下从保守的 16 开始；如实测显存充足可逐步增大，不影响已有向量含义。
+  # 单批次送入 embedding 模型的文本数量；可按显存情况调整。
   batch_size: 16
+  # 是否对向量做 L2 归一化，以便内积等价于余弦相似度。
   normalize_embeddings: true
-
-  # 产物包括 vectors.npy、records.jsonl、manifest.json，属于可重建的 staging 数据，
-  # 不应当作为 Git 源码提交。
+  # vectors.npy、records.jsonl、manifest.json 等可重建中间产物的输出目录。
   output_dir: storage/staging/embeddings/qwen3_embedding_0_6b
 
-# Step 5：唯一的正式知识库向量索引。FAISS 只保存向量与 vector_id；论文和 chunk
-# metadata 仍由 SQLite 保存。当前先实现全库首次建库，增量加入由后续入库服务负责。
+# Step 5：FAISS 向量索引配置。
 indexing:
+  # FAISS 索引后端；flat_ip 表示精确内积检索。
   backend: faiss_flat_ip
+  # 正式 FAISS 向量索引文件路径。
   index_path: storage/paperbase.faiss
+  # FAISS 索引清单文件路径，用于校验索引与 SQLite 的对应关系。
   manifest_path: storage/paperbase.faiss.manifest.json
 
-# Step 6：LLM Query 改写 + Dense + SQLite FTS5/BM25 的混合召回。LLM 的 Token、
-# API 地址与模型名只放在 .env；这里仅保存可公开、可实验的检索策略参数。
+# Step 7：本地 Cross-Encoder 重排序配置。
+reranking:
+  # 重排序器后端标识；未来可替换为其他本地或远程重排序模型。
+  backend: bge_cross_encoder
+  # 是否启用正文候选的重排序；关闭时保留 Step 6 的 RRF 排序。
+  enabled: true
+  # 模型的 Hugging Face 标识，用于记录模型来源与版本语义。
+  model_id: BAAI/bge-reranker-v2-m3
+  # 已下载的本地重排序模型目录。
+  model_path: D:/AI_Workspace/AI_Models/hf_models/bge-reranker-v2-m3
+  # 重排序推理设备；cuda 表示使用 NVIDIA GPU。
+  device: cuda
+  # 单批次输入模型的“问题 + 正文 chunk”配对数量；可按显存情况调整。
+  batch_size: 8
+  # 每个问题最多送入重排序器的正文 RRF 候选数量。
+  candidate_top_k: 40
+  # 未指定命令行 --top-k 时，最终默认保留的正文证据数量。
+  final_top_k: 5
+  # 每个“问题 + chunk”配对的最大 token 数，超出部分在 chunk 尾部截断。
+  max_length: 1024
+  # 是否将原始 logit 经过 sigmoid 转换为 0 到 1 的可读相关性分数。
+  normalize_scores: true
+
+# Step 8：以“同论文、同章节、连续 chunk”为边界补齐 Reranker 命中的上下文。
+context_expansion:
+  # 是否启用相邻 chunk 扩展；关闭后仅将 Reranker 返回的原始 chunk 作为回答证据。
+  enabled: true
+  # 命中 chunk 左右各最多扩展几个连续 chunk；1 表示可组成“前一块 + 命中块 + 后一块”。
+  neighbor_window: 1
+  # 所有正文证据组可送入回答模型的最大 token 预算；只保留完整 chunk，不从中间截断。
+  max_total_tokens: 6000
+
+# Step 8：基于已扩展证据生成最终回答的运行开关。
+answer_generation:
+  # 是否调用 LLM 生成带证据标识的回答；关闭时仍输出可审阅的检索与扩展证据。
+  enabled: true
+  # 最多向回答模型提供多少个证据单元；正文证据和参考文献证据共同计数。
+  max_evidence_units: 8
+
+# Step 6：LLM Query Rewrite、Dense 和 FTS5/BM25 混合检索配置。
 retrieval:
+  # 检索器后端标识。
   backend: hybrid_rrf
+  # 每条 Dense 查询路径召回的候选数量。
   dense_top_k_per_query: 20
+  # 原始用户问题经 BM25 检索时召回的候选数量。
   bm25_original_top_k: 10
+  # LLM 改写问题与英文关键词经 BM25 检索时召回的候选数量。
   bm25_rewrite_top_k: 20
-  fused_top_k: 40
+  # RRF 融合、去重后送入重排阶段之前保留的候选数量。
+  fused_top_k: 50
+  # Reciprocal Rank Fusion 的平滑常数。
   rrf_k: 60
-
-  # RRF 不直接比较 FAISS 与 BM25 的原始数值，而是按排名融合。英文关键词组只构成一条
-  # Rewritten BM25 路径，因此不会因关键词数量增加而放大权重。
-  dense_original_weight: 1.0
-  dense_rewrite_weight: 1.0
-  bm25_original_weight: 0.7
-  bm25_rewrite_weight: 1.0
-
-  # Qwen Query 侧的任务提示，不发送给生成 LLM，也不加入文档 embedding。
+  # 原始问题 Dense 路径在加权 RRF 中的权重。
+  dense_original_weight: 0.8
+  # LLM 改写问题 Dense 路径在加权 RRF 中的权重。
+  dense_rewrite_weight: 1.2
+  # 原始问题 BM25 路径在加权 RRF 中的权重。
+  bm25_original_weight: 0.6
+  # 改写问题与英文关键词 BM25 路径在加权 RRF 中的权重。
+  bm25_rewrite_weight: 1.2
+  # Qwen embedding 在查询侧使用的任务指令，不会写入论文文本或发送给生成 LLM。
   query_instruction: >
     Given a Chinese or English academic question, retrieve relevant passages
     from a collection of scientific papers that answer the question.
 
+  # LLM Query Rewrite 的开关和候选控制参数。
   query_rewrite:
+    # 是否启用 LLM 对用户问题进行语义补全、英文改写和英文关键词提取。
     enabled: true
+    # LLM 输出中保留的英文词法检索关键词最大数量。
     max_lexical_keywords_en: 3
-    # 仅传入最近几条检索相关历史，用于消解“这个”“它”等追问指代。
+    # 传给 LLM 以消解追问指代的最近对话轮次上限。
     max_context_turns: 4
-    # 明确询问引用/参考文献时，额外返回的 bibliography FTS5 候选数。
+    # 明确询问引用或参考文献时，额外从 bibliography FTS5 返回的候选数量。
     bibliography_top_k: 5
+    # Query Rewrite 失败时是否自动退回为仅使用原始问题检索。
     fallback_to_original: true

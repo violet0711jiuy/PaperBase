@@ -11,6 +11,7 @@ from paperbase.config import default_config_path, load_settings
 from paperbase.database import MetadataDatabase
 from paperbase.embedding import QueryEmbedder, create_document_embedder
 from paperbase.indexing import FaissIndexStore
+from paperbase.reranking import create_reranker
 
 from .hybrid_retriever import HybridRetriever, RetrievedChunk
 from .query_rewriter import create_query_rewriter
@@ -36,12 +37,17 @@ def create_hybrid_retriever(*, config_path: Path | str | None = None) -> HybridR
         settings=settings.retrieval.query_rewrite,
         env_path=settings.config_path.parent / ".env",
     )
+    reranker = (
+        create_reranker(settings.reranking) if settings.reranking.enabled else None
+    )
     return HybridRetriever(
         database=database,
         query_embedder=embedder,
         index_store=index_store,
         settings=settings.retrieval,
         query_rewriter=rewriter,
+        reranker=reranker,
+        reranking_settings=settings.reranking,
     )
 
 
@@ -75,8 +81,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     result = create_hybrid_retriever(config_path=args.config).retrieve(
         args.query,
         conversation_context=args.context,
+        # --top-k 在检索阶段分配正文与参考文献名额，而不是在最终 JSON 中简单截断。
+        result_limit=args.top_k,
     )
-    chunks = result.chunks if args.top_k is None else result.chunks[: args.top_k]
+    chunks = result.chunks
     payload = {
         # 原始问题：空白规范化后的用户输入，始终参与基础检索。
         "query": result.query,
@@ -91,6 +99,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             # 仅明确 citation/reference intent 时为 true，才会额外查询 bibliography FTS5。
             "search_bibliography": result.rewrite_plan.search_bibliography,
         },
+        # 正文重排序状态：success 表示 Cross-Encoder 已生效；fallback 表示安全沿用 RRF；disabled 表示未启用。
+        "reranking_status": result.reranking_status,
         # 展示条数：受命令行 --top-k 限制后的结果数量。
         "result_count": len(chunks),
         # 召回片段列表：每一项均含可追溯的论文定位信息和各通道命中证据。
@@ -128,6 +138,10 @@ def _chunk_to_json(chunk: RetrievedChunk) -> dict[str, object]:
         "page_end": chunk.page_end,
         # 原始文本预览：只输出前 500 字符，完整原文仍保存于 SQLite。
         "raw_text": chunk.raw_text[:500],
+        # 重排序前名次：正文在 Step 6 RRF 队列中的位置；参考文献直出候选为 null。
+        "pre_rerank_rank": chunk.pre_rerank_rank,
+        # 重排序相关性分数：正文由 Cross-Encoder 产生；未重排或参考文献直出候选为 null。
+        "rerank_score": chunk.rerank_score,
         # 融合得分：各命中通道加权 RRF 分数之和，只用于本次排序解释。
         "fused_score": chunk.fused_score,
         # 命中证据：同一 chunk 在每条检索通道中的排名、原始分数和实际权重。
