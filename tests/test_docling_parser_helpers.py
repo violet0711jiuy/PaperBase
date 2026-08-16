@@ -9,10 +9,12 @@ from docling_core.types.doc import DocItemLabel
 
 from paperbase.parsing.docling_parser import (
     _LIST_STYLE_ITEM,
+    _TitleCandidate,
     _have_stable_provenance_positions,
     _has_next_list_item,
     _join_adjacent_hard_word_break,
     _normalize_pdf_word_breaks_in_text,
+    _resolve_title_candidates,
 )
 
 
@@ -162,6 +164,127 @@ class DoclingParserHelperTests(unittest.TestCase):
                 right_text="the next item begins here.",
             )
         )
+
+    def test_real_energy_homepage_sequence_selects_paper_title_not_short_journal_name(self) -> None:
+        """复现 Saeed 真实首页顺序：短期刊名不能因靠前而压过作者-摘要链后的标题。"""
+        resolution = _resolve_title_candidates(
+            _title_candidates(
+                (DocItemLabel.SECTION_HEADER, "Contents lists available at ScienceDirect"),
+                (DocItemLabel.SECTION_HEADER, "Energy"),
+                (DocItemLabel.TEXT, "journal homepage: www.elsevier.com/locate/energy"),
+                (
+                    DocItemLabel.SECTION_HEADER,
+                    "Enhanced wind speed forecasting for sustainable power systems: "
+                    "A deep learning framework unifying deterministic predictions "
+                    "and uncertainty quantification",
+                ),
+                (DocItemLabel.SECTION_HEADER, "Authors and affiliations"),
+                (DocItemLabel.TEXT, "Adnan Saeed a, Chaoshun Li a, Saeed Rubaiee b"),
+                (
+                    DocItemLabel.TEXT,
+                    "School of Civil Engineering, Huazhong University of Science and Technology",
+                ),
+                (DocItemLabel.SECTION_HEADER, "Keywords"),
+                (DocItemLabel.SECTION_HEADER, "Abstract"),
+            )
+        )
+        self.assertEqual(
+            resolution.paper_title,
+            "Enhanced wind speed forecasting for sustainable power systems: "
+            "A deep learning framework unifying deterministic predictions "
+            "and uncertainty quantification",
+        )
+        self.assertNotEqual(resolution.paper_title, "Energy")
+        self.assertEqual(resolution.title_source, "front_matter_coherence_scoring")
+
+    def test_real_expert_systems_homepage_sequence_selects_esdtw_not_journal_name(self) -> None:
+        """复现 Qiu 真实首页顺序：长刊名也必须输给完整的标题-作者-单位-摘要结构。"""
+        resolution = _resolve_title_candidates(
+            _title_candidates(
+                (DocItemLabel.TEXT, "Contents lists available at ScienceDirect"),
+                (DocItemLabel.SECTION_HEADER, "Expert Systems With Applications"),
+                (DocItemLabel.TEXT, "journal homepage: www.elsevier.com/locate/eswa"),
+                (DocItemLabel.SECTION_HEADER, "ESDTW:Extrema-based shape dynamic time warping"),
+                (DocItemLabel.TEXT, "Lianpeng Qiu a, Cuipeng Qiu b, Chengyun Song a"),
+                (
+                    DocItemLabel.TEXT,
+                    "School of Computer Science and Engineering, Chongqing University of Technology",
+                ),
+                # 标题 resolver 在既有 front matter 规范化之前运行；真实 Qiu 首页的
+                # ARTICLE INFO 容器会在后续才被提升为 Keywords，故此处保留原始形态。
+                (DocItemLabel.SECTION_HEADER, "ARTICLE INFO"),
+                (DocItemLabel.TEXT, "Keywords: Dynamic time warping; Time series"),
+                (DocItemLabel.SECTION_HEADER, "Abstract"),
+            )
+        )
+        self.assertEqual(
+            resolution.paper_title,
+            "ESDTW:Extrema-based shape dynamic time warping",
+        )
+        self.assertNotEqual(resolution.paper_title, "Expert Systems With Applications")
+        scores = {item.candidate.text: item.score for item in resolution.ranked_candidates}
+        self.assertGreater(
+            scores["ESDTW:Extrema-based shape dynamic time warping"],
+            scores["Expert Systems With Applications"],
+        )
+
+    def test_long_journal_and_short_real_title_do_not_depend_on_text_length(self) -> None:
+        """短真实标题有作者-单位-摘要链时，应胜过更长的期刊名。"""
+        resolution = _resolve_title_candidates(
+            _title_candidates(
+                (DocItemLabel.SECTION_HEADER, "Long Journal Name for Computational Studies"),
+                (DocItemLabel.TEXT, "journal homepage: example.org/journal"),
+                (DocItemLabel.SECTION_HEADER, "Flux Map"),
+                (DocItemLabel.TEXT, "Alice Brown, Bob Chen, Carol Diaz"),
+                (DocItemLabel.TEXT, "Department of Physics, Example University"),
+                (DocItemLabel.SECTION_HEADER, "Abstract"),
+            )
+        )
+        self.assertEqual(resolution.paper_title, "Flux Map")
+
+    def test_short_journal_and_very_long_real_title_keep_structure_priority(self) -> None:
+        """长真实标题不是因长度入选，而是因其后方结构链获得更高可信度。"""
+        title = (
+            "A very long study of reliable spatiotemporal forecasting under "
+            "distribution shift with uncertainty-aware graph learning"
+        )
+        resolution = _resolve_title_candidates(
+            _title_candidates(
+                (DocItemLabel.SECTION_HEADER, "Energy"),
+                (DocItemLabel.TEXT, "journal homepage: example.org/energy"),
+                (DocItemLabel.SECTION_HEADER, title),
+                (DocItemLabel.TEXT, "Dora Evans, Evan Frost"),
+                (DocItemLabel.TEXT, "Faculty of Engineering, Sample University"),
+                (DocItemLabel.SECTION_HEADER, "Abstract"),
+            )
+        )
+        self.assertEqual(resolution.paper_title, title)
+
+    def test_low_confidence_candidate_is_unresolved_instead_of_first_long_heading(self) -> None:
+        """没有作者/摘要等下游结构证据时，长 section header 不能被默认升级为标题。"""
+        resolution = _resolve_title_candidates(
+            _title_candidates(
+                (DocItemLabel.SECTION_HEADER, "A plausible but unsupported heading"),
+            )
+        )
+        self.assertIsNone(resolution.paper_title)
+        self.assertEqual(resolution.title_source, "unresolved")
+
+
+def _title_candidates(
+    *items: tuple[DocItemLabel, str],
+) -> tuple[_TitleCandidate, ...]:
+    """构造保留阅读顺序与页码的标题 resolver 纯逻辑夹具。"""
+    return tuple(
+        _TitleCandidate(
+            item=object(),
+            label=label,
+            text=text,
+            reading_order=index,
+            pages=(1,),
+        )
+        for index, (label, text) in enumerate(items)
+    )
 
 
 if __name__ == "__main__":

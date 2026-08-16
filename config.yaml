@@ -142,14 +142,21 @@ answer_generation:
   max_evidence_units: 8
 
 # v0.2 Step 2：单篇临时论文速览。只读取 temporary workspace 的 parsed/chunks 产物，
-# 不执行 FAISS 检索，也不会重跑 PDF 解析或 embedding。
+# 先按字段选择候选 evidence，再合并、去重并应用全局 token 预算；不执行 FAISS 检索。
 paper_overview:
-  # 每类核心章节（摘要、引言、方法、实验、结论）最多提供多少个 chunk。
-  max_chunks_per_section: 5
-  # 单个 chunk 放进 Overview Prompt 的最大字符数，避免长表格或实验段落挤占上下文。
-  max_chars_per_chunk: 2000
-  # 全部 section-level context 的最大字符数。
-  max_total_context_chars: 18000
+  # 摘要最多保留两块，避免摘要重复挤占方法和结果的 token 预算。
+  max_abstract_chunks: 2
+  # 每个 Overview 字段进入候选 evidence 阶段的最大 chunk 数。
+  research_problem_candidate_limit: 3
+  contributions_candidate_limit: 3
+  main_method_candidate_limit: 4
+  datasets_candidate_limit: 2
+  experimental_setup_candidate_limit: 3
+  main_results_candidate_limit: 4
+  limitations_candidate_limit: 3
+  # 单 chunk 与整份 Overview Context 的 token 预算。
+  max_tokens_per_chunk: 480
+  max_total_context_tokens: 4800
   # 标题无法归入核心类别时，从最早正文 chunk 中保留的受控兜底数量。
   max_fallback_chunks: 2
   # Overview 结构化 JSON 的独立输出预算；不影响 Query Rewrite 或知识库 QA。

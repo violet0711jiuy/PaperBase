@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -32,6 +33,25 @@ _CORE_SECTION_ORDER = (
     "experiments",
     "conclusion",
 )
+_OVERVIEW_ROLES = (
+    "research_problem",
+    "contributions",
+    "main_method",
+    "datasets",
+    "experimental_setup",
+    "main_results",
+    "limitations",
+)
+# 方法和结果是速览中信息密度最高、也最容易被章节前缀偏差遗漏的内容，因此优先入预算。
+_ROLE_PRIORITIES = {
+    "main_method": 3,
+    "main_results": 3,
+    "research_problem": 2,
+    "contributions": 2,
+    "datasets": 2,
+    "experimental_setup": 2,
+    "limitations": 2,
+}
 
 
 class PaperOverviewError(RuntimeError):
@@ -94,6 +114,8 @@ class OverviewContextChunk:
     chunk_id: str
     section: str
     category: str
+    overview_roles: tuple[str, ...]
+    token_count: int
     text: str
 
 
@@ -103,15 +125,18 @@ class OverviewContext:
 
     paper_title: str | None
     chunks: tuple[OverviewContextChunk, ...]
+    selection_debug: dict[str, Any]
 
     @property
     def rendered_text(self) -> str:
         """将每个来源明确标为 chunk ID，供模型引用并供本地校验。"""
         return "\n\n".join(
-            "[chunk_id: {chunk_id}]\n[category: {category}]\n[section: {section}]\n{content}".format(
+            "[chunk_id: {chunk_id}]\n[category: {category}]\n[section: {section}]\n"
+            "[overview_roles: {overview_roles}]\n{content}".format(
                 chunk_id=chunk.chunk_id,
                 category=chunk.category,
                 section=chunk.section or "未标注章节",
+                overview_roles=", ".join(chunk.overview_roles),
                 content=chunk.text,
             )
             for chunk in self.chunks
@@ -126,6 +151,7 @@ class PaperOverviewOutcome:
     overview_path: Path
     context_path: Path
     selected_chunk_count: int
+    selection_debug: dict[str, Any]
 
 
 def run_paper_overview_stage(
@@ -179,7 +205,7 @@ def create_paper_overview(
 def build_overview_context(
     *, workspace_root: Path, settings: PaperOverviewSettings
 ) -> OverviewContext:
-    """从 workspace 的结构化产物构造受预算限制的章节级上下文。"""
+    """从 workspace 构造“字段候选 -> 去重 -> token 预算”的 Overview Context。"""
     root = workspace_root.resolve()
     parsed_record = _load_json_object(root / "parsed" / "parsed_paper.json")
     raw_chunks = _load_chunk_records(root / "chunks" / "chunks.jsonl")
@@ -189,40 +215,52 @@ def build_overview_context(
         if record.get("section_type") == "content" and _record_text(record)
     ]
     if not candidates:
-        return OverviewContext(paper_title=_optional_string(parsed_record.get("paper_title")), chunks=())
+        return OverviewContext(
+            paper_title=_optional_string(parsed_record.get("paper_title")),
+            chunks=(),
+            selection_debug={
+                "role_candidates": {role: [] for role in _OVERVIEW_ROLES},
+                "union_before_budget": [],
+                "final_selected_chunks": [],
+                "final_token_count": 0,
+            },
+        )
 
+    # 所有输入来自已落盘的 PaperChunk JSONL：这里不调用 Parser、Embedder 或索引。
     categories_by_chunk_id = _categorize_records(candidates)
-    selected: list[OverviewContextChunk] = []
-    remaining_chars = settings.max_total_context_chars
-    for category in _CORE_SECTION_ORDER:
-        matches = [
-            record
-            for record in candidates
-            if categories_by_chunk_id.get(_optional_string(record.get("chunk_id"))) == category
-        ]
-        for record in matches[: settings.max_chunks_per_section]:
-            chunk = _context_chunk(record, category, settings.max_chars_per_chunk, remaining_chars)
-            if chunk is None:
-                break
-            selected.append(chunk)
-            remaining_chars -= len(chunk.text)
-            if remaining_chars <= 0:
-                break
-        if remaining_chars <= 0:
-            break
+    positions_by_chunk_id = _section_positions(candidates)
+    role_candidates = _select_role_candidates(
+        records=candidates,
+        categories_by_chunk_id=categories_by_chunk_id,
+        positions_by_chunk_id=positions_by_chunk_id,
+        settings=settings,
+    )
+    selected = _select_union_with_token_budget(
+        records=candidates,
+        categories_by_chunk_id=categories_by_chunk_id,
+        role_candidates=role_candidates,
+        settings=settings,
+    )
 
-    # 部分论文标题完全非标准时仍提供少量早期正文；这不是全量 PDF 回退，也不会包含 References。
+    # 章节名完全失效时才回退到少量正文；不会向该回退路径加入 References。
     if not selected and settings.max_fallback_chunks:
-        for record in candidates[: settings.max_fallback_chunks]:
-            chunk = _context_chunk(record, "fallback", settings.max_chars_per_chunk, remaining_chars)
-            if chunk is None:
-                break
-            selected.append(chunk)
-            remaining_chars -= len(chunk.text)
+        selected = _select_fallback_chunks(candidates, settings)
+
+    debug = {
+        "role_candidates": {
+            role: [record["chunk_id"] for record, _score in records]
+            for role, records in role_candidates.items()
+        },
+        "union_before_budget": _union_chunk_ids(role_candidates),
+        "final_selected_chunks": [chunk.chunk_id for chunk in selected],
+        "final_token_count": sum(chunk.token_count for chunk in selected),
+        "token_budget": settings.max_total_context_tokens,
+    }
 
     return OverviewContext(
         paper_title=_optional_string(parsed_record.get("paper_title")),
         chunks=tuple(selected),
+        selection_debug=debug,
     )
 
 
@@ -286,9 +324,12 @@ def _write_overview_artifacts(
                         "chunk_id": chunk.chunk_id,
                         "section": chunk.section,
                         "category": chunk.category,
+                        "overview_roles": list(chunk.overview_roles),
+                        "token_count": chunk.token_count,
                     }
                     for chunk in context.chunks
                 ],
+                "selection_debug": context.selection_debug,
             },
             ensure_ascii=False,
             indent=2,
@@ -300,6 +341,7 @@ def _write_overview_artifacts(
         overview_path=overview_path,
         context_path=context_path,
         selected_chunk_count=len(context.chunks),
+        selection_debug=context.selection_debug,
     )
 
 
@@ -309,10 +351,10 @@ def _section_category(record: dict[str, Any]) -> str | None:
     front_matter_type = str(record.get("front_matter_type") or "").casefold()
     if front_matter_type == "abstract" or "abstract" in section or "摘要" in section:
         return "abstract"
-    if any(token in section for token in ("introduction", "background", "overview", "引言", "背景")):
-        return "introduction"
     if any(token in section for token in ("method", "methodology", "approach", "proposed", "framework", "model", "algorithm", "方法", "模型", "框架")):
         return "method"
+    if any(token in section for token in ("introduction", "background", "overview", "引言", "背景")):
+        return "introduction"
     if any(token in section for token in ("experiment", "evaluation", "result", "performance", "empirical", "实验", "结果", "评估", "评价")):
         return "experiments"
     if any(token in section for token in ("conclusion", "discussion", "limitation", "future work", "结论", "讨论", "局限", "展望")):
@@ -329,28 +371,27 @@ def _categorize_records(records: list[dict[str, Any]]) -> dict[str, str]:
         if chunk_id and category:
             categories[chunk_id] = category
 
-    # 很多论文把方法章节直接命名为模型/算法名，例如“3. ESDTW”，并不出现 method。
-    # 若实验主章节为第 N 节，则它紧邻的第 N-1 节及子节通常是论文的方法主体；该规则
-    # 只在没有任何关键词命中方法章节时启用，避免覆盖更明确的语义标题。
-    if "method" not in set(categories.values()):
-        experiment_numbers = [
-            number
-            for record in records
-            if _section_category(record) == "experiments"
-            for number in [_top_level_section_number(record)]
-            if number is not None
-        ]
-        if experiment_numbers:
-            inferred_method_number = min(experiment_numbers) - 1
-            if inferred_method_number > 0:
-                for record in records:
-                    chunk_id = _optional_string(record.get("chunk_id"))
-                    if (
-                        chunk_id
-                        and chunk_id not in categories
-                        and _top_level_section_number(record) == inferred_method_number
-                    ):
-                        categories[chunk_id] = "method"
+    # 很多论文把方法章节直接命名为模型/算法名，例如“3. ESDTW”，并不出现 method；
+    # 但其某个子节可能叫“3.3 Algorithm overview”。此时仍要补齐同属第 3 章、尚未
+    # 有明确语义的 3.1/3.2，才能保证方法选择器覆盖多个真实模块而非只看到一个子节。
+    experiment_numbers = [
+        number
+        for record in records
+        if _section_category(record) == "experiments"
+        for number in [_top_level_section_number(record)]
+        if number is not None
+    ]
+    if experiment_numbers:
+        inferred_method_number = min(experiment_numbers) - 1
+        if inferred_method_number > 0:
+            for record in records:
+                chunk_id = _optional_string(record.get("chunk_id"))
+                if (
+                    chunk_id
+                    and chunk_id not in categories
+                    and _top_level_section_number(record) == inferred_method_number
+                ):
+                    categories[chunk_id] = "method"
     return categories
 
 
@@ -365,24 +406,254 @@ def _top_level_section_number(record: dict[str, Any]) -> int | None:
     return int(top_level) if top_level.isdigit() else None
 
 
+def _select_role_candidates(
+    *,
+    records: list[dict[str, Any]],
+    categories_by_chunk_id: dict[str, str],
+    positions_by_chunk_id: dict[str, tuple[int, int]],
+    settings: PaperOverviewSettings,
+) -> dict[str, list[tuple[dict[str, Any], float]]]:
+    """为每个 Overview 字段独立挑选高价值候选；此处尚不消耗全局 token 预算。"""
+    limits = {
+        "research_problem": settings.research_problem_candidate_limit,
+        "contributions": settings.contributions_candidate_limit,
+        "main_method": settings.main_method_candidate_limit,
+        "datasets": settings.datasets_candidate_limit,
+        "experimental_setup": settings.experimental_setup_candidate_limit,
+        "main_results": settings.main_results_candidate_limit,
+        "limitations": settings.limitations_candidate_limit,
+    }
+    selected: dict[str, list[tuple[dict[str, Any], float]]] = {}
+    for role in _OVERVIEW_ROLES:
+        scored = [
+            (record, _role_score(
+                role=role,
+                record=record,
+                category=categories_by_chunk_id.get(_required_chunk_id(record)),
+                position=positions_by_chunk_id.get(_required_chunk_id(record), (0, 1)),
+            ))
+            for record in records
+        ]
+        # 分数为零的 chunk 对该字段没有已知证据价值，不能仅因排在前面占用候选名额。
+        scored = [(record, score) for record, score in scored if score > 0]
+        scored.sort(key=lambda item: (-item[1], _chunk_index(item[0]), _required_chunk_id(item[0])))
+        selected[role] = (
+            _select_diverse_method_candidates(scored, limits[role])
+            if role == "main_method"
+            else scored[: limits[role]]
+        )
+    return selected
+
+
+def _role_score(
+    *, role: str, record: dict[str, Any], category: str | None, position: tuple[int, int]
+) -> float:
+    """以可解释的章节、位置与文本信号评分，不把评分结果当作论文结论。"""
+    section = (_optional_string(record.get("section")) or "").casefold()
+    text = _record_text(record).casefold()
+    section_position = position[0] / max(position[1] - 1, 1)
+    score = 0.0
+    if role == "research_problem":
+        score += 9 if category == "abstract" else 5 if category == "introduction" else 0
+        score += 2 * (1 - section_position) if category == "introduction" else 0
+        score += 5 * _signal_count(text, ("problem", "challenge", "limitation", "however", "issue", "difficult", "drawback", "问题", "挑战", "局限", "然而", "不足"))
+    elif role == "contributions":
+        score += 8 if category == "abstract" else 4 if category == "introduction" else 2 if category == "conclusion" else 0
+        score += 3 * section_position if category == "introduction" else 0
+        score += 6 * _signal_count(text, ("contribution", "contributions", "we propose", "our work", "in summary", "we present", "提出", "贡献", "本文", "总结"))
+    elif role == "main_method":
+        # 章节结构已识别为 Method 时应明显优先于背景段落中偶然出现的 “method” 一词。
+        score += 20 if category == "method" else 2 if category == "abstract" else 0
+        score += 5 * _signal_count(section + " " + text, ("method", "approach", "framework", "algorithm", "model", "proposed", "overview", "methodology", "方法", "框架", "算法", "模型", "提出"))
+    elif role == "datasets":
+        score += 4 if category == "experiments" else 0
+        score += 8 * _signal_count(section + " " + text, ("dataset", "datasets", "data set", "data collection", "benchmark", "corpus", "ucr", "数据集", "数据集", "基准"))
+    elif role == "experimental_setup":
+        score += 4 if category == "experiments" else 0
+        score += 7 * _signal_count(section + " " + text, ("setup", "baseline", "metric", "implementation", "setting", "protocol", "parameter", "evaluation", "experiment", "设置", "基线", "指标", "实现", "参数", "实验"))
+    elif role == "main_results":
+        score += 5 if category == "experiments" else 4 if category == "conclusion" else 0
+        score += 9 * _signal_count(section + " " + text, ("result", "performance", "comparison", "outperform", "improvement", "better than", "accuracy", "rmse", "mae", "mape", "error", "table", "figure", "结果", "性能", "比较", "优于", "提升", "准确率", "误差", "表", "图"))
+        score += min(_numeric_density(text) * 8, 6)
+    elif role == "limitations":
+        score += 5 if category == "conclusion" else 0
+        score += 9 * _signal_count(section + " " + text, ("limitation", "limitations", "fail", "failure", "worse", "sensitive", "however", "drawback", "future work", "error analysis", "局限", "失败", "较差", "敏感", "然而", "缺点", "未来工作"))
+    return score
+
+
+def _select_diverse_method_candidates(
+    scored: list[tuple[dict[str, Any], float]], limit: int
+) -> list[tuple[dict[str, Any], float]]:
+    """方法字段先覆盖不同 subsection，再在必要时补充同一 subsection 的高分块。"""
+    selected: list[tuple[dict[str, Any], float]] = []
+    seen_sections: set[str] = set()
+    for record, score in scored:
+        section = _optional_string(record.get("section")) or "未标注章节"
+        if section in seen_sections:
+            continue
+        selected.append((record, score))
+        seen_sections.add(section)
+        if len(selected) == limit:
+            return selected
+    for record, score in scored:
+        if (record, score) in selected:
+            continue
+        selected.append((record, score))
+        if len(selected) == limit:
+            break
+    return selected
+
+
+def _select_union_with_token_budget(
+    *,
+    records: list[dict[str, Any]],
+    categories_by_chunk_id: dict[str, str],
+    role_candidates: dict[str, list[tuple[dict[str, Any], float]]],
+    settings: PaperOverviewSettings,
+) -> list[OverviewContextChunk]:
+    """合并字段候选、按角色优先级贪心入预算，最后恢复论文原始阅读顺序。"""
+    records_by_id = {_required_chunk_id(record): record for record in records}
+    roles_by_chunk_id: dict[str, set[str]] = {}
+    best_score_by_chunk_id: dict[str, float] = {}
+    for role, candidates in role_candidates.items():
+        for record, score in candidates:
+            chunk_id = _required_chunk_id(record)
+            roles_by_chunk_id.setdefault(chunk_id, set()).add(role)
+            best_score_by_chunk_id[chunk_id] = max(best_score_by_chunk_id.get(chunk_id, 0.0), score)
+
+    ordered_ids = sorted(
+        roles_by_chunk_id,
+        key=lambda chunk_id: (
+            -max(_ROLE_PRIORITIES[role] for role in roles_by_chunk_id[chunk_id]),
+            -best_score_by_chunk_id[chunk_id],
+            _chunk_index(records_by_id[chunk_id]),
+            chunk_id,
+        ),
+    )
+    selected: list[OverviewContextChunk] = []
+    abstract_count = 0
+    remaining_tokens = settings.max_total_context_tokens
+    for chunk_id in ordered_ids:
+        record = records_by_id[chunk_id]
+        category = categories_by_chunk_id.get(chunk_id, "fallback")
+        if category == "abstract" and abstract_count >= settings.max_abstract_chunks:
+            continue
+        chunk = _context_chunk(
+            record=record,
+            category=category,
+            roles=tuple(sorted(roles_by_chunk_id[chunk_id])),
+            max_tokens=settings.max_tokens_per_chunk,
+        )
+        if chunk.token_count > remaining_tokens:
+            continue
+        selected.append(chunk)
+        remaining_tokens -= chunk.token_count
+        if category == "abstract":
+            abstract_count += 1
+
+    return sorted(selected, key=lambda chunk: (_chunk_index(records_by_id[chunk.chunk_id]), chunk.chunk_id))
+
+
+def _select_fallback_chunks(
+    records: list[dict[str, Any]], settings: PaperOverviewSettings
+) -> list[OverviewContextChunk]:
+    """核心章节均无法识别时，保留最早少量正文作为显式 fallback。"""
+    selected: list[OverviewContextChunk] = []
+    remaining_tokens = settings.max_total_context_tokens
+    for record in records[: settings.max_fallback_chunks]:
+        chunk = _context_chunk(
+            record=record,
+            category="fallback",
+            roles=("fallback",),
+            max_tokens=settings.max_tokens_per_chunk,
+        )
+        if chunk.token_count > remaining_tokens:
+            continue
+        selected.append(chunk)
+        remaining_tokens -= chunk.token_count
+    return selected
+
+
+def _union_chunk_ids(role_candidates: dict[str, list[tuple[dict[str, Any], float]]]) -> list[str]:
+    """以角色顺序聚合候选 ID，便于 debug 中观察合并前的去重边界。"""
+    result: list[str] = []
+    seen: set[str] = set()
+    for role in _OVERVIEW_ROLES:
+        for record, _score in role_candidates[role]:
+            chunk_id = _required_chunk_id(record)
+            if chunk_id not in seen:
+                seen.add(chunk_id)
+                result.append(chunk_id)
+    return result
+
+
+def _section_positions(records: list[dict[str, Any]]) -> dict[str, tuple[int, int]]:
+    """计算 chunk 在各自 section 内的位置，用于区分引言前部问题与后部贡献。"""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(_optional_string(record.get("section")) or "未标注章节", []).append(record)
+    positions: dict[str, tuple[int, int]] = {}
+    for group in grouped.values():
+        ordered = sorted(group, key=lambda record: (_chunk_index(record), _required_chunk_id(record)))
+        for index, record in enumerate(ordered):
+            positions[_required_chunk_id(record)] = (index, len(ordered))
+    return positions
+
+
 def _context_chunk(
-    record: dict[str, Any], category: str, max_chunk_chars: int, remaining_chars: int
-) -> OverviewContextChunk | None:
-    """在双重字符预算内保留 chunk 开头的完整可读内容。"""
-    if remaining_chars < 1:
-        return None
+    *, record: dict[str, Any], category: str, roles: tuple[str, ...], max_tokens: int
+) -> OverviewContextChunk:
+    """以已存 raw_token_count 为预算单位，必要时按比例截断 raw_text。"""
     raw_text = _record_text(record)
-    limit = min(max_chunk_chars, remaining_chars)
-    text = raw_text if len(raw_text) <= limit else raw_text[:limit].rstrip() + "\n[本 chunk 后续内容已截断]"
+    original_tokens = _record_token_count(record)
+    token_count = min(original_tokens, max_tokens)
+    if original_tokens > max_tokens:
+        char_limit = max(1, int(len(raw_text) * max_tokens / original_tokens))
+        text = raw_text[:char_limit].rstrip() + "\n[本 chunk 后续内容已截断]"
+    else:
+        text = raw_text
+    return OverviewContextChunk(
+        chunk_id=_required_chunk_id(record),
+        section=_optional_string(record.get("section")) or "未标注章节",
+        category=category,
+        overview_roles=roles,
+        token_count=token_count,
+        text=text,
+    )
+
+
+def _signal_count(text: str, signals: tuple[str, ...]) -> int:
+    """统计不同关键词是否出现；重复词不反复加分，降低长段落的长度偏置。"""
+    return sum(signal in text for signal in signals)
+
+
+def _numeric_density(text: str) -> float:
+    """用数字、百分号和常见指标的出现比例识别结果密度，不解释这些数字的业务含义。"""
+    if not text:
+        return 0.0
+    return len(re.findall(r"\d+(?:\.\d+)?%?", text)) / max(len(text.split()), 1)
+
+
+def _record_token_count(record: dict[str, Any]) -> int:
+    """优先复用 Chunker 已生成的 token 计数；旧工件缺失时使用保守字符估算。"""
+    value = record.get("raw_token_count")
+    if isinstance(value, int) and value > 0:
+        return value
+    return max(1, (len(_record_text(record)) + 3) // 4)
+
+
+def _chunk_index(record: dict[str, Any]) -> int:
+    """读取稳定 chunk_index；缺失时置于同分候选末尾。"""
+    value = record.get("chunk_index")
+    return value if isinstance(value, int) and value >= 0 else 2**31 - 1
+
+
+def _required_chunk_id(record: dict[str, Any]) -> str:
+    """所有进入 selector 的记录都必须保留 v0.1 PaperChunk 的稳定身份。"""
     chunk_id = _optional_string(record.get("chunk_id"))
     if not chunk_id:
         raise PaperOverviewError("Workspace chunk is missing chunk_id.")
-    return OverviewContextChunk(
-        chunk_id=chunk_id,
-        section=_optional_string(record.get("section")) or "未标注章节",
-        category=category,
-        text=text,
-    )
+    return chunk_id
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:

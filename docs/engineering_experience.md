@@ -1068,3 +1068,135 @@ CLI 的 FAISS—SQLite—embedding 工件交叉验证通过；前 10 条向量�
 **结构化输出取舍（2026-08-15）**：移除了 Query Rewrite 与最终回答中的 JSON Repair Prompt 和第二次 LLM 修复调用。现在由 OpenAI-compatible API 的 `response_format=json_schema` 尽可能约束字段，再由 Pydantic 的严格模型（字段类型、必填字段、`extra="forbid"`）进行本地验证。原因是 Repair 仍是一次新的生成，可能改写原有语义、增加调用成本，并使失败行为难以复现；当结构不合法时，Query Rewrite 直接回退原始 Query，回答生成直接回退可审阅证据。新增测试确认错误 JSON 只触发一次模型调用。
 
 **验证**：离线测试覆盖同节连续扩展、章节/References 隔离、完整组 token 预算和伪造引用回退；全量 55 项测试通过。该阶段是纯读取链路，不需要重新 parse、chunk、ingest 或重建 FAISS。
+
+---
+
+# v0.2 Step 2 补充：Paper Overview 的字段感知 Context Selector
+
+**记录日期：2026-08-16；范围：仅优化临时论文工作区的 Paper Overview Context 构造，不修改 v0.1 正式知识库检索链路、标题识别、PDF 解析、Chunk、Embedding 或 FAISS。**
+
+## 1. 问题与原始流程
+
+Paper Overview 是对一篇临时上传论文的整篇速览，不走 Temporary FAISS / Reranker。初版流程直接读取
+temporary workspace 已保存的 `parsed_paper.json` 与 `chunks.jsonl`，按 `Abstract`、`Introduction`、
+`Method`、`Experiments`、`Conclusion` 等大类分别取该类最靠前的若干 chunk，合并后一次发送给 LLM：
+
+```text
+每类章节的前 N 个 chunk
+→ 合并、按总长度截断
+→ 一次 LLM 调用
+→ Paper Overview JSON
+```
+
+该方案能够避免重新 Parse / Embedding，也能排除 `References`，但有明显的 **section prefix bias
+（章节前缀偏差）**：章节长度较长时，固定选择开头块会把“章节开场说明”误当作代表证据。
+
+在真实的 ESDTW 论文 temporary workspace 中，具体表现为：
+
+- Introduction 的前段主要是研究背景，后部的明确 contributions 可能未入选；
+- 方法章只覆盖前部，`3.1`、`3.3 Algorithm overview`、`3.4 Time complexity analysis` 等后续模块容易丢失；
+- Experiments 先选到“开展了哪些实验”的介绍，而 `4.3 Sequence alignment results`、`4.5 Time series classification results`
+  中的具体指标和数值未必入选；
+- `4.7 Discussion` 的失败案例或限制说明没有与 Conclusion 同等的入选机会。
+
+根因不是 Chunker 切分错误，也不是向量检索失败；而是 Overview 的上下文选择只利用了“所属大章节”和
+“文件顺序”，没有利用已有的 section/subsection 结构、chunk 的章节内位置和文本中的弱证据信号。
+
+## 2. 设计目标与约束
+
+这次不将七个字段拆成七次 LLM 调用。仍保持一份共享 Context 与一次结构化生成，但让程序先为各字段选择
+可能相关的 evidence：
+
+```text
+字段候选 evidence
+→ chunk_id 合并与去重
+→ 全局 token 预算筛选
+→ 一份 Overview Context
+→ 一次 LLM 调用
+```
+
+选择器的分数只用于“让哪些原文块有机会进入 Context”，不是论文事实，也不直接生成结论。最终结论仍由 LLM
+依据所给原文生成，并接受来源 ID 校验。
+
+## 3. 最终举措
+
+在 [`paperbase/overview/service.py`](../paperbase/overview/service.py) 中实现了字段感知、结构感知的确定性
+selector，并把全部上限集中到 [`config.yaml`](../config.yaml) 的 `paper_overview` 配置：
+
+| Overview 字段 | 主要候选规则 |
+| --- | --- |
+| `research_problem` | Abstract；Introduction 前/中部；`problem`、`challenge`、`however`、`limitation` 等问题信号 |
+| `contributions` | Abstract；Introduction 后部；`contribution`、`we propose`、`our work`、`in summary` 等信号 |
+| `main_method` | 识别为方法章的块优先；先覆盖不同 subsection，再补同 subsection 的高分块 |
+| `datasets` | Dataset/Data/Benchmark/UCR 等文本或章节信号 |
+| `experimental_setup` | Setup、Baseline、Metric、Implementation、Settings 等实验设置信号 |
+| `main_results` | Results/Performance/Comparison、Table/Figure、指标词与数值密度；其 token 优先级最高 |
+| `limitations` | Discussion、Limitations、Failure Case、Error Analysis、Conclusion，以及 `sensitive`、`drawback`、`future work` 等明确信号 |
+
+对于“方法章未显式写 Method，而实验为第 N 章”的常见论文结构，程序把第 `N-1` 章中尚未有明确类别的块补为
+Method 候选。这是章节编号与已有 section metadata 的保守推断，不改写原始章节名或正文。
+
+每个入选 chunk 在 Context 中保留已有元数据，并新增 selector 辅助标签：
+
+```text
+[chunk_id: paper_..._chunk_0044]
+[category: experiments]
+[section: 4.3. Sequence alignment results]
+[overview_roles: main_results]
+raw_text...
+```
+
+`overview_roles` 仅表示该块可能服务的字段，不能被解释为程序已经判定了论文结论。
+
+## 4. Token 预算与来源边界
+
+旧版是“每一大类固定块数”。新版采用共享的 `max_total_context_tokens`：先合并 `chunk_id` 并去重，再按
+`main_method` / `main_results` 高于其他字段的优先级入预算；重复背景与低优先级块在空间不足时被跳过。Abstract
+最多保留少量块，避免摘要重复占用方法和结果的容量。
+
+预算直接复用 v0.1 Chunker 已写入 `raw_token_count`（本地 Qwen tokenizer 对 `raw_text` 的计数）。单块超过
+`max_tokens_per_chunk` 时才按比例截断正文；历史工件缺失该字段时使用保守的“字符数 / 4”估算。该计数是稳定的
+Context 预算近似值，不等于远端 LLM 服务端对系统 Prompt、标签和输出 JSON 的精确 token 计费。
+
+来源字段也遵循“确定性信息不交给 LLM”的原则：LLM 对每个 Overview 字段只返回 `content` 与
+`source_chunk_ids`；程序校验 ID 必须属于本次 Context，并由 `chunk_id → section` 元数据回填最终 API/JSON 的
+`source_sections`。这样避免模型重复生成可由代码可靠导出的章节名称。
+
+## 5. 真实论文验证与结果
+
+在 `staging_d371213bfbeb45f38e9919b53cccdeaa` 的 ESDTW 真实论文上执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m paperbase.overview staging_d371213bfbeb45f38e9919b53cccdeaa
+```
+
+selector 的 debug 输出显示：候选合并前有 16 个唯一 chunk，最终在 `4800` token 预算内保留 14 个、共
+`4501` token，且无重复 ID。关键覆盖如下：
+
+| 字段 | 最终代表性证据 |
+| --- | --- |
+| Contributions | Abstract 与 Introduction 后部 `chunk_0009` |
+| Main method | 第 3 章、`3.1`、`3.3 Algorithm overview`、`3.4 Time complexity analysis` |
+| Datasets / setup | `4.1 Datasets and performance measure` 与实验设置块 |
+| Main results | `4.3 Sequence alignment results` 的 `chunk_0042/0044/0045`，以及 `4.5 Time series classification results` 的 `chunk_0048` |
+| Limitations | `4.7 Discussion` 的 `chunk_0061` 与第 5 章 Conclusion |
+
+相应 Overview 已能基于结果段写出 `14/18`、`46/84` 等论文明确给出的实验数字，并从 Discussion / Conclusion
+提取“对局部极值、噪声和极值数量变化敏感”等明确限制。说明这次改动解决了测试样本中的章节前缀偏差，而不是只让
+Context 变长。
+
+## 6. 验证、结论与限制
+
+- 专用测试覆盖：Introduction 后部 contribution、多个 Method subsection、含数值的 Results、Discussion
+  limitation、References 排除、最终 ID 去重与全局 token 预算；`4/4` 通过。
+- 全项目单元测试：`68/68` 通过。
+- 真实运行仍是一次 `complete_json` 调用；Overview 只读取 staging 中的 parsed/chunks 产物，未触发 Parser、
+  Embedder、Temporary Index、正式 FAISS 或 FTS5。
+- 运行前后比较正式 `paperbase.sqlite3`、`paperbase.faiss`、`paperbase.faiss.manifest.json` 的 SHA-256，均无变化。
+
+**结论：该问题已在当前真实样本和单元测试范围内解决。**新的 selector 能够主动为字段寻找跨 subsection、跨
+实验结果和 Discussion 的证据，且仍保持一次 LLM 调用、可审计来源和正式 KB 隔离。
+
+**尚有限制：**关键词和章节名规则目前以中英文常见学术写法为主；非常规标题、其他语言或结果完全只存在图片中的
+论文仍可能遗漏候选，需要积累更多样本后增加评测集。`raw_token_count` 也只是 Context 预算，不是远端模型的
+精确计费。此前发现的论文标题/作者单位解析异常属于 Parser 质量问题，未纳入本次 selector 修复。

@@ -24,6 +24,12 @@ def main() -> None:
         f"selected_chunks={outcome.selected_chunk_count}\n"
         f"paper_title={outcome.overview.paper_title}"
     )
+    # 选择器调试信息只展示 chunk ID、角色和 token 预算，不在 CLI 重复输出论文正文。
+    for role, chunk_ids in outcome.selection_debug["role_candidates"].items():
+        print(f"{role}: {chunk_ids}")
+    print(f"union_before_budget: {outcome.selection_debug['union_before_budget']}")
+    print(f"final_selected_chunks: {outcome.selection_debug['final_selected_chunks']}")
+    print(f"final_token_count: {outcome.selection_debug['final_token_count']}")
 
 
 if __name__ == "__main__":

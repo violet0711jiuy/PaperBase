@@ -56,27 +56,23 @@ class PaperOverviewTests(unittest.TestCase):
 
             context = build_overview_context(
                 workspace_root=workspace,
-                settings=PaperOverviewSettings(
-                    max_chunks_per_section=2,
-                    max_chars_per_chunk=1_000,
-                    max_total_context_chars=8_000,
-                    max_fallback_chunks=1,
-                ),
+                settings=_overview_settings(),
             )
             outcome = create_paper_overview(
                 workspace_root=workspace,
-                settings=PaperOverviewSettings(
-                    max_chunks_per_section=2,
-                    max_chars_per_chunk=1_000,
-                    max_total_context_chars=8_000,
-                    max_fallback_chunks=1,
-                ),
+                settings=_overview_settings(),
                 client=client,  # type: ignore[arg-type]
             )
 
             self.assertEqual(
                 [chunk.category for chunk in context.chunks],
                 ["abstract", "introduction", "method", "experiments", "experiments", "conclusion"],
+            )
+            self.assertIn("main_results", context.chunks[4].overview_roles)
+            self.assertEqual(len({chunk.chunk_id for chunk in context.chunks}), len(context.chunks))
+            self.assertLessEqual(
+                sum(chunk.token_count for chunk in context.chunks),
+                _overview_settings().max_total_context_tokens,
             )
             self.assertNotIn("reference-only-text", client.user_prompt)
             self.assertNotIn("[chunk_id: chunk_006]", client.user_prompt)
@@ -106,6 +102,49 @@ class PaperOverviewTests(unittest.TestCase):
                     client=_FakeOverviewClient(response),  # type: ignore[arg-type]
                 )
 
+    def test_selector_covers_late_contributions_method_subsections_and_results(self) -> None:
+        """字段候选应摆脱章节前缀偏差，并保留 Discussion 中的限制证据机会。"""
+        with TemporaryDirectory() as temporary_directory:
+            workspace = _write_workspace_with_records(
+                Path(temporary_directory) / "staging_selector",
+                (
+                    _chunk("chunk_000", "Abstract", "The abstract summarizes MethodX and results.", front_matter_type="abstract"),
+                    _chunk("chunk_001", "1 Introduction", "The challenge is unreliable forecasting."),
+                    _chunk("chunk_002", "1 Introduction", "Background information without a field signal."),
+                    _chunk("chunk_003", "1 Introduction", "Our main contributions are a robust MethodX and a new benchmark."),
+                    _chunk("chunk_010", "3 System Design", "The proposed system contains three modules."),
+                    _chunk("chunk_011", "3.1 Encoder", "The encoder extracts temporal features."),
+                    _chunk("chunk_012", "3.2 Algorithm overview", "The decoder produces the final forecast."),
+                    _chunk("chunk_020", "4 Experiments", "We conduct experiments on several settings."),
+                    _chunk("chunk_021", "4.1 Datasets", "We use the BenchSet dataset."),
+                    _chunk("chunk_022", "4.2 Implementation settings", "Baselines use the same metric and parameter settings."),
+                    _chunk("chunk_023", "4.3 Comparison results", "Table 3 reports Accuracy 91.2% and MAE 0.12, outperforming BaseX."),
+                    _chunk("chunk_024", "4.4 Performance results", "Figure 4 shows RMSE 1.4 and a 12% improvement."),
+                    _chunk("chunk_025", "4.5 Discussion", "However, the method is sensitive to sparse observations."),
+                    _chunk("chunk_026", "References", "Reference content must not be selected.", section_type="bibliography"),
+                ),
+            )
+            settings = PaperOverviewSettings(
+                max_tokens_per_chunk=300,
+                max_total_context_tokens=3_000,
+                main_method_candidate_limit=3,
+                main_results_candidate_limit=3,
+            )
+            context = build_overview_context(workspace_root=workspace, settings=settings)
+            debug = context.selection_debug
+
+            self.assertIn("chunk_003", debug["role_candidates"]["contributions"])
+            self.assertEqual(
+                set(debug["role_candidates"]["main_method"][:3]),
+                {"chunk_010", "chunk_011", "chunk_012"},
+            )
+            self.assertIn("chunk_023", debug["role_candidates"]["main_results"])
+            self.assertIn("chunk_024", debug["role_candidates"]["main_results"])
+            self.assertIn("chunk_025", debug["role_candidates"]["limitations"])
+            self.assertNotIn("chunk_026", debug["union_before_budget"])
+            self.assertEqual(len(debug["final_selected_chunks"]), len(set(debug["final_selected_chunks"])))
+            self.assertLessEqual(debug["final_token_count"], settings.max_total_context_tokens)
+
     def test_overview_output_budget_does_not_change_shared_runtime_settings(self) -> None:
         """Overview 的长 JSON 预算只作用于其专用客户端，不能改变其他 v0.1 调用。"""
         shared = LLMRuntimeSettings(
@@ -120,11 +159,6 @@ class PaperOverviewTests(unittest.TestCase):
 
 def _write_workspace(root: Path) -> Path:
     """写出与 Temporary Workspace 相同的最小 parsed/chunks 文件，不创建向量或索引。"""
-    (root / "parsed").mkdir(parents=True)
-    (root / "chunks").mkdir()
-    (root / "parsed" / "parsed_paper.json").write_text(
-        json.dumps({"paper_title": "Example paper"}, ensure_ascii=False), encoding="utf-8"
-    )
     records = (
         _chunk("chunk_000", "Front matter > Abstract", "This work studies forecasting errors.", front_matter_type="abstract"),
         _chunk("chunk_001", "1 Introduction", "Existing systems lack reliable uncertainty estimates."),
@@ -137,11 +171,30 @@ def _write_workspace(root: Path) -> Path:
         # 无章节名的正文可能由 PDF 版面解析产生；它不能阻断编号方法章节的结构回退。
         _chunk("chunk_007", "", "An unsectioned layout fragment."),
     )
+    return _write_workspace_with_records(root, records)
+
+
+def _write_workspace_with_records(root: Path, records: tuple[dict[str, object], ...]) -> Path:
+    """将自定义 PaperChunk JSONL 写为 Overview 的只读输入夹具。"""
+    (root / "parsed").mkdir(parents=True)
+    (root / "chunks").mkdir()
+    (root / "parsed" / "parsed_paper.json").write_text(
+        json.dumps({"paper_title": "Example paper"}, ensure_ascii=False), encoding="utf-8"
+    )
     (root / "chunks" / "chunks.jsonl").write_text(
         "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
         encoding="utf-8",
     )
     return root
+
+
+def _overview_settings() -> PaperOverviewSettings:
+    """为测试提供紧凑但足以覆盖各字段候选的 token 预算。"""
+    return PaperOverviewSettings(
+        max_tokens_per_chunk=300,
+        max_total_context_tokens=3_000,
+        max_fallback_chunks=1,
+    )
 
 
 def _chunk(
@@ -155,8 +208,10 @@ def _chunk(
     """构造 v0.1 PaperChunk JSONL 中 Overview 需要读取的稳定字段。"""
     return {
         "chunk_id": chunk_id,
+        "chunk_index": int(chunk_id.rsplit("_", maxsplit=1)[-1]),
         "section": section,
         "raw_text": raw_text,
+        "raw_token_count": max(1, len(raw_text.split())),
         "section_type": section_type,
         "front_matter_type": front_matter_type,
     }

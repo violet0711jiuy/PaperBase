@@ -246,16 +246,24 @@ class AnswerGenerationSettings(BaseModel):
 
 
 class PaperOverviewSettings(BaseModel):
-    """v0.2 单篇论文速览的章节级上下文预算。"""
+    """v0.2 单篇论文速览的字段级 evidence 选择与上下文预算。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    # 每类核心章节最多选取的 chunk 数，防止 Introduction 或 Experiments 独占 Prompt。
-    max_chunks_per_section: int = Field(default=3, ge=1, le=10)
-    # 一个 chunk 写入 Prompt 时允许保留的最大字符数，超出时只截取前段并显式标注。
-    max_chars_per_chunk: int = Field(default=2_000, ge=300, le=12_000)
-    # 所有章节内容的总字符预算；标题与 Prompt 固定说明不计入此预算。
-    max_total_context_chars: int = Field(default=18_000, ge=2_000, le=80_000)
+    # Abstract 通常浓缩全文信息，因此最多保留少量块，避免与后续章节重复。
+    max_abstract_chunks: int = Field(default=2, ge=1, le=5)
+    # 以下上限分别控制每个 Overview 字段进入“候选 evidence”阶段的 chunk 数。
+    research_problem_candidate_limit: int = Field(default=3, ge=1, le=8)
+    contributions_candidate_limit: int = Field(default=3, ge=1, le=8)
+    main_method_candidate_limit: int = Field(default=4, ge=1, le=10)
+    datasets_candidate_limit: int = Field(default=2, ge=1, le=6)
+    experimental_setup_candidate_limit: int = Field(default=3, ge=1, le=8)
+    main_results_candidate_limit: int = Field(default=4, ge=1, le=10)
+    limitations_candidate_limit: int = Field(default=3, ge=1, le=8)
+    # 单个 chunk 可进入 Context 的最大 token 数；超出时只截断该 chunk，不重切分论文。
+    max_tokens_per_chunk: int = Field(default=480, ge=64, le=2_048)
+    # 所有去重后的 Context chunk 共享的 token 预算；高优先级角色先占用预算。
+    max_total_context_tokens: int = Field(default=4_800, ge=512, le=32_000)
     # 无法匹配核心章节名称时，最多保留多少个前序正文 chunk 作为受控兜底。
     max_fallback_chunks: int = Field(default=2, ge=0, le=10)
     # Overview 有八个带来源字段，所需 JSON 通常比 Query Rewrite 的全局默认输出更长。

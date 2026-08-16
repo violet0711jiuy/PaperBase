@@ -23,23 +23,54 @@ from docling_core.types.io import DocumentStream
 from .base import FrontMatterBlock, PageFurniture, PaperParser, ParsedPaper
 
 
-# 这些字符串是论文首页常见、但并非论文标题的版面元素。先标准化再匹配，
-# 可以同时处理 "A R T I C L E I N F O" 这类带空格的排版文本。
-_TITLE_NOISE_PREFIXES = (
+# 标题 resolver 只识别“出版栏模式”，绝不维护具体期刊名白名单。键已去除大小写、
+# 空白和标点，因而可覆盖 ``Contents lists available ...``、``DOI: ...`` 等常见首页
+# 版式噪声。期刊名本身不会因出现在本表而被排除，而会由其后方的 journal-homepage
+# 结构信号降分。
+_TITLE_NON_TITLE_PREFIXES = (
     "contentslistsavailable",
     "journalhomepage",
     "articleinfo",
+    "articleinformation",
     "abstract",
+    "summary",
     "keywords",
-    "pvldbreferenceformat",
-    "pvldbartifactavailability",
+    "keyword",
+    "indexterms",
+    "received",
+    "revised",
+    "accepted",
+    "published",
+    "doi",
+    "issn",
+    "copyright",
+    "license",
+    "creativecommons",
     "referenceformat",
+    "publicationinformation",
+    "citation",
     "artifactavailability",
+    "codeavailability",
+    "dataavailability",
+    "availability",
+    "rightsandlicense",
+    "authorsandaffiliations",
+    "authorinformation",
+    "correspondence",
 )
 
-# 当 Docling 没有给出 title 标签时，过短的首页标题通常是期刊名、栏目名或摘要标题。
-# 宁可返回 None 交由人工确认，也不要把错误标题写入后续的 SQLite 元数据。
-_MINIMUM_FALLBACK_TITLE_LENGTH = 20
+# DOI、ISSN、URL、版权等即使不处于标准行内标签位置，也属于出版元数据而非论文标题。
+_TITLE_PUBLICATION_METADATA = re.compile(
+    r"(?:\bdoi\s*[:/]|\bissn\b|\b(?:copyright|license|licence)\b|"
+    r"\bcreative\s+commons\b|https?://|www\.)",
+    re.IGNORECASE,
+)
+
+# 作者行的识别仅用于标题候选的下游结构加分，不修改 authors / affiliations 的既有
+# 识别逻辑。要求至少两个逗号分隔的人名，避免把普通 Title Case 论文题目误判为作者。
+_TITLE_AUTHOR_NAME = re.compile(
+    r"\b[A-Z][A-Za-z'’.-]{1,}(?:\s+[A-Z][A-Za-z'’.-]{1,})+\b"
+)
 
 # Granite-Docling 在带编号的显示公式后偶尔会继续生成相邻正文。编号在科研论文中
 # 位于公式末尾，因此只在已经识别出这种末尾编号时截断；无编号公式绝不猜测边界。
@@ -120,8 +151,8 @@ _COMMON_HYPHENATED_CONTINUATIONS = frozenset(
 )
 
 # 这些后缀出现在换行后的单词开头时，前半部分与后半部分拼接为一个单词的置信度很高。
-# 例如 ``humid-\nity``、``regulari-\nzation``、``forecast-\ning``。这是通用英语形态
-# 规则，不依赖某篇论文、作者或数据集名称。
+# 例如 ``humid-\nity``、``regulari-\nzation``、``forecast-\ning``。这是通用英语形态规则，
+# 不依赖某篇论文、作者或数据集名称。
 _WORD_CONTINUATION_SUFFIXES = (
     "ability",
     "ation",
@@ -283,6 +314,62 @@ _AFFILIATION_SIGNAL = re.compile(
 _MAX_AUTHORSHIP_BLOCK_CHARS = 1800
 
 
+@dataclass(frozen=True)
+class _TitleResolverWeights:
+    """标题候选的可审计评分参数；集中定义，避免散落的 magic numbers。"""
+
+    title_label: int = 42
+    section_header_label: int = 20
+    text_label: int = 3
+    first_page: int = 2
+    early_reading_order: int = 4
+    title_like_word_shape: int = 3
+    overly_long_text_shape_penalty: int = 3
+    preceding_contents_penalty: int = 4
+    author_text_candidate_penalty: int = 34
+    affiliation_text_candidate_penalty: int = 18
+    downstream_publication_furniture_penalty: int = 38
+    downstream_author_signal: int = 12
+    downstream_affiliation_signal: int = 14
+    downstream_abstract_or_keywords: int = 10
+    complete_author_front_matter_chain: int = 16
+    minimum_confidence: int = 45
+    minimum_margin: int = 6
+
+
+_TITLE_RESOLVER_WEIGHTS = _TitleResolverWeights()
+
+
+@dataclass(frozen=True)
+class _TitleCandidate:
+    """一个未改写的 Docling 原始 item 在首页阅读顺序中的标题候选视图。"""
+
+    item: object
+    text: str
+    label: object
+    reading_order: int
+    pages: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _ScoredTitleCandidate:
+    """候选的确定性评分结果；拒绝原因用于测试和人工排查。"""
+
+    candidate: _TitleCandidate
+    score: int
+    rejection_reason: str | None
+
+
+@dataclass(frozen=True)
+class _TitleResolution:
+    """标题 resolver 的内部结果；不向下游暴露或修改 Docling 原始节点。"""
+
+    paper_title: str | None
+    title_source: str
+    title_candidates: tuple[str, ...]
+    ranked_candidates: tuple[_ScoredTitleCandidate, ...]
+
+
 def _normalize_pdf_word_breaks_in_text(text: str) -> str:
     """修复一个非公式文本项内的软/硬连字符断行。
 
@@ -438,7 +525,10 @@ class DoclingParser(PaperParser):
             self._remove_dangling_table_page_counter_fragments(document)
         )
         deduplicated_caption_count = self._deduplicate_repeated_captions(document)
-        paper_title, title_source, title_candidates = self._extract_title(document)
+        paper_title, title_source, title_candidates = self._extract_title(
+            document,
+            max_pages=self._settings.front_matter_max_pages,
+        )
         if self._settings.enable_front_matter_recognition:
             front_matter = self._normalize_and_extract_front_matter(
                 document,
@@ -533,44 +623,16 @@ class DoclingParser(PaperParser):
     @staticmethod
     def _extract_title(
         document: DoclingDocument,
+        *,
+        max_pages: int = 2,
     ) -> tuple[str | None, str, tuple[str, ...]]:
-        """从 Docling 结构中提取可供业务层使用的论文标题。
-
-        不改写 Docling 的原始 ``label``。这样既能保留模型真实输出，后续也可以
-        审计标题规则；PaperBase 只在自己的元数据层记录最终使用的 ``paper_title``。
-        """
-        first_page_headers: list[str] = []
-        explicit_titles: list[str] = []
-
-        for item, _level in document.iterate_items():
-            text = (getattr(item, "text", "") or "").strip()
-            if not text:
-                continue
-
-            if item.label == DocItemLabel.TITLE:
-                explicit_titles.append(text)
-                continue
-
-            # provenance 中记录了该项目来自 PDF 的哪些页面。标题候选只允许来自首页，
-            # 防止将后续章节标题误认为论文题目。
-            page_numbers = {provenance.page_no for provenance in item.prov}
-            if item.label == DocItemLabel.SECTION_HEADER and 1 in page_numbers:
-                first_page_headers.append(text)
-
-        if explicit_titles:
-            return explicit_titles[0], "docling_title_label", tuple(explicit_titles)
-
-        candidates = tuple(
-            text
-            for text in first_page_headers
-            if _is_fallback_title_candidate(text)
+        """从首页候选中选择可信标题，而不改写 Docling 原始 item 或阅读顺序。"""
+        resolution = _resolve_title_from_document(document, max_pages=max_pages)
+        return (
+            resolution.paper_title,
+            resolution.title_source,
+            resolution.title_candidates,
         )
-        if candidates:
-            # 保持页面阅读顺序，选取过滤噪声后的第一个候选。相比简单选择最长文本，
-            # 它不会把摘要中的长句或首页其他说明误当作标题。
-            return candidates[0], "first_page_heading_heuristic", candidates
-
-        return None, "unresolved", ()
 
     @staticmethod
     def _clean_enriched_formula_text(document: DoclingDocument) -> None:
@@ -1589,12 +1651,266 @@ def _find_root_title_index(root_items: list[object], paper_title: str) -> int | 
     return None
 
 
+def _resolve_title_from_document(
+    document: DoclingDocument,
+    *,
+    max_pages: int,
+) -> _TitleResolution:
+    """收集首页候选并用标题后的结构一致性选择标题。
+
+    该函数只读取 item 的 label、文本和 provenance。不会修改 ``item.text``、不会调整
+    文档树，也不会为了选标题而移动作者、摘要或出版信息。
+    """
+    candidates = _collect_title_candidates(document, max_pages=max_pages)
+    return _resolve_title_candidates(candidates)
+
+
+def _collect_title_candidates(
+    document: DoclingDocument,
+    *,
+    max_pages: int,
+) -> tuple[_TitleCandidate, ...]:
+    """保留首页窗口内 TITLE、SECTION_HEADER 与 TEXT 的原始阅读顺序和 provenance。"""
+    candidates: list[_TitleCandidate] = []
+    for reading_order, (item, _level) in enumerate(document.iterate_items()):
+        label = getattr(item, "label", None)
+        if label not in {
+            DocItemLabel.TITLE,
+            DocItemLabel.SECTION_HEADER,
+            DocItemLabel.TEXT,
+        }:
+            continue
+        text = (getattr(item, "text", "") or "").strip()
+        pages = tuple(
+            sorted(
+                {
+                    provenance.page_no
+                    for provenance in getattr(item, "prov", [])
+                    if getattr(provenance, "page_no", None) is not None
+                }
+            )
+        )
+        # 没有 provenance 或跨出首页窗口的对象无法证明其来源位置，宁可不把它当标题。
+        if not text or not pages or max(pages) > max_pages:
+            continue
+        candidates.append(
+            _TitleCandidate(
+                item=item,
+                text=text,
+                label=label,
+                reading_order=reading_order,
+                pages=pages,
+            )
+        )
+    return tuple(candidates)
+
+
+def _resolve_title_candidates(
+    candidates: tuple[_TitleCandidate, ...],
+) -> _TitleResolution:
+    """以多信号评分解析候选；低分或近似并列时显式返回 unresolved。"""
+    scored = tuple(
+        _score_title_candidate(candidate, candidates)
+        for candidate in candidates
+    )
+    ranked = tuple(
+        sorted(
+            (item for item in scored if item.rejection_reason is None),
+            key=lambda item: (-item.score, item.candidate.reading_order),
+        )
+    )
+    # ``title_candidates`` 保留可参与竞争的标题状 item。普通 TEXT 只有达到可信线时
+    # 才展示，避免把整段摘要或作者行扩散到 ParsedPaper 的元数据中。
+    visible_candidates = tuple(
+        item.candidate.text
+        for item in ranked
+        if item.candidate.label != DocItemLabel.TEXT
+        or item.score >= _TITLE_RESOLVER_WEIGHTS.minimum_confidence
+    )
+    if not ranked:
+        return _TitleResolution(None, "unresolved", visible_candidates, ranked)
+
+    best = ranked[0]
+    if best.score < _TITLE_RESOLVER_WEIGHTS.minimum_confidence:
+        return _TitleResolution(None, "unresolved", visible_candidates, ranked)
+    if (
+        len(ranked) > 1
+        and best.score - ranked[1].score < _TITLE_RESOLVER_WEIGHTS.minimum_margin
+    ):
+        return _TitleResolution(None, "unresolved", visible_candidates, ranked)
+    return _TitleResolution(
+        paper_title=best.candidate.text,
+        title_source="front_matter_coherence_scoring",
+        title_candidates=visible_candidates,
+        ranked_candidates=ranked,
+    )
+
+
+def _score_title_candidate(
+    candidate: _TitleCandidate,
+    all_candidates: tuple[_TitleCandidate, ...],
+) -> _ScoredTitleCandidate:
+    """对单个候选计算可解释分数；文本长度只贡献很小的形态分。"""
+    rejection_reason = _title_candidate_rejection_reason(candidate.text)
+    if rejection_reason is not None:
+        return _ScoredTitleCandidate(candidate, score=-10_000, rejection_reason=rejection_reason)
+
+    weights = _TITLE_RESOLVER_WEIGHTS
+    score = _title_label_score(candidate.label, weights)
+    score += weights.first_page if candidate.pages[0] == 1 else 0
+    # 靠前只能略微加分，不能像旧版一样决定性地选择“第一个够长的标题”。
+    score += weights.early_reading_order if candidate.reading_order <= 6 else 0
+    score += _title_text_shape_score(candidate.text, weights)
+    # 普通 TEXT 允许作为标题兜底，但作者行和单位行不能借用自己后方的结构链反客为主。
+    if candidate.label == DocItemLabel.TEXT:
+        if _looks_like_title_author_line(candidate.text):
+            score -= weights.author_text_candidate_penalty
+        if _AFFILIATION_SIGNAL.search(candidate.text) is not None:
+            score -= weights.affiliation_text_candidate_penalty
+    score += _title_preceding_context_score(candidate, all_candidates, weights)
+    score += _title_downstream_coherence_score(candidate, all_candidates, weights)
+    return _ScoredTitleCandidate(candidate, score=score, rejection_reason=None)
+
+
+def _title_label_score(label: object, weights: _TitleResolverWeights) -> int:
+    """Docling 的 TITLE 标签最强，SECTION_HEADER 次之，普通 TEXT 仅作受控兜底。"""
+    if label == DocItemLabel.TITLE:
+        return weights.title_label
+    if label == DocItemLabel.SECTION_HEADER:
+        return weights.section_header_label
+    return weights.text_label
+
+
+def _title_text_shape_score(text: str, weights: _TitleResolverWeights) -> int:
+    """文本形态只做弱提示，明确避免以最小字符数作为标题判定规则。"""
+    word_count = len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'’.-]*", text))
+    score = weights.title_like_word_shape if 2 <= word_count <= 30 else 0
+    if word_count > 60:
+        score -= weights.overly_long_text_shape_penalty
+    return score
+
+
+def _title_preceding_context_score(
+    candidate: _TitleCandidate,
+    all_candidates: tuple[_TitleCandidate, ...],
+    weights: _TitleResolverWeights,
+) -> int:
+    """Contents 紧邻期刊名是常见出版栏形态，故只对该局部结构做小幅降分。"""
+    preceding = [
+        item
+        for item in all_candidates
+        if item.reading_order < candidate.reading_order
+    ]
+    if not preceding:
+        return 0
+    previous_text = preceding[-1].text
+    normalized = _normalized_front_matter_label(previous_text)
+    return (
+        -weights.preceding_contents_penalty
+        if normalized.startswith("contentslistsavailable")
+        else 0
+    )
+
+
+def _title_downstream_coherence_score(
+    candidate: _TitleCandidate,
+    all_candidates: tuple[_TitleCandidate, ...],
+    weights: _TitleResolverWeights,
+) -> int:
+    """评估候选后方是否自然形成“标题→作者/单位→摘要或关键词”结构。"""
+    author_signal = False
+    affiliation_signal = False
+    strong_boundary = False
+    publication_furniture_seen = False
+
+    for following in all_candidates:
+        if following.reading_order <= candidate.reading_order:
+            continue
+        heading_type = _front_matter_heading_type(following.text)
+        inline_content_type = _split_inline_content_label(following.text)
+        if heading_type in {"abstract", "keywords"} or (
+            inline_content_type is not None
+            and inline_content_type[0] in {"abstract", "keywords"}
+        ):
+            strong_boundary = True
+            break
+        # 下一个未被识别为出版/前置元数据的标题可能是另一篇题候选。此时不把其后的
+        # 作者和摘要错误归因给当前候选，例如 “Journal Name → Real Paper Title”。
+        if (
+            following.label in {DocItemLabel.TITLE, DocItemLabel.SECTION_HEADER}
+            and _title_candidate_rejection_reason(following.text) is None
+        ):
+            break
+        if _is_title_publication_furniture(following.text):
+            publication_furniture_seen = True
+            continue
+        if _looks_like_title_author_line(following.text):
+            author_signal = True
+        if _AFFILIATION_SIGNAL.search(following.text) is not None:
+            affiliation_signal = True
+
+    score = 0
+    if publication_furniture_seen:
+        score -= weights.downstream_publication_furniture_penalty
+    if author_signal:
+        score += weights.downstream_author_signal
+    if affiliation_signal:
+        score += weights.downstream_affiliation_signal
+    if strong_boundary:
+        score += weights.downstream_abstract_or_keywords
+    if author_signal and affiliation_signal and strong_boundary:
+        score += weights.complete_author_front_matter_chain
+    return score
+
+
+def _title_candidate_rejection_reason(text: str) -> str | None:
+    """仅拒绝有明确出版/前置元数据证据的候选，不按具体期刊名过滤。"""
+    normalized = _normalized_front_matter_label(text)
+    if not normalized:
+        return "empty_text"
+    if any(normalized.startswith(prefix) for prefix in _TITLE_NON_TITLE_PREFIXES):
+        return "publication_or_front_matter_label"
+    if _TITLE_PUBLICATION_METADATA.search(text) is not None:
+        return "publication_metadata"
+    return None
+
+
+def _is_title_publication_furniture(text: str) -> bool:
+    """判断紧邻候选的文本是否是期刊主页、DOI 等出版栏，而非论文正文。"""
+    normalized = _normalized_front_matter_label(text)
+    if _TITLE_PUBLICATION_METADATA.search(text) is not None:
+        return True
+    # Authors、Abstract、Keywords 等是标题后的合理前置边界，不是“期刊名后紧跟主页”
+    # 这种反证；它们已经由调用方单独处理，不能在这里施加出版栏惩罚。
+    return normalized.startswith(
+        (
+            "contentslistsavailable",
+            "journalhomepage",
+            "received",
+            "revised",
+            "accepted",
+            "published",
+            "referenceformat",
+            "publicationinformation",
+            "citation",
+            "doi",
+            "issn",
+            "copyright",
+            "license",
+            "creativecommons",
+        )
+    )
+
+
+def _looks_like_title_author_line(text: str) -> bool:
+    """以“多个逗号分隔人名”作为作者行证据，避免依赖特定姓名或作者数量。"""
+    names = _TITLE_AUTHOR_NAME.findall(text)
+    return len(names) >= 2 and "," in text
+
+
 def _is_fallback_title_candidate(text: str) -> bool:
-    """判断首页 section header 是否适合作为标题回退候选。"""
-    normalized = re.sub(r"[^a-z0-9]", "", text.lower())
-    if len(text) < _MINIMUM_FALLBACK_TITLE_LENGTH:
-        return False
-    return not any(normalized.startswith(prefix) for prefix in _TITLE_NOISE_PREFIXES)
+    """兼容旧内部调用：现在只过滤明确出版栏，不再使用长度阈值决定标题。"""
+    return _title_candidate_rejection_reason(text) is None
 
 
 def _normalize_spaced_capital_heading(text: str) -> str:
