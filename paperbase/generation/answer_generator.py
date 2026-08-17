@@ -36,11 +36,14 @@ class AnswerGenerationDraft(BaseModel):
     evidence_explanation: str = Field(min_length=1)
     # 有证据时解释阅读意义；极简事实或证据确实不足时允许为 null，但字段必须出现。
     reading_interpretation: str | None
-    # 使用到的证据编号：只能来自本次传入的 E#/R#，程序会再次验证。
-    # 必须显式输出，避免模型在正文使用 [E#] 后由默认空列表掩盖遗漏。
-    citations: list[str]
-    # 证据不足标志：true 时不得把模型常识包装成论文结论。
+    # 模型填写的引用清单只作为辅助检查；最终清单由程序从正文 [E#]/[R#] 确定性提取。
+    citations: list[str] = Field(default_factory=list)
+    # 证据不足表示：当前证据连问题的核心结论也无法支持。
     insufficient_evidence: bool
+    # 部分回答表示：核心结论可回答，但覆盖范围、条件或次要细节不完整。
+    partial_answer: bool = False
+    # 仅在 partial_answer=true 时说明尚未覆盖的范围；不能写成论文事实。
+    coverage_note: str | None = None
 
 
 class AnswerGenerationResult(BaseModel):
@@ -51,6 +54,8 @@ class AnswerGenerationResult(BaseModel):
     answer: str = Field(min_length=1)
     citations: list[str] = Field(default_factory=list)
     insufficient_evidence: bool
+    partial_answer: bool = False
+    coverage_note: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,9 +63,12 @@ class AnswerGenerationOutcome:
     """回答生成结果；失败时保持检索证据可用，而不是中断整个问答流程。"""
 
     status: str
-    answer: str | None
+    # 所有分支都返回可展示文本；前端无需为 answer=null 再写一套兜底逻辑。
+    answer: str
     citations: tuple[str, ...]
     insufficient_evidence: bool
+    partial_answer: bool = False
+    coverage_note: str | None = None
 
 
 class GroundedAnswerGenerator:
@@ -87,9 +95,11 @@ class GroundedAnswerGenerator:
         if not self._settings.enabled:
             return AnswerGenerationOutcome(
                 status="disabled",
-                answer=None,
+                answer="回答生成功能当前未启用；请查看下方已检索到的论文证据。",
                 citations=(),
-                insufficient_evidence=not bool(bounded_evidence),
+                # 未生成可引用的论文结论时，不能让调用方把该提示误当作回答事实。
+                insufficient_evidence=True,
+                coverage_note="回答生成器未启用，系统未根据检索证据形成最终回答。",
             )
         if not bounded_evidence:
             return AnswerGenerationOutcome(
@@ -144,9 +154,11 @@ class GroundedAnswerGenerator:
         """生成环节是可选增强；失败时让调用方继续展示已审计的证据。"""
         return AnswerGenerationOutcome(
             status="fallback",
-            answer=None,
+            answer="回答生成未完成；系统保留了下方已检索到的论文证据，供你核验或重新提问。",
             citations=(),
-            insufficient_evidence=False,
+            # 这是“生成失败”，不是把已有检索证据错误判成无关；但尚无可展示的论文结论。
+            insufficient_evidence=True,
+            coverage_note="回答模型未生成符合证据引用约束的内容，尚未形成可引用的论文结论。",
         )
 
 
@@ -179,25 +191,52 @@ def _normalize_and_validate_answer(
     *,
     allowed_evidence_ids: set[str],
 ) -> AnswerGenerationResult:
-    """清洗可确定的格式问题，并拒绝模型编造的证据编号。"""
+    """校验正文引用，并由程序确定最终引用清单与回答覆盖状态。"""
     answer = result.answer.strip()
     if not answer:
         raise ValueError("Answer must not be blank after stripping.")
-    citations = _unique_nonempty_strings(result.citations)
-    unknown_citations = set(citations).difference(allowed_evidence_ids)
-    if unknown_citations:
-        raise ValueError("Answer contains citations outside the provided evidence.")
-    in_text_citations = set(re.findall(r"\[([ER]\d+)\]", answer))
-    if not in_text_citations.issubset(allowed_evidence_ids):
+    citations = _extract_in_text_citations(answer)
+    if not set(citations).issubset(allowed_evidence_ids):
         raise ValueError("Answer text contains fabricated evidence labels.")
-    if not in_text_citations.issubset(set(citations)):
-        raise ValueError("Answer text citations must also appear in citations.")
-    if not result.insufficient_evidence and not citations:
+
+    # ``citations`` 是可由正文确定性得到的派生数据，不能因为模型漏填重复字段而丢弃回答。
+    # 因此不信任模型单独返回的 citations 数组，只以实际出现且已验证的标记为准。
+    insufficient_evidence = result.insufficient_evidence
+    partial_answer = result.partial_answer
+    coverage_note = (result.coverage_note or "").strip() or None
+
+    if insufficient_evidence and citations:
+        # 这类输出通常代表模型已给出可核验的核心回答，却把“并未穷尽全部细节”错标成
+        # evidence insufficient。将它规范为 partial，既保留回答和引用，也向 UI 交代边界。
+        insufficient_evidence = False
+        partial_answer = True
+        coverage_note = coverage_note or _DEFAULT_PARTIAL_COVERAGE_NOTE
+    elif insufficient_evidence:
+        # 真正无证据回答不得携带引用，更不能同时声称“部分回答”。
+        partial_answer = False
+        coverage_note = None
+    elif partial_answer:
+        if not citations:
+            raise ValueError("A partial answer must cite provided evidence.")
+        coverage_note = coverage_note or _DEFAULT_PARTIAL_COVERAGE_NOTE
+    elif not citations:
         raise ValueError("A non-insufficient answer must cite provided evidence.")
+    else:
+        # 完整回答不应额外声称“覆盖不完整”；忽略模型的矛盾附加字段。
+        coverage_note = None
+
+    if not partial_answer:
+        answer = _remove_coverage_note_section(answer)
+    # 模型误把“部分覆盖”写成 insufficient 时，compose 阶段尚未有 coverage_note；
+    # 在这里补上程序生成的可见边界说明，保证返回字段与 answer 正文一致。
+    if coverage_note and "### 证据覆盖说明" not in answer:
+        answer = f"{answer}\n\n### 证据覆盖说明\n{coverage_note}"
     return AnswerGenerationResult(
         answer=answer,
         citations=citations,
-        insufficient_evidence=result.insufficient_evidence,
+        insufficient_evidence=insufficient_evidence,
+        partial_answer=partial_answer,
+        coverage_note=coverage_note,
     )
 
 
@@ -206,6 +245,7 @@ def _compose_answer(draft: AnswerGenerationDraft) -> AnswerGenerationResult:
     direct_answer = draft.direct_answer.strip()
     evidence_explanation = draft.evidence_explanation.strip()
     interpretation = (draft.reading_interpretation or "").strip()
+    coverage_note = (draft.coverage_note or "").strip()
     if not direct_answer or not evidence_explanation:
         raise ValueError("Answer draft must include direct answer and evidence explanation.")
     parts = [
@@ -214,10 +254,14 @@ def _compose_answer(draft: AnswerGenerationDraft) -> AnswerGenerationResult:
     ]
     if interpretation:
         parts.append(f"### 如何理解\n{interpretation}")
+    if coverage_note:
+        parts.append(f"### 证据覆盖说明\n{coverage_note}")
     return AnswerGenerationResult(
         answer="\n\n".join(parts),
         citations=draft.citations,
         insufficient_evidence=draft.insufficient_evidence,
+        partial_answer=draft.partial_answer,
+        coverage_note=coverage_note or None,
     )
 
 
@@ -232,6 +276,19 @@ def _unique_nonempty_strings(values: Sequence[str]) -> list[str]:
         seen.add(normalized)
         cleaned.append(normalized)
     return cleaned
+
+
+_DEFAULT_PARTIAL_COVERAGE_NOTE = "当前证据支持上述核心回答，但未覆盖问题涉及的全部细节或范围。"
+
+
+def _extract_in_text_citations(answer: str) -> list[str]:
+    """按正文首次出现顺序提取引用，作为 API 的唯一 citations 来源。"""
+    return _unique_nonempty_strings(re.findall(r"\[([ER]\d+)\]", answer))
+
+
+def _remove_coverage_note_section(answer: str) -> str:
+    """移除与最终状态矛盾的、由 compose 固定追加在末尾的覆盖说明。"""
+    return re.sub(r"\n\n### 证据覆盖说明\n.*\Z", "", answer, flags=re.DOTALL)
 
 
 def _has_ambiguous_singular_paper_reference(
@@ -265,4 +322,6 @@ def _to_outcome(result: AnswerGenerationResult, *, status: str) -> AnswerGenerat
         answer=result.answer,
         citations=tuple(result.citations),
         insufficient_evidence=result.insufficient_evidence,
+        partial_answer=result.partial_answer,
+        coverage_note=result.coverage_note,
     )

@@ -45,16 +45,51 @@ class _FakeVectorIndex:
 
 
 class _FakeRewriter:
-    """稳定覆盖原始/改写 Dense、原始/关键词 BM25 与 bibliography 分支。"""
+    """稳定覆盖 resolved/semantic Dense、关键词 BM25 与 bibliography 分支。"""
 
-    def rewrite(self, query: str, *, conversation_context: object = None) -> QueryRewritePlan:
-        _ = conversation_context
+    def plan(
+        self, query: str, *, trusted_scope: object = None, conversation_context: object = None
+    ) -> QueryRewritePlan:
+        _ = trusted_scope, conversation_context
         return QueryRewritePlan(
             original_query=query,
-            semantic_query="dynamic time method",
+            resolved_query=query,
+            semantic_query_en="dynamic time method",
             lexical_keywords_en=("results",),
             search_bibliography=True,
-            status="success",
+            rewrite_status="success",
+        )
+
+
+class _ContextRecordingRewriter(_FakeRewriter):
+    """记录 scope 与上下文，验证两类输入没有混在一起。"""
+
+    def __init__(self) -> None:
+        self.contexts: list[tuple[str, ...]] = []
+        self.scopes: list[object] = []
+
+    def plan(
+        self, query: str, *, trusted_scope: object = None, conversation_context: object = None
+    ) -> QueryRewritePlan:
+        self.contexts.append(tuple(conversation_context or ()))
+        self.scopes.append(trusted_scope)
+        return super().plan(
+            query, trusted_scope=trusted_scope, conversation_context=conversation_context
+        )
+
+
+class _UnresolvedRewriter:
+    """模拟缺少历史对象的追问；Retriever 不得把原句送入任何召回路径。"""
+
+    def plan(
+        self, query: str, *, trusted_scope: object = None, conversation_context: object = None
+    ) -> QueryRewritePlan:
+        _ = trusted_scope, conversation_context
+        return QueryRewritePlan(
+            original_query=query,
+            resolution_status="unresolved",
+            rewrite_status="not_run",
+            clarification_message="请明确它指的是哪个方法。",
         )
 
 
@@ -99,7 +134,7 @@ class AskThisPaperTests(unittest.TestCase):
 
         result = retriever.retrieve("How does the method work?", result_limit=3)
 
-        self.assertEqual(result.rewrite_plan.status, "success")
+        self.assertEqual(result.rewrite_plan.rewrite_status, "success")
         self.assertEqual(result.reranking_status, "success")
         self.assertTrue(result.chunks)
         self.assertTrue(all(chunk.paper_id == "paper-current" for chunk in result.chunks))
@@ -109,7 +144,12 @@ class AskThisPaperTests(unittest.TestCase):
         self.assertEqual([chunk.chunk_id for chunk in bibliography], ["reference-current"])
         self.assertEqual(bibliography[0].source_matches[0].route, "bm25_bibliography")
         content = [chunk for chunk in result.chunks if chunk.section_type == "content"]
-        self.assertTrue(any({item.route for item in chunk.source_matches}.issuperset({"dense_original", "bm25_original"}) for chunk in content))
+        content_routes = {
+            item.route for chunk in content for item in chunk.source_matches
+        }
+        self.assertIn("dense_resolved", content_routes)
+        self.assertIn("dense_semantic", content_routes)
+        self.assertNotIn("bm25_original", content_routes)  # 旧 resolved_query BM25 路径已移除。
 
     def test_evidence_expansion_uses_section_id_and_never_crosses_sibling(self) -> None:
         snapshot = _snapshot(Path("/temporary/staging_ask"))
@@ -150,21 +190,70 @@ class AskThisPaperTests(unittest.TestCase):
             self.assertEqual(result.result_path.parent, snapshot.root_dir / "ask_paper")
             self.assertFalse((snapshot.root_dir / "paperbase.sqlite3").exists())
 
+    def test_unresolved_reference_skips_retrieval_and_returns_clarification(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            snapshot = _snapshot(Path(temporary_directory) / "staging_ask")
+            snapshot.root_dir.mkdir()
+            client = _FakeAnswerClient()
+            service = AskThisPaperService(
+                snapshot=snapshot,
+                retriever=_retriever(snapshot, rewriter=_UnresolvedRewriter()),
+                expander=WorkspaceSectionEvidenceExpander(
+                    snapshot=snapshot,
+                    settings=ContextExpansionSettings(neighbor_window=1, max_total_tokens=500),
+                ),
+                generator=GroundedAnswerGenerator(
+                    settings=AnswerGenerationSettings(), client=client
+                ),
+            )
 
-def _retriever(snapshot: WorkspaceSectionSnapshot) -> WorkspaceHybridRetriever:
+            result = service.ask("它和 DTW 有什么区别？")
+
+            self.assertEqual(result.retrieval.reranking_status, "not_run")
+            self.assertEqual(result.retrieval.chunks, ())
+            self.assertEqual(result.answer.status, "needs_clarification")
+            self.assertEqual(result.answer.answer, "请明确它指的是哪个方法。")
+            self.assertEqual(client.calls, 0)
+
+    def test_service_passes_current_paper_as_trusted_scope_not_conversation_text(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            snapshot = _snapshot(Path(temporary_directory) / "staging_ask")
+            snapshot.root_dir.mkdir()
+            rewriter = _ContextRecordingRewriter()
+            service = AskThisPaperService(
+                snapshot=snapshot,
+                retriever=_retriever(snapshot, rewriter=rewriter),
+                expander=WorkspaceSectionEvidenceExpander(
+                    snapshot=snapshot,
+                    settings=ContextExpansionSettings(neighbor_window=1, max_total_tokens=500),
+                ),
+                generator=GroundedAnswerGenerator(
+                    settings=AnswerGenerationSettings(), client=_FakeAnswerClient()
+                ),
+            )
+
+            service.ask("这篇论文的方法是什么？", conversation_context=("上一轮问题。",))
+
+            self.assertEqual(rewriter.contexts[0][0], "上一轮问题。")
+            self.assertEqual(len(rewriter.contexts[0]), 1)
+            self.assertEqual(getattr(rewriter.scopes[0], "paper_id"), "paper-current")
+            self.assertEqual(getattr(rewriter.scopes[0], "paper_title"), "Current Paper")
+
+
+def _retriever(
+    snapshot: WorkspaceSectionSnapshot, *, rewriter: object | None = None
+) -> WorkspaceHybridRetriever:
     """装配完全替身化的 Hybrid Retriever，便于断言当前论文隔离边界。"""
     retrieval_settings = RetrievalSettings(
         backend="hybrid_rrf",
         query_instruction="Retrieve evidence from the currently selected paper only.",
         dense_top_k_per_query=2,
-        bm25_original_top_k=2,
-        bm25_rewrite_top_k=2,
+        bm25_keywords_top_k=2,
         fused_top_k=4,
         rrf_k=60,
-        dense_original_weight=1.0,
-        dense_rewrite_weight=1.0,
-        bm25_original_weight=1.0,
-        bm25_rewrite_weight=1.0,
+        dense_resolved_weight=1.0,
+        dense_semantic_weight=1.0,
+        bm25_keywords_weight=1.0,
     )
     reranking_settings = RerankingSettings(
         backend="fake",
@@ -185,7 +274,7 @@ def _retriever(snapshot: WorkspaceSectionSnapshot) -> WorkspaceHybridRetriever:
         content_bm25=cache.get_or_build(snapshot),
         bibliography_bm25=WorkspaceBM25Index.build(snapshot, section_type="bibliography"),
         settings=retrieval_settings,
-        query_rewriter=_FakeRewriter(),  # type: ignore[arg-type]
+        query_planner=rewriter or _FakeRewriter(),  # type: ignore[arg-type]
         reranker=_FakeReranker(),  # type: ignore[arg-type]
         reranking_settings=reranking_settings,
     )

@@ -1,13 +1,14 @@
 """Step 6 混合检索模块：Query 改写、稠密召回、BM25 与 RRF 融合。"""
 
 from .hybrid_retriever import HybridRetriever, RetrievedChunk, RetrievalResult
-from .query_rewriter import LLMQueryRewriter, QueryRewritePlan, create_query_rewriter
+from .query_rewriter import LLMQueryPlanner, QueryRewritePlan, TrustedPaperScope, create_query_planner
 
 __all__ = [
     "HybridRetriever",
-    "LLMQueryRewriter",
+    "LLMQueryPlanner",
     "QueryRewritePlan",
     "RetrievedChunk",
     "RetrievalResult",
-    "create_query_rewriter",
+    "TrustedPaperScope",
+    "create_query_planner",
 ]

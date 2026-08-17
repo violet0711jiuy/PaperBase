@@ -76,14 +76,30 @@ ANSWER_GENERATION_SYSTEM_PROMPT = """
 对于实验问题，除结论外，还应说明可用证据中的设置、比较对象、指标和数值。
 若其中任何一项没有证据，应明确缺失，不能用常识补充。
 
-【证据不足】
-只有当现有证据无法回答用户问题的核心部分时，才设置：
-"insufficient_evidence": true
+【回答覆盖状态】
+必须在以下三种状态中严格选择，不能把它们混为一谈：
 
-如果核心问题可以回答，只是部分次要细节缺失：
+1. 完全无法回答：当前证据无法支持问题的核心结论，或 E#/R# 与问题主题、对象、方法或结论明显无关。
+   此时设置 "insufficient_evidence": true、"partial_answer": false；正文不得出现 [E#]/[R#]，citations 必须为空。
+
+2. 可回答但不完整：证据足以支持一个有用的核心回答，但不能覆盖问题要求的全部范围、条件、对象或次要细节。
+   此时设置 "insufficient_evidence": false、"partial_answer": true；所有事实性结论都必须带 [E#]/[R#]，并在 coverage_note 简洁说明缺少什么。
+
+3. 证据充分：设置 "insufficient_evidence": false、"partial_answer": false；所有事实性结论都必须带 [E#]/[R#]。
+
+【完全无法回答】
+
+无关证据同样属于证据不足，绝不能因为存在 E#/R# 就把它们拼接成答案。例如用户询问猫，
+而证据只讨论风速预测、空气污染或其他无关论文时：不得用常识回答，也不得总结无关论文；
+应在 direct_answer 和 evidence_explanation 中明确说明“提供的论文证据与该问题无关，无法根据它回答”。
+此时 citations 必须为空列表，正文中不得出现 [E#]/[R#]。
+
+【可回答但不完整】
+如果核心问题可以回答，只是部分次要细节、范围或条件缺失：
 - 回答已有证据能够支持的部分；
 - 明确指出缺失信息；
-- "insufficient_evidence" 保持 false。
+- 设置 "insufficient_evidence": false 和 "partial_answer": true；
+- 在 coverage_note 中说明证据覆盖边界。
 
 不要为了追求完整而补充证据中没有的信息。
 
@@ -98,8 +114,8 @@ ANSWER_GENERATION_SYSTEM_PROMPT = """
 1. 每个关键事实或结论后必须标注对应证据 ID，例如 [E1]、[E2][E4]。
 2. 只能引用 <evidence_context> 中真实存在的 E# / R#，不得创建新的编号。
 3. 引用应尽量精确，避免给一个结论附上无关证据。
-4. "citations" 必须包含 answer 中实际使用的全部引用 ID，去重后返回。
-5. 不得在 citations 中加入 answer 未使用的证据。
+4. "citations" 应包含正文实际使用的全部引用 ID，去重后返回；程序仍会以正文中的 [E#]/[R#] 作为最终可信来源。
+5. 不得在 citations 中加入正文未使用的证据。
 
 【输出】
 只输出以下 JSON，不输出 Markdown、代码块、解释或其他字段：
@@ -109,7 +125,9 @@ ANSWER_GENERATION_SYSTEM_PROMPT = """
   "evidence_explanation": "论文中的步骤、推导、实验依据或比较，带精确引用",
   "reading_interpretation": "该结论如何理解；没有直接证据时为 null",
   "citations": ["E1", "E3"],
-  "insufficient_evidence": false
+  "insufficient_evidence": false,
+  "partial_answer": false,
+  "coverage_note": null
 }
 
 程序会将三个内容字段排版为用户可读的 ``answer``。即使证据不足，direct_answer 和

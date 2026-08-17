@@ -18,8 +18,9 @@ from paperbase.generation.answer_generator import (
     create_answer_generator,
 )
 from paperbase.generation.section_expander import ExpansionResult
+from paperbase.generation.relevance import NO_RELEVANT_EVIDENCE_MESSAGE, has_insufficient_retrieval_relevance
 from paperbase.reranking import create_reranker
-from paperbase.retrieval.query_rewriter import create_query_rewriter
+from paperbase.retrieval.query_rewriter import TrustedPaperScope, create_query_planner
 from paperbase.staging.bm25 import WorkspaceBM25IndexCache
 from paperbase.staging.sections import WorkspaceSectionRepository, WorkspaceSectionSnapshot
 
@@ -52,11 +53,13 @@ class AskThisPaperService:
         retriever: WorkspaceHybridRetriever,
         expander: WorkspaceSectionEvidenceExpander,
         generator: GroundedAnswerGenerator,
+        min_rerank_score: float = 0.05,
     ) -> None:
         self._snapshot = snapshot
         self._retriever = retriever
         self._expander = expander
         self._generator = generator
+        self._min_rerank_score = min_rerank_score
 
     def ask(
         self,
@@ -66,17 +69,42 @@ class AskThisPaperService:
         retrieval_result_limit: int | None = None,
     ) -> AskThisPaperResult:
         """执行当前论文独占的检索、证据扩展和一次 LLM 回答，并保存可审计结果。"""
+        # workspace 论文范围是可信程序状态，不能伪装成一条 conversation_context 文本。
+        trusted_scope = TrustedPaperScope(
+            paper_id=self._snapshot.paper_id,
+            paper_title=self._snapshot.paper_title,
+        )
         retrieval = self._retriever.retrieve(
             query,
+            trusted_scope=trusted_scope,
             conversation_context=conversation_context,
             result_limit=retrieval_result_limit,
         )
         expansion = self._expander.expand(retrieval)
-        answer = self._generator.generate(
-            query=retrieval.query,
-            evidence=expansion.evidence,
-            conversation_context=conversation_context,
-        )
+        if retrieval.rewrite_plan.resolution_status == "unresolved":
+            answer = AnswerGenerationOutcome(
+                status="needs_clarification",
+                answer=retrieval.rewrite_plan.clarification_message,
+                citations=(),
+                insufficient_evidence=True,
+            )
+        elif has_insufficient_retrieval_relevance(
+            retrieval,
+            min_rerank_score=self._min_rerank_score,
+        ):
+            answer = AnswerGenerationOutcome(
+                status="insufficient_evidence",
+                answer=NO_RELEVANT_EVIDENCE_MESSAGE,
+                citations=(),
+                insufficient_evidence=True,
+            )
+        else:
+            answer = self._generator.generate(
+                query=retrieval.rewrite_plan.resolved_query or retrieval.query,
+                evidence=expansion.evidence,
+                # 回答器也只把它作为对话定位信息，而论文事实必须来自 evidence。
+                conversation_context=conversation_context,
+            )
         result_path = _write_result_artifact(
             snapshot=self._snapshot,
             retrieval=retrieval,
@@ -106,7 +134,7 @@ def create_ask_this_paper_service(
         snapshot=snapshot,
         query_embedder=embedder,
         settings=settings.retrieval,
-        query_rewriter=create_query_rewriter(
+        query_planner=create_query_planner(
             settings=settings.retrieval.query_rewrite,
             env_path=settings.config_path.parent / ".env",
         ),
@@ -124,6 +152,7 @@ def create_ask_this_paper_service(
             settings=settings.answer_generation,
             env_path=settings.config_path.parent / ".env",
         ),
+        min_rerank_score=settings.answer_generation.min_rerank_score,
     )
 
 
@@ -184,9 +213,11 @@ def _result_to_json(result: AskThisPaperResult) -> dict[str, object]:
         "workspace_id": result.workspace_id,
         "query": retrieval.query,
         "rewrite_plan": {
-            "status": retrieval.rewrite_plan.status,
-            "semantic_query": retrieval.rewrite_plan.semantic_query,
+            "resolution_status": retrieval.rewrite_plan.resolution_status,
+            "resolved_query": retrieval.rewrite_plan.resolved_query,
+            "semantic_query_en": retrieval.rewrite_plan.semantic_query_en,
             "lexical_keywords_en": list(retrieval.rewrite_plan.lexical_keywords_en),
+            "rewrite_status": retrieval.rewrite_plan.rewrite_status,
             "search_bibliography": retrieval.rewrite_plan.search_bibliography,
         },
         "reranking_status": retrieval.reranking_status,
@@ -194,6 +225,8 @@ def _result_to_json(result: AskThisPaperResult) -> dict[str, object]:
         "answer": result.answer.answer,
         "citations": list(result.answer.citations),
         "insufficient_evidence": result.answer.insufficient_evidence,
+        "partial_answer": result.answer.partial_answer,
+        "coverage_note": result.answer.coverage_note,
         "retrieved_chunks": [
             {
                 "rank": chunk.rank,

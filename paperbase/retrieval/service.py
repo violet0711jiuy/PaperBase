@@ -14,7 +14,7 @@ from paperbase.indexing import FaissIndexStore
 from paperbase.reranking import create_reranker
 
 from .hybrid_retriever import HybridRetriever, RetrievedChunk
-from .query_rewriter import create_query_rewriter
+from .query_rewriter import create_query_planner
 
 
 def create_hybrid_retriever(*, config_path: Path | str | None = None) -> HybridRetriever:
@@ -33,7 +33,7 @@ def create_hybrid_retriever(*, config_path: Path | str | None = None) -> HybridR
         )
     # 索引存储适配器直接接收完整 indexing 配置，避免在线侧重复维护路径参数。
     index_store = FaissIndexStore(settings.indexing)
-    rewriter = create_query_rewriter(
+    rewriter = create_query_planner(
         settings=settings.retrieval.query_rewrite,
         env_path=settings.config_path.parent / ".env",
     )
@@ -45,7 +45,7 @@ def create_hybrid_retriever(*, config_path: Path | str | None = None) -> HybridR
         query_embedder=embedder,
         index_store=index_store,
         settings=settings.retrieval,
-        query_rewriter=rewriter,
+        query_planner=rewriter,
         reranker=reranker,
         reranking_settings=settings.reranking,
     )
@@ -90,12 +90,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         "query": result.query,
         # 改写计划：记录 LLM 是否成功，以及实际新增了哪些检索查询。
         "rewrite_plan": {
-            # 改写状态：success / fallback / disabled。
-            "status": result.rewrite_plan.status,
+            # 指代消解状态：unresolved 时检索器不会执行模糊原问题的 Dense/BM25。
+            "resolution_status": result.rewrite_plan.resolution_status,
+            # 实际进入第一条 Dense 的规范问题；原始用户问题仍在 query 字段。
+            "resolved_query": result.rewrite_plan.resolved_query,
             # 语义改写：一条完整问句，进入 Rewritten Dense Top-20 通道；无改写时为 null。
-            "semantic_query": result.rewrite_plan.semantic_query,
+            "semantic_query_en": result.rewrite_plan.semantic_query_en,
             # 英文关键词组：共同构成一条 Rewritten BM25 Top-20 的 OR 查询。
             "lexical_keywords_en": list(result.rewrite_plan.lexical_keywords_en),
+            # Retrieval Rewrite 状态：success / degraded / not_run。
+            "rewrite_status": result.rewrite_plan.rewrite_status,
             # 仅明确 citation/reference intent 时为 true，才会额外查询 bibliography FTS5。
             "search_bibliography": result.rewrite_plan.search_bibliography,
         },
@@ -147,7 +151,7 @@ def _chunk_to_json(chunk: RetrievedChunk) -> dict[str, object]:
         # 命中证据：同一 chunk 在每条检索通道中的排名、原始分数和实际权重。
         "source_matches": [
             {
-                # 召回路径：如 dense_original、bm25_keyword_zh。
+                # 召回路径：如 dense_resolved、dense_semantic、bm25_keywords。
                 "route": source.route,
                 # 该路径实际使用的查询文本。
                 "query": source.query,

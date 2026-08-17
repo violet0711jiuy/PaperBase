@@ -182,11 +182,7 @@ class IndexingSettings(BaseModel):
 
 
 class QueryRewriteSettings(BaseModel):
-    """LLM Query 改写的边界参数；密钥与模型地址仍只从 ``.env`` 读取。
-
-    一次 LLM 调用只产生一条语义改写问题和一组英文关键词；关键词组会作为一条
-    Rewritten BM25 路径执行，而非拆成多条独立 BM25 路径。
-    """
+    """Query Resolution 与 Retrieval Rewrite 的 LLM 边界参数。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -196,7 +192,6 @@ class QueryRewriteSettings(BaseModel):
     max_context_turns: int = Field(default=4, ge=0, le=16)
     # 引用意图命中后，bibliography FTS5 最多提供的辅助候选数；不参与主 FAISS。
     bibliography_top_k: int = Field(default=5, ge=1, le=20)
-    fallback_to_original: bool = True
 
 
 class RetrievalSettings(BaseModel):
@@ -206,14 +201,12 @@ class RetrievalSettings(BaseModel):
 
     backend: str = Field(min_length=1)
     dense_top_k_per_query: int = Field(default=20, ge=1, le=200)
-    bm25_original_top_k: int = Field(default=10, ge=1, le=200)
-    bm25_rewrite_top_k: int = Field(default=20, ge=1, le=200)
+    bm25_keywords_top_k: int = Field(default=20, ge=1, le=200)
     fused_top_k: int = Field(default=40, ge=1, le=500)
     rrf_k: int = Field(default=60, ge=1, le=1_000)
-    dense_original_weight: float = Field(default=1.0, gt=0, le=10)
-    dense_rewrite_weight: float = Field(default=1.0, gt=0, le=10)
-    bm25_original_weight: float = Field(default=0.7, gt=0, le=10)
-    bm25_rewrite_weight: float = Field(default=1.0, gt=0, le=10)
+    dense_resolved_weight: float = Field(default=1.0, gt=0, le=10)
+    dense_semantic_weight: float = Field(default=1.0, gt=0, le=10)
+    bm25_keywords_weight: float = Field(default=1.0, gt=0, le=10)
     query_instruction: str = Field(min_length=20, max_length=1_000)
     query_rewrite: QueryRewriteSettings = Field(default_factory=QueryRewriteSettings)
 
@@ -258,6 +251,8 @@ class AnswerGenerationSettings(BaseModel):
 
     enabled: bool = True
     max_evidence_units: int = Field(default=8, ge=1, le=30)
+    # Reranker 已成功时，最高正文分低于该阈值即视为没有可用论文证据；0 表示关闭该保护。
+    min_rerank_score: float = Field(default=0.05, ge=0.0, le=1.0)
     # 回答需要解释论文证据，单独覆盖全局 LLM_MAX_TOKENS；不影响短小的 Query Rewrite。
     max_output_tokens: int = Field(default=1_600, ge=400, le=8_000)
 

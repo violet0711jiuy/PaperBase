@@ -13,7 +13,7 @@ from paperbase.embedding.base import QueryEmbedder
 from paperbase.indexing import FaissIndexStore
 from paperbase.reranking import Reranker
 
-from .query_rewriter import QueryRewritePlan, QueryRewriter
+from .query_rewriter import QueryPlanner, QueryRewritePlan, TrustedPaperScope
 
 
 @dataclass(frozen=True)
@@ -88,14 +88,14 @@ class HybridRetriever:
         query_embedder: QueryEmbedder,
         index_store: FaissIndexStore,
         settings: RetrievalSettings,
-        query_rewriter: QueryRewriter,
+        query_planner: QueryPlanner,
         reranker: Reranker | None = None,
         reranking_settings: RerankingSettings | None = None,
     ) -> None:
         self._database = database
         self._query_embedder = query_embedder
         self._settings = settings
-        self._query_rewriter = query_rewriter
+        self._query_planner = query_planner
         self._reranker = reranker
         self._reranking_settings = reranking_settings
         # 启动时验证索引、清单、SQLite 映射三者一致；不读取 staging 工件。
@@ -105,46 +105,45 @@ class HybridRetriever:
         self,
         query: str,
         *,
+        trusted_scope: TrustedPaperScope | None = None,
         conversation_context: Sequence[str] | None = None,
         result_limit: int | None = None,
     ) -> RetrievalResult:
-        """运行四路召回并返回按 chunk_id 去重后的 Top-K chunk。
-
-        1. 原始问题 Dense Top-20；2. 原始问题 BM25 Top-10；3. 一条语义改写 Dense Top-20；
-        4. 英文关键词组 BM25 Top-20。RRF 聚合字典以 chunk_id 为键，因此融合期间便已去重。
-        """
-        # 上下文只交给改写器消解指代；原始 Dense/BM25 路径始终只使用当前用户问题。
-        plan = self._query_rewriter.rewrite(
+        """运行 resolved Dense、英文语义 Dense 与英文关键词 BM25 三路召回。"""
+        # trusted_scope 是程序状态；conversation_context 只作为 Resolution 的普通待处理数据。
+        plan = self._query_planner.plan(
             query,
+            trusted_scope=trusted_scope,
             conversation_context=conversation_context,
         )
         if result_limit is not None and result_limit < 1:
             raise ValueError("result_limit must be positive when provided.")
+        if plan.resolution_status == "unresolved":
+            return RetrievalResult(
+                query=plan.original_query,
+                rewrite_plan=plan,
+                reranking_status="not_run",
+                chunks=(),
+            )
+        resolved_query = plan.resolved_query or plan.original_query
         candidates: dict[str, _Candidate] = {}
 
         self._add_dense_matches(
             candidates=candidates,
-            route="dense_original",
-            queries=(plan.original_query,),
-            group_weight=self._settings.dense_original_weight,
+            route="dense_resolved",
+            queries=(resolved_query,),
+            group_weight=self._settings.dense_resolved_weight,
         )
         self._add_dense_matches(
             candidates=candidates,
-            route="dense_rewrite",
-            queries=(plan.semantic_query,) if plan.semantic_query is not None else (),
-            group_weight=self._settings.dense_rewrite_weight,
-        )
-        self._add_original_bm25_matches(
-            candidates=candidates,
-            route="bm25_original",
-            query=plan.original_query,
-            top_k=self._settings.bm25_original_top_k,
-            weight=self._settings.bm25_original_weight,
+            route="dense_semantic",
+            queries=(plan.semantic_query_en,) if plan.semantic_query_en is not None else (),
+            group_weight=self._settings.dense_semantic_weight,
         )
         self._add_rewritten_bm25_matches(
             candidates=candidates,
             keywords=plan.lexical_keywords_en,
-            weight=self._settings.bm25_rewrite_weight,
+            weight=self._settings.bm25_keywords_weight,
         )
         bibliography_candidates: tuple[_Candidate, ...] = ()
         if plan.search_bibliography:
@@ -152,7 +151,7 @@ class HybridRetriever:
             # 无法定位目标论文时宁可不查 bibliography，也不能退化为全库宽泛主题词匹配。
             target_paper_id = _select_bibliography_target_paper_id(candidates)
             bibliography_candidates = self._collect_bibliography_candidates(
-                query=(plan.semantic_query or plan.original_query),
+                query=(plan.semantic_query_en or resolved_query),
                 keywords=plan.lexical_keywords_en,
                 target_paper_id=target_paper_id,
             )
@@ -163,7 +162,7 @@ class HybridRetriever:
         )
         reranking_status = "disabled"
         ordered_content, reranking_status = self._rerank_content_candidates(
-            query=(plan.semantic_query or plan.original_query),
+            query=resolved_query,
             candidates=rrf_ordered_content,
         )
         if plan.search_bibliography:
@@ -284,25 +283,6 @@ class HybridRetriever:
                     effective_weight=group_weight,
                 )
 
-    def _add_original_bm25_matches(
-        self,
-        *,
-        candidates: dict[str, _Candidate],
-        route: str,
-        query: str,
-        top_k: int,
-        weight: float,
-    ) -> None:
-        """执行原始问题 BM25 Top-10；RRF 只使用排名而不混用 BM25 原始分数。"""
-        rows = self._database.search_bm25(query, top_k=top_k)
-        self._add_bm25_rows(
-            candidates=candidates,
-            rows=rows,
-            route=route,
-            query=query,
-            weight=weight,
-        )
-
     def _add_rewritten_bm25_matches(
         self,
         *,
@@ -314,14 +294,14 @@ class HybridRetriever:
         if not keywords:
             return
         rows = self._database.search_bm25_keyword_group(
-            keywords, top_k=self._settings.bm25_rewrite_top_k
+            keywords, top_k=self._settings.bm25_keywords_top_k
         )
         # 对外证据使用可读的 OR 文本；SQLite 内部会对每个关键词安全转义并编译为 FTS5 表达式。
         rendered_query = " OR ".join(keywords)
         self._add_bm25_rows(
             candidates=candidates,
             rows=rows,
-            route="bm25_rewrite",
+            route="bm25_keywords",
             query=rendered_query,
             weight=weight,
         )

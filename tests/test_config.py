@@ -41,8 +41,7 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(settings.reranking.model_path.is_absolute())
         self.assertEqual(settings.retrieval.backend, "hybrid_rrf")
         self.assertEqual(settings.retrieval.dense_top_k_per_query, 20)
-        self.assertEqual(settings.retrieval.bm25_original_top_k, 10)
-        self.assertEqual(settings.retrieval.bm25_rewrite_top_k, 20)
+        self.assertEqual(settings.retrieval.bm25_keywords_top_k, 20)
         self.assertTrue(settings.retrieval.query_rewrite.enabled)
         self.assertEqual(settings.answer_generation.max_output_tokens, 1600)
         self.assertEqual(

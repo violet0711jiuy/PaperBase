@@ -238,6 +238,7 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
         self.assertIn("阅读式解释深度", ANSWER_GENERATION_SYSTEM_PROMPT)
         self.assertIn("公式、复杂度或定量结果问题", ANSWER_GENERATION_SYSTEM_PROMPT)
         self.assertIn("### 论文中的依据与推导", ANSWER_GENERATION_SYSTEM_PROMPT)
+        self.assertIn("无关证据同样属于证据不足", ANSWER_GENERATION_SYSTEM_PROMPT)
 
     def test_rejects_fabricated_citation_and_falls_back_to_evidence(self) -> None:
         client = _FakeClient(
@@ -250,8 +251,10 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
         outcome = generator.generate(query="方法是什么？", evidence=self._evidence())
 
         self.assertEqual(outcome.status, "fallback")
-        self.assertIsNone(outcome.answer)
+        self.assertIsNotNone(outcome.answer)
+        self.assertIn("回答生成未完成", outcome.answer or "")
         self.assertEqual(outcome.citations, ())
+        self.assertTrue(outcome.insufficient_evidence)
 
     def test_invalid_answer_json_falls_back_without_json_repair_call(self) -> None:
         """Pydantic 拒绝额外字段后，系统只保留证据，不再发起第二次 LLM 修复请求。"""
@@ -308,6 +311,53 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
         self.assertEqual(outcome.status, "success")
         self.assertIn("<conversation_context>", client.calls[0]["user_prompt"])
         self.assertIn("Paper A", client.calls[0]["user_prompt"])
+
+    def test_derives_citations_and_partial_status_from_grounded_answer_text(self) -> None:
+        """模型漏填 citations、误标证据不足时，程序保留有依据的部分回答。"""
+        client = _FakeClient(
+            [
+                '{"direct_answer":"该方法使用动态图。[E1]",'
+                '"evidence_explanation":"证据说明其使用动态图。[E1]",'
+                '"reading_interpretation":null,"citations":[],'
+                '"insufficient_evidence":true}',
+            ]
+        )
+        generator = GroundedAnswerGenerator(
+            settings=AnswerGenerationSettings(),
+            client=client,
+        )
+
+        outcome = generator.generate(query="方法是什么？", evidence=self._evidence())
+
+        self.assertEqual(outcome.status, "success")
+        self.assertFalse(outcome.insufficient_evidence)
+        self.assertTrue(outcome.partial_answer)
+        self.assertEqual(outcome.citations, ("E1",))
+        self.assertIsNotNone(outcome.coverage_note)
+        self.assertIn("### 证据覆盖说明", outcome.answer or "")
+
+    def test_true_insufficient_answer_keeps_no_citations(self) -> None:
+        """完全无关的证据不能被误升级为部分回答，也要给前端稳定正文。"""
+        client = _FakeClient(
+            [
+                '{"direct_answer":"提供的论文证据与该问题无关，无法据此回答。",'
+                '"evidence_explanation":"当前证据只描述动态图方法，未涉及所问对象。",'
+                '"reading_interpretation":null,"citations":["E1"],'
+                '"insufficient_evidence":true}',
+            ]
+        )
+        generator = GroundedAnswerGenerator(
+            settings=AnswerGenerationSettings(),
+            client=client,
+        )
+
+        outcome = generator.generate(query="猫喜欢吃什么？", evidence=self._evidence())
+
+        self.assertEqual(outcome.status, "success")
+        self.assertTrue(outcome.insufficient_evidence)
+        self.assertFalse(outcome.partial_answer)
+        self.assertEqual(outcome.citations, ())
+        self.assertTrue(outcome.answer)
 
 
 if __name__ == "__main__":

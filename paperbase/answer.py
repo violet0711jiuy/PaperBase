@@ -25,7 +25,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         action="append",
         default=[],
         metavar="TEXT",
-        help="可重复传入近期问答上下文，仅用于 Query Rewrite 的指代消解。",
+        help="可重复传入近期问答上下文，用于 Query Rewrite 的指代消解和回答衔接；不能替代论文证据。",
     )
     parser.add_argument(
         "--config",
@@ -53,27 +53,33 @@ def main(argv: Sequence[str] | None = None) -> None:
 def _result_to_json(result: AnswerServiceResult) -> dict[str, object]:
     """统一定义 CLI JSON 字段含义，确保答案、检索与证据能独立检查。"""
     return {
-        # 用户原始问题：经空白规范化后仍用于 Original Dense/BM25 的查询文本。
+        # 用户原始问题：供 UI 与会话记录；第一条 Dense 使用 resolved_query。
         "query": result.retrieval.query,
         # Query Rewrite 结果：解释本次是否有英文语义改写、英文关键词及参考文献检索意图。
         "rewrite_plan": {
-            "status": result.retrieval.rewrite_plan.status,
-            "semantic_query": result.retrieval.rewrite_plan.semantic_query,
+            "resolution_status": result.retrieval.rewrite_plan.resolution_status,
+            "resolved_query": result.retrieval.rewrite_plan.resolved_query,
+            "semantic_query_en": result.retrieval.rewrite_plan.semantic_query_en,
             "lexical_keywords_en": list(result.retrieval.rewrite_plan.lexical_keywords_en),
+            "rewrite_status": result.retrieval.rewrite_plan.rewrite_status,
             "search_bibliography": result.retrieval.rewrite_plan.search_bibliography,
         },
         # 重排序状态：success 表示 BGE reranker 生效；fallback 时仍保留 RRF 结果。
         "reranking_status": result.retrieval.reranking_status,
-        # 最终生成状态：success/disabled/insufficient_evidence/ambiguous_paper/fallback。
+        # 最终生成状态：success/disabled/insufficient_evidence/ambiguous_paper/needs_clarification/fallback。
         # 没有 repaired：结构化输出不合法时，程序不会再让 LLM 进行 JSON 格式修复，
         # 而是直接保留检索到的证据并安全降级，避免第二次生成改变答案含义。
         "answer_status": result.answer.status,
-        # 回答正文：生成失败时为 null，但下方 evidence 仍可供人工或后续 UI 展示。
+        # 回答正文：即使生成失败也会返回明确的程序提示，避免前端处理 null。
         "answer": result.answer.answer,
         # 被回答引用的 E#/R# 标识，均已经过程序验证，绝不会引用未提供的证据。
         "citations": list(result.answer.citations),
         # 证据不足标志：true 时答案不应被当作论文事实结论。
         "insufficient_evidence": result.answer.insufficient_evidence,
+        # 部分回答标志：核心回答有依据，但覆盖范围或细节仍不完整。
+        "partial_answer": result.answer.partial_answer,
+        # 覆盖边界由 LLM 提出、程序校验后展示；完全无法回答时为 null。
+        "coverage_note": result.answer.coverage_note,
         # 检索命中摘要：保留每一块的原始定位，扩展前后可逐层审计。
         "retrieved_chunks": [
             {

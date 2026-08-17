@@ -17,7 +17,7 @@ from paperbase.retrieval.hybrid_retriever import (
     RetrievalResult,
     RetrievalSourceMatch,
 )
-from paperbase.retrieval.query_rewriter import QueryRewriter
+from paperbase.retrieval.query_rewriter import QueryPlanner, TrustedPaperScope
 from paperbase.staging.bm25 import WorkspaceBM25Index, WorkspaceBM25IndexCache
 from paperbase.staging.sections import WorkspaceChunk, WorkspaceSectionSnapshot
 
@@ -120,7 +120,7 @@ class WorkspaceHybridRetriever:
         content_bm25: WorkspaceBM25Index,
         bibliography_bm25: WorkspaceBM25Index | None,
         settings: RetrievalSettings,
-        query_rewriter: QueryRewriter,
+        query_planner: QueryPlanner,
         reranker: Reranker | None = None,
         reranking_settings: RerankingSettings | None = None,
     ) -> None:
@@ -131,7 +131,7 @@ class WorkspaceHybridRetriever:
         self._content_bm25 = content_bm25
         self._bibliography_bm25 = bibliography_bm25
         self._settings = settings
-        self._query_rewriter = query_rewriter
+        self._query_planner = query_planner
         self._reranker = reranker
         self._reranking_settings = reranking_settings
         self._content_by_id = {
@@ -147,7 +147,7 @@ class WorkspaceHybridRetriever:
         snapshot: WorkspaceSectionSnapshot,
         query_embedder: QueryEmbedder,
         settings: RetrievalSettings,
-        query_rewriter: QueryRewriter,
+        query_planner: QueryPlanner,
         reranker: Reranker | None,
         reranking_settings: RerankingSettings | None,
         bm25_cache: WorkspaceBM25IndexCache,
@@ -170,7 +170,7 @@ class WorkspaceHybridRetriever:
             content_bm25=bm25_cache.get_or_build(snapshot),
             bibliography_bm25=bibliography_bm25,
             settings=settings,
-            query_rewriter=query_rewriter,
+            query_planner=query_planner,
             reranker=reranker,
             reranking_settings=reranking_settings,
         )
@@ -179,39 +179,50 @@ class WorkspaceHybridRetriever:
         self,
         query: str,
         *,
+        trusted_scope: TrustedPaperScope | None = None,
         conversation_context: Sequence[str] | None = None,
         result_limit: int | None = None,
     ) -> RetrievalResult:
         """运行四路正文召回；参考文献只在明确意图时本论文内直接返回。"""
         if result_limit is not None and result_limit < 1:
             raise ValueError("result_limit must be positive when provided.")
-        plan = self._query_rewriter.rewrite(query, conversation_context=conversation_context)
+        plan = self._query_planner.plan(
+            query,
+            trusted_scope=trusted_scope,
+            conversation_context=conversation_context,
+        )
+        if plan.resolution_status == "unresolved":
+            return RetrievalResult(
+                query=plan.original_query,
+                rewrite_plan=plan,
+                reranking_status="not_run",
+                chunks=(),
+            )
+        resolved_query = plan.resolved_query or plan.original_query
         candidates: dict[str, _Candidate] = {}
         self._add_dense_matches(
-            candidates, route="dense_original", queries=(plan.original_query,),
-            weight=self._settings.dense_original_weight,
+            candidates, route="dense_resolved", queries=(resolved_query,),
+            weight=self._settings.dense_resolved_weight,
         )
-        if plan.semantic_query:
+        if plan.semantic_query_en:
             self._add_dense_matches(
-                candidates, route="dense_rewrite", queries=(plan.semantic_query,),
-                weight=self._settings.dense_rewrite_weight,
+                candidates, route="dense_semantic", queries=(plan.semantic_query_en,),
+                weight=self._settings.dense_semantic_weight,
             )
-        self._add_bm25_matches(
-            candidates, route="bm25_original", query=plan.original_query,
-            top_k=self._settings.bm25_original_top_k,
-            weight=self._settings.bm25_original_weight,
-        )
         if plan.lexical_keywords_en:
             self._add_bm25_matches(
                 candidates,
-                route="bm25_rewrite",
+                route="bm25_keywords",
                 query=" OR ".join(plan.lexical_keywords_en),
-                top_k=self._settings.bm25_rewrite_top_k,
-                weight=self._settings.bm25_rewrite_weight,
+                top_k=self._settings.bm25_keywords_top_k,
+                weight=self._settings.bm25_keywords_weight,
                 keywords=plan.lexical_keywords_en,
             )
         ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.chunk.chunk_id))
-        reranked, reranking_status = self._rerank(plan.semantic_query or plan.original_query, ordered)
+        reranked, reranking_status = self._rerank(
+            resolved_query,
+            ordered,
+        )
         bibliography = self._retrieve_bibliography(plan) if plan.search_bibliography else ()
         output_limit = result_limit or self._default_output_limit(include_bibliography=bool(bibliography))
         content_limit = max(0, output_limit - len(bibliography))
@@ -325,7 +336,11 @@ class WorkspaceHybridRetriever:
         if self._bibliography_bm25 is None:
             return ()
         keywords = tuple(getattr(plan, "lexical_keywords_en", ()))
-        query = " ".join(keywords) if keywords else str(getattr(plan, "semantic_query", None) or getattr(plan, "original_query"))
+        query = " ".join(keywords) if keywords else str(
+            getattr(plan, "semantic_query_en", None)
+            or getattr(plan, "resolved_query", None)
+            or getattr(plan, "original_query")
+        )
         matches = self._bibliography_bm25.search(query, top_k=self._settings.query_rewrite.bibliography_top_k)
         return tuple(
             _Candidate(

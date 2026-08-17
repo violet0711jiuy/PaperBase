@@ -34,7 +34,7 @@ from paperbase.parsing.inspect import (
     write_docling_inspection_artifacts,
 )
 from paperbase.retrieval.hybrid_retriever import HybridRetriever
-from paperbase.retrieval.query_rewriter import NoopQueryRewriter
+from paperbase.retrieval.query_rewriter import NoopQueryPlanner
 
 
 class CleanRebuildError(RuntimeError):
@@ -526,7 +526,7 @@ def _run_offline_qa_smoke(
         query_embedder=embedder,
         index_store=index_store,
         settings=settings.retrieval,
-        query_rewriter=NoopQueryRewriter(),
+        query_planner=NoopQueryPlanner(),
         # 不加载额外 Cross-Encoder；本 smoke test 验证已重建的正式 QA 检索输入链路。
         reranker=None,
         reranking_settings=None,

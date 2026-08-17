@@ -150,6 +150,8 @@ answer_generation:
   enabled: true
   # 最多向回答模型提供多少个证据单元；正文证据和参考文献证据共同计数。
   max_evidence_units: 8
+  # Reranker 成功但所有正文分数都低于此值时，不让无关 chunk 进入 Answer LLM。
+  min_rerank_score: 0.05
   # 最终阅读式回答的独立输出上限；不再受全局 LLM_MAX_TOKENS=500 限制。
   max_output_tokens: 1600
 
@@ -184,36 +186,32 @@ explain_section:
   max_key_points: 5
   max_output_tokens: 2500
 
-# Step 6：LLM Query Rewrite、Dense 和 FTS5/BM25 混合检索配置。
+# Step 6：Query Planning、Dense 和 FTS5/BM25 混合检索配置。
 retrieval:
   # 检索器后端标识。
   backend: hybrid_rrf
   # 每条 Dense 查询路径召回的候选数量。
   dense_top_k_per_query: 20
-  # 原始用户问题经 BM25 检索时召回的候选数量。
-  bm25_original_top_k: 10
-  # LLM 改写问题与英文关键词经 BM25 检索时召回的候选数量。
-  bm25_rewrite_top_k: 20
+  # 英文关键词 BM25 检索时召回的候选数量。
+  bm25_keywords_top_k: 20
   # RRF 融合、去重后送入重排阶段之前保留的候选数量。
   fused_top_k: 50
   # Reciprocal Rank Fusion 的平滑常数。
   rrf_k: 60
-  # 原始问题 Dense 路径在加权 RRF 中的权重。
-  dense_original_weight: 0.8
-  # LLM 改写问题 Dense 路径在加权 RRF 中的权重。
-  dense_rewrite_weight: 1.2
-  # 原始问题 BM25 路径在加权 RRF 中的权重。
-  bm25_original_weight: 0.6
-  # 改写问题与英文关键词 BM25 路径在加权 RRF 中的权重。
-  bm25_rewrite_weight: 1.2
+  # resolved_query Dense 路径在加权 RRF 中的权重。
+  dense_resolved_weight: 0.8
+  # semantic_query_en Dense 路径在加权 RRF 中的权重。
+  dense_semantic_weight: 1.2
+  # 英文关键词 BM25 路径在加权 RRF 中的权重。
+  bm25_keywords_weight: 1.2
   # Qwen embedding 在查询侧使用的任务指令，不会写入论文文本或发送给生成 LLM。
   query_instruction: >
     Given a Chinese or English academic question, retrieve relevant passages
     from a collection of scientific papers that answer the question.
 
-  # LLM Query Rewrite 的开关和候选控制参数。
+  # Query Resolution 与 Retrieval Rewrite 的开关和候选控制参数。
   query_rewrite:
-    # 是否启用 LLM 对用户问题进行语义补全、英文改写和英文关键词提取。
+    # 是否启用 LLM Query Resolution 与英文 Retrieval Rewrite。
     enabled: true
     # LLM 输出中保留的英文词法检索关键词最大数量。
     max_lexical_keywords_en: 3
@@ -221,5 +219,3 @@ retrieval:
     max_context_turns: 4
     # 明确询问引用或参考文献时，额外从 bibliography FTS5 返回的候选数量。
     bibliography_top_k: 5
-    # Query Rewrite 失败时是否自动退回为仅使用原始问题检索。
-    fallback_to_original: true

@@ -59,24 +59,27 @@ class _FakeIndexStore:
 class _FakeEmbedder:
     def embed_queries(self, texts: list[str], *, instruction: str) -> np.ndarray:
         return np.asarray(
-            [[1.0, 0.0] if text == "原始问题" else [0.0, 1.0] for text in texts],
+            [[1.0, 0.0] if text == "已消解问题" else [0.0, 1.0] for text in texts],
             dtype=np.float32,
         )
 
 
 class _FakeRewriter:
-    def rewrite(
+    def plan(
         self,
         query: str,
         *,
+        trusted_scope: object = None,
         conversation_context: list[str] | None = None,
     ) -> QueryRewritePlan:
         # 测试替身不依赖历史，但必须接受正式接口的可选参数。
-        _ = conversation_context
+        _ = trusted_scope, conversation_context
         return QueryRewritePlan(
             original_query="原始问题",
-            semantic_query="改写问题",
+            resolved_query="已消解问题",
+            semantic_query_en="改写问题",
             lexical_keywords_en=("LSTM", "wind speed prediction", "author"),
+            rewrite_status="success",
             search_bibliography=False,
         )
 
@@ -84,17 +87,20 @@ class _FakeRewriter:
 class _BibliographyRewriter:
     """模拟明确引用意图，确保测试会进入 bibliography FTS5 辅助路径。"""
 
-    def rewrite(
+    def plan(
         self,
         query: str,
         *,
+        trusted_scope: object = None,
         conversation_context: list[str] | None = None,
     ) -> QueryRewritePlan:
-        _ = query, conversation_context
+        _ = query, trusted_scope, conversation_context
         return QueryRewritePlan(
             original_query="original citation question",
-            semantic_query="Which references concern wind speed prediction?",
+            resolved_query="original citation question",
+            semantic_query_en="Which references concern wind speed prediction?",
             lexical_keywords_en=("wind speed prediction",),
+            rewrite_status="success",
             search_bibliography=True,
         )
 
@@ -105,8 +111,12 @@ class _FakeReranker:
     backend_id = "fake_reranker"
     model_id = "fake/reranker"
 
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
     def rerank(self, query: str, passages: list[str]) -> tuple[RerankScore, ...]:
-        _ = query, passages
+        self.queries.append(query)
+        _ = passages
         # 输入正文 RRF 候选的三个分数分别为 0.10、0.95、0.50。
         return tuple(
             RerankScore(input_index=index, score=score)
@@ -126,6 +136,7 @@ class _FakeDatabase:
         return tuple(self._rows[vector_id] for vector_id in vector_ids if vector_id in self._rows)
 
     def search_bm25(self, query: str, *, top_k: int) -> tuple[dict[str, object], ...]:
+        self.original_bm25_query = query
         return ({**self._rows[1], "bm25_score": -1.0},)
 
     def search_bm25_keyword_group(
@@ -198,14 +209,12 @@ class HybridRetrieverTests(unittest.TestCase):
         settings = RetrievalSettings(
             backend="hybrid_rrf",
             dense_top_k_per_query=2,
-            bm25_original_top_k=10,
-            bm25_rewrite_top_k=20,
+            bm25_keywords_top_k=20,
             fused_top_k=3,
             rrf_k=10,
-            dense_original_weight=1.0,
-            dense_rewrite_weight=1.0,
-            bm25_original_weight=0.7,
-            bm25_rewrite_weight=1.0,
+            dense_resolved_weight=1.0,
+            dense_semantic_weight=1.0,
+            bm25_keywords_weight=1.0,
             query_instruction="Retrieve academic passages relevant to this question.",
         )
         retriever = HybridRetriever(
@@ -213,7 +222,7 @@ class HybridRetrieverTests(unittest.TestCase):
             query_embedder=_FakeEmbedder(),  # type: ignore[arg-type]
             index_store=_FakeIndexStore(),  # type: ignore[arg-type]
             settings=settings,
-            query_rewriter=_FakeRewriter(),
+            query_planner=_FakeRewriter(),
         )
 
         result = retriever.retrieve("任意输入")
@@ -222,11 +231,11 @@ class HybridRetrieverTests(unittest.TestCase):
         second_chunk = result.chunks[0]
         self.assertEqual(
             {source.route for source in second_chunk.source_matches},
-            {"dense_original", "dense_rewrite", "bm25_rewrite"},
+            {"dense_resolved", "dense_semantic", "bm25_keywords"},
         )
         # 语义改写路固定只有一条，因此应保留该路完整的 1.0 权重。
         semantic_source = next(
-            source for source in second_chunk.source_matches if source.route == "dense_rewrite"
+            source for source in second_chunk.source_matches if source.route == "dense_semantic"
         )
         self.assertEqual(semantic_source.effective_weight, 1.0)
         # 三个英文关键词必须作为一组只调用一次 BM25，而不是拆成三路。
@@ -234,19 +243,18 @@ class HybridRetrieverTests(unittest.TestCase):
             retriever._database.keyword_group,  # type: ignore[attr-defined]
             ("LSTM", "wind speed prediction", "author"),
         )
+        self.assertFalse(hasattr(retriever._database, "original_bm25_query"))  # type: ignore[attr-defined]
 
     def test_bibliography_bm25_uses_keywords_and_is_scoped_to_best_content_paper(self) -> None:
         settings = RetrievalSettings(
             backend="hybrid_rrf",
             dense_top_k_per_query=2,
-            bm25_original_top_k=10,
-            bm25_rewrite_top_k=20,
+            bm25_keywords_top_k=20,
             fused_top_k=4,
             rrf_k=10,
-            dense_original_weight=1.0,
-            dense_rewrite_weight=1.0,
-            bm25_original_weight=0.7,
-            bm25_rewrite_weight=1.0,
+            dense_resolved_weight=1.0,
+            dense_semantic_weight=1.0,
+            bm25_keywords_weight=1.0,
             query_instruction="Retrieve academic passages relevant to this question.",
         )
         database = _BibliographyFakeDatabase()
@@ -255,7 +263,7 @@ class HybridRetrieverTests(unittest.TestCase):
             query_embedder=_FakeEmbedder(),  # type: ignore[arg-type]
             index_store=_FakeIndexStore(),  # type: ignore[arg-type]
             settings=settings,
-            query_rewriter=_BibliographyRewriter(),
+            query_planner=_BibliographyRewriter(),
         )
 
         result = retriever.retrieve("风速预测那篇论文里面的参考文献哪些也是风速预测")
@@ -277,14 +285,12 @@ class HybridRetrieverTests(unittest.TestCase):
         settings = RetrievalSettings(
             backend="hybrid_rrf",
             dense_top_k_per_query=2,
-            bm25_original_top_k=10,
-            bm25_rewrite_top_k=20,
+            bm25_keywords_top_k=20,
             fused_top_k=3,
             rrf_k=10,
-            dense_original_weight=1.0,
-            dense_rewrite_weight=1.0,
-            bm25_original_weight=0.7,
-            bm25_rewrite_weight=1.0,
+            dense_resolved_weight=1.0,
+            dense_semantic_weight=1.0,
+            bm25_keywords_weight=1.0,
             query_instruction="Retrieve academic passages relevant to this question.",
         )
         retriever = HybridRetriever(
@@ -292,7 +298,7 @@ class HybridRetrieverTests(unittest.TestCase):
             query_embedder=_FakeEmbedder(),  # type: ignore[arg-type]
             index_store=_FakeIndexStore(),  # type: ignore[arg-type]
             settings=settings,
-            query_rewriter=_FakeRewriter(),
+            query_planner=_FakeRewriter(),
             reranker=_FakeReranker(),
             reranking_settings=self._reranking_settings(),
         )
@@ -305,19 +311,18 @@ class HybridRetrieverTests(unittest.TestCase):
         self.assertEqual(result.chunks[0].rerank_score, 0.95)
         self.assertEqual(result.chunks[1].pre_rerank_rank, 3)
         self.assertEqual(result.chunks[1].rerank_score, 0.5)
+        self.assertEqual(retriever._reranker.queries, ["已消解问题"])  # type: ignore[attr-defined]
 
     def test_bibliography_is_direct_output_and_not_sent_to_reranker(self) -> None:
         settings = RetrievalSettings(
             backend="hybrid_rrf",
             dense_top_k_per_query=2,
-            bm25_original_top_k=10,
-            bm25_rewrite_top_k=20,
+            bm25_keywords_top_k=20,
             fused_top_k=4,
             rrf_k=10,
-            dense_original_weight=1.0,
-            dense_rewrite_weight=1.0,
-            bm25_original_weight=0.7,
-            bm25_rewrite_weight=1.0,
+            dense_resolved_weight=1.0,
+            dense_semantic_weight=1.0,
+            bm25_keywords_weight=1.0,
             query_instruction="Retrieve academic passages relevant to this question.",
         )
         retriever = HybridRetriever(
@@ -325,7 +330,7 @@ class HybridRetrieverTests(unittest.TestCase):
             query_embedder=_FakeEmbedder(),  # type: ignore[arg-type]
             index_store=_FakeIndexStore(),  # type: ignore[arg-type]
             settings=settings,
-            query_rewriter=_BibliographyRewriter(),
+            query_planner=_BibliographyRewriter(),
             reranker=_FakeReranker(),
             reranking_settings=self._reranking_settings(),
         )
