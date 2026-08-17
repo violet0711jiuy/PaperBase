@@ -137,10 +137,7 @@ class LLMQueryPlanner:
         conversation_context: Sequence[str] | None = None,
     ) -> QueryRewritePlan:
         normalized_query = _normalize_query(query)
-        normalized_context = _normalize_conversation_context(
-            conversation_context,
-            max_context_turns=self._settings.max_context_turns,
-        )
+        normalized_context = _normalize_conversation_context(conversation_context)
         # 先使用当前 query 与程序可信 scope；这两者优先级高于普通会话文本。
         locally_resolved = _resolve_without_llm(normalized_query, trusted_scope=trusted_scope)
         if locally_resolved is None:
@@ -293,6 +290,7 @@ def _has_context_dependent_reference(query: str) -> bool:
     generic_patterns = (
         r"\b(this|that|it|they|former|latter)\b",
         r"(?:这个|那个|它|他们|前者|后者|上述|上面|刚才|前面)(?:方法|模型|算法|结果|实验|工作|论文|文献|指标|数据集)?",
+        r"(?:这个步骤|上述步骤|第[一二三四五六七八九十\d]+步)",
     )
     return any(re.search(pattern, normalized) for pattern in generic_patterns) or _has_paper_reference(
         normalized
@@ -302,7 +300,7 @@ def _has_context_dependent_reference(query: str) -> bool:
 def _has_inline_antecedent(query: str) -> bool:
     """保守识别当前 query 内的论文标题、书名号或模型缩写，确保它优先于上下文。"""
     reference = re.search(
-        r"(?:本文|这篇论文|该论文|该文|这个方法|该方法|该模型|它|this paper|this method|it)",
+        r"(?:本文|这篇论文|该论文|该文|这个方法|该方法|该模型|它|这个步骤|上述步骤|第[一二三四五六七八九十\d]+步|this paper|this method|it)",
         query,
         flags=re.IGNORECASE,
     )
@@ -340,14 +338,12 @@ def _optional_normalized(value: str | None) -> str | None:
 
 def _normalize_conversation_context(
     conversation_context: Sequence[str] | None,
-    *,
-    max_context_turns: int,
 ) -> tuple[str, ...]:
-    """只保留有限、清理后的最近上下文；其中内容仍是用户数据而非可信 scope。"""
-    if not conversation_context or max_context_turns == 0:
+    """清理服务层已按 ConversationSettings 截取的上下文；其中内容仍是用户数据。"""
+    if not conversation_context:
         return ()
     cleaned = tuple(" ".join(item.split()) for item in conversation_context if item and item.strip())
-    return cleaned[-max_context_turns:]
+    return cleaned
 
 
 def _normalize_keywords(values: Sequence[str], *, max_keywords: int) -> tuple[str, ...]:

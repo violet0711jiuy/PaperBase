@@ -21,6 +21,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Run PaperBase Step 8 grounded paper QA.")
     parser.add_argument("query", help="用户问题，可使用中文或英文。")
     parser.add_argument(
+        "--conversation-id",
+        default=None,
+        help="复用此前返回的 KB conversation_id；省略时自动创建新会话。",
+    )
+    parser.add_argument(
         "--context",
         action="append",
         default=[],
@@ -44,6 +49,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--top-k must be positive.")
     result = create_answer_service(config_path=args.config).answer_query(
         args.query,
+        conversation_id=args.conversation_id,
         conversation_context=args.context,
         retrieval_result_limit=args.top_k,
     )
@@ -53,6 +59,8 @@ def main(argv: Sequence[str] | None = None) -> None:
 def _result_to_json(result: AnswerServiceResult) -> dict[str, object]:
     """统一定义 CLI JSON 字段含义，确保答案、检索与证据能独立检查。"""
     return {
+        # 本轮所属会话；下一轮传回 --conversation-id 后会自动读取最近历史。
+        "conversation_id": result.conversation_id,
         # 用户原始问题：供 UI 与会话记录；第一条 Dense 使用 resolved_query。
         "query": result.retrieval.query,
         # Query Rewrite 结果：解释本次是否有英文语义改写、英文关键词及参考文献检索意图。

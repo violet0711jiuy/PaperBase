@@ -11,6 +11,7 @@ from typing import Sequence
 from uuid import uuid4
 
 from paperbase.config import AppSettings, default_config_path, load_settings
+from paperbase.conversations import ConversationStore, format_turns_as_context
 from paperbase.embedding import QueryEmbedder, create_document_embedder
 from paperbase.generation.answer_generator import (
     AnswerGenerationOutcome,
@@ -41,6 +42,7 @@ class AskThisPaperResult:
     expansion: ExpansionResult
     answer: AnswerGenerationOutcome
     result_path: Path
+    conversation_id: str | None
 
 
 class AskThisPaperService:
@@ -53,22 +55,31 @@ class AskThisPaperService:
         retriever: WorkspaceHybridRetriever,
         expander: WorkspaceSectionEvidenceExpander,
         generator: GroundedAnswerGenerator,
+        conversation_store: ConversationStore | None = None,
+        conversation_max_context_turns: int = 0,
         min_rerank_score: float = 0.05,
     ) -> None:
         self._snapshot = snapshot
         self._retriever = retriever
         self._expander = expander
         self._generator = generator
+        self._conversation_store = conversation_store
+        self._conversation_max_context_turns = conversation_max_context_turns
         self._min_rerank_score = min_rerank_score
 
     def ask(
         self,
         query: str,
         *,
+        conversation_id: str | None = None,
         conversation_context: Sequence[str] | None = None,
         retrieval_result_limit: int | None = None,
     ) -> AskThisPaperResult:
         """执行当前论文独占的检索、证据扩展和一次 LLM 回答，并保存可审计结果。"""
+        active_conversation_id, stored_context = self._load_conversation_context(
+            conversation_id=conversation_id
+        )
+        effective_context = (*stored_context, *(conversation_context or ()))
         # workspace 论文范围是可信程序状态，不能伪装成一条 conversation_context 文本。
         trusted_scope = TrustedPaperScope(
             paper_id=self._snapshot.paper_id,
@@ -77,7 +88,7 @@ class AskThisPaperService:
         retrieval = self._retriever.retrieve(
             query,
             trusted_scope=trusted_scope,
-            conversation_context=conversation_context,
+            conversation_context=effective_context,
             result_limit=retrieval_result_limit,
         )
         expansion = self._expander.expand(retrieval)
@@ -102,22 +113,56 @@ class AskThisPaperService:
             answer = self._generator.generate(
                 query=retrieval.rewrite_plan.resolved_query or retrieval.query,
                 evidence=expansion.evidence,
-                # 回答器也只把它作为对话定位信息，而论文事实必须来自 evidence。
-                conversation_context=conversation_context,
+                # 只使用 resolved_query 与本轮 Evidence，历史回答不能充当论文事实。
+                conversation_context=None,
             )
         result_path = _write_result_artifact(
-            snapshot=self._snapshot,
-            retrieval=retrieval,
-            expansion=expansion,
-            answer=answer,
+        snapshot=self._snapshot,
+        retrieval=retrieval,
+        expansion=expansion,
+        answer=answer,
+        conversation_id=active_conversation_id,
         )
+        if active_conversation_id is not None:
+            self._conversation_store.append_turn(  # type: ignore[union-attr]
+                active_conversation_id,
+                user_query=query,
+                assistant_answer=answer.answer,
+                resolved_query=retrieval.rewrite_plan.resolved_query,
+                resolution_status=retrieval.rewrite_plan.resolution_status,
+                audit_path=str(result_path),
+            )
         return AskThisPaperResult(
             workspace_id=self._snapshot.workspace_id,
             retrieval=retrieval,
             expansion=expansion,
             answer=answer,
             result_path=result_path,
+            conversation_id=active_conversation_id,
         )
+
+    def _load_conversation_context(
+        self, *, conversation_id: str | None
+    ) -> tuple[str | None, tuple[str, ...]]:
+        """读取当前 workspace 的独占会话，禁止跨 workspace 复用历史。"""
+        if self._conversation_store is None:
+            if conversation_id is not None:
+                raise ValueError("Conversation Store is not configured for this AskThisPaperService.")
+            return None, ()
+        if conversation_id is None:
+            record = self._conversation_store.create_conversation(
+                "workspace", self._snapshot.workspace_id
+            )
+        else:
+            record = self._conversation_store.get_conversation(
+                conversation_id,
+                expected_scope_type="workspace",
+                expected_scope_id=self._snapshot.workspace_id,
+            )
+        turns = self._conversation_store.get_recent_turns(
+            record.conversation_id, self._conversation_max_context_turns
+        )
+        return record.conversation_id, format_turns_as_context(turns)
 
 
 def create_ask_this_paper_service(
@@ -152,6 +197,11 @@ def create_ask_this_paper_service(
             settings=settings.answer_generation,
             env_path=settings.config_path.parent / ".env",
         ),
+        conversation_store=ConversationStore(
+            settings.conversation.path,
+            busy_timeout_ms=settings.conversation.busy_timeout_ms,
+        ),
+        conversation_max_context_turns=settings.conversation.max_context_turns,
         min_rerank_score=settings.answer_generation.min_rerank_score,
     )
 
@@ -165,6 +215,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Ask only the selected temporary paper.")
     parser.add_argument("workspace_id", help="storage/staging 下的 staging_<uuid> 工作区。")
     parser.add_argument("query", help="针对当前论文的自然语言问题。")
+    parser.add_argument(
+        "--conversation-id",
+        default=None,
+        help="复用此前返回的当前 workspace conversation_id；省略时自动创建新会话。",
+    )
     parser.add_argument("--context", action="append", default=[], metavar="TEXT")
     parser.add_argument("--top-k", type=int, default=None)
     parser.add_argument("--config", type=Path, default=default_config_path())
@@ -175,6 +230,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         workspace_id=args.workspace_id, config_path=args.config
     ).ask(
         args.query,
+        conversation_id=args.conversation_id,
         conversation_context=args.context,
         retrieval_result_limit=args.top_k,
     )
@@ -187,6 +243,7 @@ def _write_result_artifact(
     retrieval: object,
     expansion: ExpansionResult,
     answer: AnswerGenerationOutcome,
+    conversation_id: str | None,
 ) -> Path:
     """把一次问答保存到 workspace 内，方便后续前端读取；不修改 chunks、索引或 PDF。"""
     directory = snapshot.root_dir / "ask_paper"
@@ -200,6 +257,7 @@ def _write_result_artifact(
             expansion=expansion,
             answer=answer,
             result_path=path,
+            conversation_id=conversation_id,
         )
     )
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -211,6 +269,7 @@ def _result_to_json(result: AskThisPaperResult) -> dict[str, object]:
     retrieval = result.retrieval
     return {
         "workspace_id": result.workspace_id,
+        "conversation_id": result.conversation_id,
         "query": retrieval.query,
         "rewrite_plan": {
             "resolution_status": retrieval.rewrite_plan.resolution_status,

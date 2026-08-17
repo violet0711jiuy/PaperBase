@@ -188,10 +188,24 @@ class QueryRewriteSettings(BaseModel):
 
     enabled: bool = True
     max_lexical_keywords_en: int = Field(default=3, ge=1, le=5)
-    # 只保留近期检索对话，避免较早历史覆盖当前用户问题；0 表示禁用历史上下文。
-    max_context_turns: int = Field(default=4, ge=0, le=16)
     # 引用意图命中后，bibliography FTS5 最多提供的辅助候选数；不参与主 FAISS。
     bibliography_top_k: int = Field(default=5, ge=1, le=20)
+
+
+class ConversationSettings(BaseModel):
+    """独立 Conversation Store 的路径与近期指代上下文预算。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: Path
+    max_context_turns: int = Field(default=4, ge=0, le=32)
+    busy_timeout_ms: int = Field(default=5_000, ge=0, le=60_000)
+
+    @field_validator("path", mode="after")
+    @classmethod
+    def resolve_conversation_path(cls, value: Path, info: ValidationInfo) -> Path:
+        """会话数据库独立于正式 KB SQLite，但同样支持相对配置路径。"""
+        return _resolve_path(value, info)
 
 
 class RetrievalSettings(BaseModel):
@@ -322,6 +336,7 @@ class AppSettings(BaseModel):
     indexing: IndexingSettings
     reranking: RerankingSettings
     retrieval: RetrievalSettings
+    conversation: ConversationSettings
     context_expansion: ContextExpansionSettings = Field(
         default_factory=ContextExpansionSettings
     )

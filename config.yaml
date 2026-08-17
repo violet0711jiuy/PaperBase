@@ -86,6 +86,13 @@ database:
   # SQLite 遇到短暂锁定时的最长等待时间，单位为毫秒。
   busy_timeout_ms: 5000
 
+# 多轮聊天状态独立保存，rebuild.py 不会读取、删除或重建该数据库。
+conversation:
+  path: storage/conversations.sqlite3
+  # 每次 Query Resolution 最多读取的最近完整 User + Assistant 回合数。
+  max_context_turns: 4
+  busy_timeout_ms: 5000
+
 # Step 4：向量生成配置。
 embedding:
   # embedding 模型适配器后端标识。
@@ -215,7 +222,5 @@ retrieval:
     enabled: true
     # LLM 输出中保留的英文词法检索关键词最大数量。
     max_lexical_keywords_en: 3
-    # 传给 LLM 以消解追问指代的最近对话轮次上限。
-    max_context_turns: 4
     # 明确询问引用或参考文献时，额外从 bibliography FTS5 返回的候选数量。
     bibliography_top_k: 5

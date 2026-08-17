@@ -18,6 +18,7 @@ from paperbase.config import (
     RerankingSettings,
     RetrievalSettings,
 )
+from paperbase.conversations import ConversationStore
 from paperbase.generation.answer_generator import GroundedAnswerGenerator
 from paperbase.reranking.base import RerankScore
 from paperbase.retrieval.query_rewriter import QueryRewritePlan
@@ -195,6 +196,7 @@ class AskThisPaperTests(unittest.TestCase):
             snapshot = _snapshot(Path(temporary_directory) / "staging_ask")
             snapshot.root_dir.mkdir()
             client = _FakeAnswerClient()
+            store = ConversationStore(Path(temporary_directory) / "conversations.sqlite3")
             service = AskThisPaperService(
                 snapshot=snapshot,
                 retriever=_retriever(snapshot, rewriter=_UnresolvedRewriter()),
@@ -205,6 +207,8 @@ class AskThisPaperTests(unittest.TestCase):
                 generator=GroundedAnswerGenerator(
                     settings=AnswerGenerationSettings(), client=client
                 ),
+                conversation_store=store,
+                conversation_max_context_turns=4,
             )
 
             result = service.ask("它和 DTW 有什么区别？")
@@ -214,6 +218,11 @@ class AskThisPaperTests(unittest.TestCase):
             self.assertEqual(result.answer.status, "needs_clarification")
             self.assertEqual(result.answer.answer, "请明确它指的是哪个方法。")
             self.assertEqual(client.calls, 0)
+            self.assertIsNotNone(result.conversation_id)
+            turns = store.get_recent_turns(result.conversation_id or "", 4)
+            self.assertEqual(len(turns), 1)
+            self.assertEqual(turns[0].user_query, "它和 DTW 有什么区别？")
+            self.assertEqual(turns[0].assistant_answer, "请明确它指的是哪个方法。")
 
     def test_service_passes_current_paper_as_trusted_scope_not_conversation_text(self) -> None:
         with TemporaryDirectory() as temporary_directory:
