@@ -48,6 +48,21 @@ class IndexBuildSummary:
     recovered_pending_publish: bool
 
 
+@dataclass(frozen=True)
+class IncrementalIndexCandidate:
+    """尚未公开的正式 FAISS 增量候选文件。
+
+    candidate 只在 SQLite 已写入同一批 vector_id 后才允许发布；因此 service 可以在
+    commit 前准备昂贵的 FAISS 文件，在失败时直接删除它而不触碰线上索引。
+    """
+
+    candidate_index_path: Path
+    manifest: dict[str, Any]
+    assignments: tuple[VectorAssignment, ...]
+    added_vector_count: int
+    dimension: int
+
+
 class FaissIndexStore:
     """管理唯一正式 FAISS 索引文件及其与 SQLite 的映射契约。
 
@@ -77,6 +92,149 @@ class FaissIndexStore:
     def manifest_path(self) -> Path:
         """返回与正式索引配套的 JSON 清单路径。"""
         return self._manifest_path
+
+    def prepare_incremental_append(
+        self,
+        *,
+        database: MetadataDatabase,
+        artifact: LoadedEmbeddingArtifact,
+        additions: tuple[VectorAssignment, ...],
+    ) -> IncrementalIndexCandidate:
+        """基于已发布索引制作“旧向量 + staging 向量”的候选文件，不公开任何改动。
+
+        该方法只复用传入的 staging vectors，不会加载 embedding 模型。正式 ID 来自调用方，
+        staging temporary FAISS 的本地 ID 从不参与这里的映射。
+        """
+        _validate_artifact_for_flat_ip(artifact)
+        _validate_assignments(additions)
+        artifact_by_chunk_id = {record.chunk_id: record for record in artifact.records}
+        if set(artifact_by_chunk_id) != {item.chunk_id for item in additions}:
+            raise FaissIndexError(
+                "Incremental artifact records must exactly match the new vector assignments."
+            )
+        for assignment in additions:
+            if artifact_by_chunk_id[assignment.chunk_id].embedding_text_sha256 != assignment.embedding_text_sha256:
+                raise FaissIndexError(
+                    f"Incremental embedding text hash differs for {assignment.chunk_id}."
+                )
+
+        state = database.vector_index_state()
+        existing_assignments: tuple[VectorAssignment, ...]
+        if state.total_chunk_count:
+            if state.vectorized_chunk_count != state.total_chunk_count:
+                raise FaissIndexError(
+                    "Cannot increment a formal index with unvectorized existing content chunks."
+                )
+            verified = self.verify_published_index(database=database)
+            if verified.dimension != int(artifact.vectors.shape[1]):
+                raise FaissIndexError(
+                    "Staging embedding dimension does not match the formal FAISS index."
+                )
+            index = _read_faiss_index(self._index_path)
+            existing_assignments = tuple(
+                VectorAssignment(
+                    chunk_id=str(row["chunk_id"]),
+                    vector_id=int(row["vector_id"]),
+                    embedding_text_sha256=hashlib.sha256(
+                        str(row["embedding_text"]).encode("utf-8")
+                    ).hexdigest(),
+                )
+                for row in database.vector_id_assignments()
+            )
+        else:
+            if self._index_path.exists() or self._manifest_path.exists():
+                raise FaissIndexError(
+                    "Formal FAISS files exist while SQLite has no vectorized content."
+                )
+            faiss = _import_faiss()
+            index = faiss.IndexIDMap2(faiss.IndexFlatIP(int(artifact.vectors.shape[1])))
+            existing_assignments = ()
+
+        existing_ids = {item.vector_id for item in existing_assignments}
+        added_ids = {item.vector_id for item in additions}
+        if existing_ids.intersection(added_ids):
+            raise FaissIndexError("Incremental vector IDs collide with the formal FAISS index.")
+        complete_assignments = tuple(
+            sorted((*existing_assignments, *additions), key=lambda item: item.vector_id)
+        )
+        _validate_assignments(complete_assignments)
+
+        operation_id = uuid4().hex
+        candidate_path = self._candidate_index_path(operation_id)
+        try:
+            index.add_with_ids(
+                np.ascontiguousarray(artifact.vectors),
+                np.asarray([item.vector_id for item in additions], dtype=np.int64),
+            )
+            _write_faiss_index_object(
+                path=candidate_path,
+                index=index,
+                expected_vector_ids={item.vector_id for item in complete_assignments},
+            )
+            manifest = {
+                "index_schema_version": _INDEX_SCHEMA_VERSION,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "backend_id": "faiss_flat_ip",
+                "index_type": "IndexIDMap2(IndexFlatIP)",
+                "metric": "inner_product",
+                "dimension": int(artifact.vectors.shape[1]),
+                "vector_count": len(complete_assignments),
+                "vector_id_min": complete_assignments[0].vector_id,
+                "vector_id_max": complete_assignments[-1].vector_id,
+                "assignment_fingerprint_sha256": _assignment_fingerprint(complete_assignments),
+                "index_sha256": _file_sha256(candidate_path),
+                # 这里记录当前增量批次的模型契约；完整 records 仍在正式 embedding artifact。
+                "embedding_artifact": {
+                    "model_id": artifact.manifest["model_id"],
+                    "input_fingerprint_sha256": artifact.manifest["input_fingerprint_sha256"],
+                    "normalized": artifact.manifest["normalized"],
+                    "record_count": len(complete_assignments),
+                },
+            }
+            _validate_manifest(
+                manifest=manifest,
+                assignments=complete_assignments,
+                dimension=int(artifact.vectors.shape[1]),
+                index_path=candidate_path,
+            )
+        except Exception:
+            candidate_path.unlink(missing_ok=True)
+            raise
+        return IncrementalIndexCandidate(
+            candidate_index_path=candidate_path,
+            manifest=manifest,
+            assignments=complete_assignments,
+            added_vector_count=len(additions),
+            dimension=int(artifact.vectors.shape[1]),
+        )
+
+    def publish_incremental_candidate(
+        self, candidate: IncrementalIndexCandidate, *, database: MetadataDatabase
+    ) -> None:
+        """在 SQLite 已持有完整映射后原子替换正式 FAISS 与 manifest。"""
+        actual = tuple(
+            VectorAssignment(
+                chunk_id=str(row["chunk_id"]),
+                vector_id=int(row["vector_id"]),
+                embedding_text_sha256=hashlib.sha256(
+                    str(row["embedding_text"]).encode("utf-8")
+                ).hexdigest(),
+            )
+            for row in database.vector_id_assignments()
+        )
+        if actual != candidate.assignments:
+            raise FaissIndexError(
+                "SQLite vector mapping changed while the incremental FAISS candidate was prepared."
+            )
+        _validate_manifest(
+            manifest=candidate.manifest,
+            assignments=candidate.assignments,
+            dimension=candidate.dimension,
+            index_path=candidate.candidate_index_path,
+        )
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(candidate.candidate_index_path, self._index_path)
+        _write_json_atomic(self._manifest_path, candidate.manifest)
 
     def build_initial_index(
         self,
@@ -447,6 +605,21 @@ def write_flat_ip_index(*, path: Path, vectors: np.ndarray, vector_ids: np.ndarr
         index_path=path,
         expected_dimension=int(vectors.shape[1]),
         expected_vector_ids={int(vector_id) for vector_id in vector_ids},
+    )
+
+
+def _write_faiss_index_object(
+    *, path: Path, index: Any, expected_vector_ids: set[int]
+) -> None:
+    """将已追加向量的内存索引写为候选文件，并复用正式文件校验。"""
+    faiss = _import_faiss()
+    serialized_index = faiss.serialize_index(index)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(np.asarray(serialized_index, dtype=np.uint8).tobytes())
+    _validate_index_file(
+        index_path=path,
+        expected_dimension=int(index.d),
+        expected_vector_ids=expected_vector_ids,
     )
 
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -232,6 +232,10 @@ class MetadataDatabaseError(RuntimeError):
     """元数据数据库的 schema、导入或一致性检查失败时抛出。"""
 
 
+class DocumentAlreadyExistsError(MetadataDatabaseError):
+    """增量提升发现同一稳定 paper_id 已存在时抛出。"""
+
+
 @dataclass(frozen=True)
 class ImportSummary:
     """一次论文元数据导入的可展示摘要。"""
@@ -240,6 +244,17 @@ class ImportSummary:
     document_replaced: bool
     front_matter_chunk_count: int
     chunk_count: int
+
+
+@dataclass(frozen=True)
+class PromotionImportSummary:
+    """一次 staging -> 正式 SQLite 写入的结果摘要。"""
+
+    paper_id: str
+    section_count: int
+    chunk_count: int
+    content_chunk_count: int
+    bibliography_chunk_count: int
 
 
 @dataclass(frozen=True)
@@ -421,6 +436,128 @@ class MetadataDatabase:
             chunk_count=len(result.chunks),
         )
 
+    def promote_chunking_result(
+        self,
+        *,
+        result: ChunkingResult,
+        vector_assignments: Sequence[tuple[str, int, str]],
+    ) -> PromotionImportSummary:
+        """原子写入一篇已完成 staging 的论文及其正式 vector_id。
+
+        此入口不调用 Parser、Chunker 或 Embedder。调用方先验证工作区工件，并为全部
+        content chunk 分配未使用的正式 vector_id；document、sections、chunks 与 FTS
+        trigger 在同一个 SQLite 事务中写入，FAISS 由 promotion service 随后发布。
+        """
+        self.initialize()
+        paper_id, source_sha256 = _validate_chunking_result(result)
+        assignments_by_chunk_id = _validate_promotion_assignments(
+            result=result, assignments=vector_assignments
+        )
+        parsed_paper = result.parsed_paper
+        chunker_id = _required_diagnostic_string(
+            result.diagnostics, "chunking.chunker_id"
+        )
+        now = _utc_timestamp()
+
+        with self._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM documents WHERE paper_id = ?", (paper_id,)
+            ).fetchone() is not None:
+                raise DocumentAlreadyExistsError(
+                    f"Document already exists for paper_id: {paper_id}"
+                )
+            used_vector_ids = {
+                int(row["vector_id"])
+                for row in connection.execute(
+                    "SELECT vector_id FROM chunks WHERE vector_id IS NOT NULL"
+                )
+            }
+            if used_vector_ids.intersection(assignments_by_chunk_id.values()):
+                raise MetadataDatabaseError(
+                    "Promotion vector_id assignment collides with the formal knowledge base."
+                )
+
+            connection.execute(
+                """
+                INSERT INTO documents (
+                    paper_id, source_path, source_filename, source_sha256,
+                    paper_title, title_source, parser_id, chunker_id,
+                    parse_diagnostics_json, chunking_diagnostics_json,
+                    ingested_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    paper_id,
+                    str(parsed_paper.source),
+                    parsed_paper.source.name,
+                    source_sha256,
+                    parsed_paper.paper_title,
+                    parsed_paper.title_source,
+                    parsed_paper.parser_id,
+                    chunker_id,
+                    _stable_json(parsed_paper.diagnostics),
+                    _stable_json(result.diagnostics),
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO sections (
+                    section_id, paper_id, section_title, section_number,
+                    section_level, parent_section_id, section_index, page_start, page_end
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _section_row(section)
+                    for section in sorted(
+                        parsed_paper.sections, key=lambda section: section.section_index
+                    )
+                ),
+            )
+            connection.executemany(
+                """
+                INSERT INTO chunks (
+                    chunk_id, vector_id, paper_id, chunk_index,
+                    raw_text, embedding_text, section, content_kind, front_matter_type, section_type,
+                    page_start, page_end,
+                    raw_token_count, embedding_token_count, prev_chunk_id, next_chunk_id, section_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _chunk_row(
+                        replace(
+                            chunk,
+                            # bibliography 不存在于 staging embedding artifact，必须保持 NULL。
+                            vector_id=assignments_by_chunk_id.get(chunk.chunk_id),
+                        )
+                    )
+                    for chunk in result.chunks
+                ),
+            )
+
+        return PromotionImportSummary(
+            paper_id=paper_id,
+            section_count=len(parsed_paper.sections),
+            chunk_count=len(result.chunks),
+            content_chunk_count=sum(
+                chunk.section_type == "content" for chunk in result.chunks
+            ),
+            bibliography_chunk_count=sum(
+                chunk.section_type == "bibliography" for chunk in result.chunks
+            ),
+        )
+
+    def delete_document_for_promotion_rollback(self, paper_id: str) -> None:
+        """仅在 promotion 发布失败时删除本次刚插入的一篇论文。
+
+        删除 documents 会由外键与 FTS trigger 同步清理 sections、chunks 和派生索引；
+        只按稳定 paper_id 精确删除，不会按标题或路径模糊匹配其他论文。
+        """
+        self.initialize()
+        with self._connect() as connection:
+            connection.execute("DELETE FROM documents WHERE paper_id = ?", (paper_id,))
+
     def row_counts(self) -> dict[str, int]:
         """返回核心表的行数，专用于 Step 3 验收和后续健康检查。"""
         self.initialize()
@@ -540,6 +677,25 @@ class MetadataDatabase:
         if not rows:
             raise MetadataDatabaseError("Cannot generate embeddings because SQLite has no chunks.")
         return rows
+
+    def list_content_embedding_inputs_for_promotion(self) -> tuple[sqlite3.Row, ...]:
+        """返回当前正式正文的 embedding 输入，不要求 vector_id 为空。
+
+        Incremental Promotion 只用它把已经存在的 vectors 与新 staging vectors 合成一份
+        可审计 artifact；它不重新拼接 embedding_text，也不调用 embedding model。
+        """
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT chunk_id, paper_id, chunk_index, embedding_text
+                    FROM chunks
+                    WHERE section_type = 'content'
+                    ORDER BY vector_id
+                    """
+                ).fetchall()
+            )
 
     def vector_index_state(self) -> VectorIndexState:
         """读取 vector_id 分配状态，不读取或加载任何 FAISS 文件。"""
@@ -882,6 +1038,45 @@ def _validate_embedding_records_in_connection(
                 "Embedding artifact is stale because embedding_text changed for "
                 f"{chunk_id}."
             )
+
+
+def _validate_promotion_assignments(
+    *, result: ChunkingResult, assignments: Sequence[tuple[str, int, str]]
+) -> dict[str, int]:
+    """校验 staging 向量记录恰好覆盖本论文的全部正文 chunk。
+
+    这里同时核对 embedding_text 哈希，确保 promotion 不会把另一份工作区的 vectors.npy
+    或者分块文本更新前的旧向量写入正式 FAISS。
+    """
+    content_chunks = tuple(
+        chunk for chunk in result.chunks if chunk.section_type == "content"
+    )
+    if not content_chunks:
+        raise MetadataDatabaseError("Promotion requires at least one content chunk.")
+    expected_text_hashes = {
+        chunk.chunk_id: hashlib.sha256(chunk.embedding_text.encode("utf-8")).hexdigest()
+        for chunk in content_chunks
+    }
+    seen_vector_ids: set[int] = set()
+    assigned: dict[str, int] = {}
+    for chunk_id, vector_id, text_sha256 in assignments:
+        if chunk_id in assigned:
+            raise MetadataDatabaseError("Promotion assignments contain duplicate chunk_id values.")
+        if vector_id < 1 or vector_id in seen_vector_ids:
+            raise MetadataDatabaseError(
+                "Promotion assignments require unique positive vector_id values."
+            )
+        if expected_text_hashes.get(chunk_id) != text_sha256:
+            raise MetadataDatabaseError(
+                f"Promotion embedding record does not match chunk text: {chunk_id}"
+            )
+        assigned[chunk_id] = vector_id
+        seen_vector_ids.add(vector_id)
+    if set(assigned) != set(expected_text_hashes):
+        raise MetadataDatabaseError(
+            "Promotion assignments must exactly cover all content chunks and no bibliography chunks."
+        )
+    return assigned
 
 
 def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
