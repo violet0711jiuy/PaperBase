@@ -11,7 +11,7 @@ import unittest
 
 from paperbase.chunking.base import ChunkingResult, PaperChunk
 from paperbase.database import MetadataDatabase, MetadataDatabaseError
-from paperbase.parsing.base import FrontMatterBlock, ParsedPaper
+from paperbase.parsing.base import FrontMatterBlock, ParsedPaper, SectionRecord
 
 
 class MetadataDatabaseTests(unittest.TestCase):
@@ -190,6 +190,76 @@ class MetadataDatabaseTests(unittest.TestCase):
                 101,
             )
 
+    def test_import_persists_section_tree_and_chunk_foreign_key(self) -> None:
+        """多级父子节点可独立保存，直属 chunk 只引用子节点 section_id。"""
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            result, parent, child = _sectioned_result(root)
+            database = MetadataDatabase(root / "metadata.sqlite3")
+
+            database.import_chunking_result(result)
+
+            sections = database.list_sections(parent.paper_id)
+            self.assertEqual([row["section_id"] for row in sections], [parent.section_id, child.section_id])
+            self.assertIsNone(sections[0]["parent_section_id"])
+            self.assertEqual(sections[1]["parent_section_id"], parent.section_id)
+            self.assertEqual(database.get_section(child.section_id)["section_title"], "3.1 Encoder")
+            chunks = database.list_chunks(parent.paper_id)
+            self.assertIsNone(chunks[0]["section_id"])
+            self.assertEqual(chunks[1]["section_id"], child.section_id)
+            # 父节点没有直属 chunk，仍以独立 SectionRecord 形式存在。
+            self.assertNotIn(parent.section_id, {row["section_id"] for row in chunks})
+
+    def test_v4_database_upgrade_keeps_old_chunks_null_and_is_idempotent(self) -> None:
+        """旧 v0.1 数据只新增可空列，不回填 hierarchy，也可重复 initialize。"""
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database_path = root / "legacy_v4.sqlite3"
+            _write_v4_database(database_path)
+            database = MetadataDatabase(database_path)
+
+            database.initialize()
+            database.initialize()
+
+            legacy_chunks = database.list_chunks("paper_legacy")
+            self.assertEqual(len(legacy_chunks), 1)
+            self.assertIsNone(legacy_chunks[0]["section_id"])
+            self.assertEqual(database.list_sections("paper_legacy"), ())
+            connection = sqlite3.connect(database_path)
+            try:
+                version = connection.execute(
+                    "SELECT value FROM schema_info WHERE key = 'schema_version'"
+                ).fetchone()[0]
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(chunks)")
+                }
+            finally:
+                connection.close()
+            self.assertEqual(version, "5")
+            self.assertIn("section_id", columns)
+
+    def test_document_delete_cascades_sections_without_orphans(self) -> None:
+        """删除论文时 sections 与 chunks 都由外键清理，不遗留孤儿节点。"""
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            result, parent, _child = _sectioned_result(root)
+            database = MetadataDatabase(root / "metadata.sqlite3")
+            database.import_chunking_result(result)
+
+            connection = sqlite3.connect(database.path)
+            try:
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("DELETE FROM documents WHERE paper_id = ?", (parent.paper_id,))
+                connection.commit()
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM sections").fetchone()[0], 0
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], 0
+                )
+            finally:
+                connection.close()
+
     def test_v1_database_migrates_front_matter_to_typed_chunks(self) -> None:
         """升级旧库时应保留 chunk 正文、回填类型，并移除重复的全文表。"""
         with TemporaryDirectory() as temporary_directory:
@@ -308,7 +378,7 @@ class MetadataDatabaseTests(unittest.TestCase):
                 }
             finally:
                 connection.close()
-            self.assertEqual(version, "4")
+            self.assertEqual(version, "5")
             self.assertNotIn("front_matter", table_names)
             self.assertIn("chunks_fts", table_names)
 
@@ -402,6 +472,145 @@ def _sample_result(
         chunks=chunks,
         diagnostics={"chunking.chunker_id": "test_chunker"},
     )
+
+
+def _sectioned_result(
+    root: Path,
+) -> tuple[ChunkingResult, SectionRecord, SectionRecord]:
+    """基于既有 fixture 附加 ``3 -> 3.1``，其中父节点不拥有直属 chunk。"""
+    result = _sample_result(root)
+    paper_id = result.chunks[0].paper_id
+    parent = SectionRecord(
+        section_id=f"{paper_id}_section_0000",
+        paper_id=paper_id,
+        section_title="3 Methodology",
+        section_number="3",
+        section_level=1,
+        parent_section_id=None,
+        section_index=0,
+        page_start=3,
+        page_end=5,
+    )
+    child = SectionRecord(
+        section_id=f"{paper_id}_section_0001",
+        paper_id=paper_id,
+        section_title="3.1 Encoder",
+        section_number="3.1",
+        section_level=2,
+        parent_section_id=parent.section_id,
+        section_index=1,
+        page_start=3,
+        page_end=4,
+    )
+    parsed_paper = replace(result.parsed_paper, sections=(parent, child))
+    chunks = (
+        result.chunks[0],
+        replace(
+            result.chunks[1],
+            section="3 Methodology > 3.1 Encoder",
+            content_kind="body",
+            front_matter_type=None,
+            section_id=child.section_id,
+        ),
+    )
+    return (
+        replace(result, parsed_paper=parsed_paper, chunks=chunks),
+        parent,
+        child,
+    )
+
+
+def _write_v4_database(path: Path) -> None:
+    """建立最小 v4 数据库，模拟现有 v0.1 表结构而不借用当前 v5 schema。"""
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE documents (
+                paper_id TEXT PRIMARY KEY,
+                source_path TEXT NOT NULL,
+                source_filename TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL UNIQUE,
+                paper_title TEXT,
+                title_source TEXT NOT NULL,
+                parser_id TEXT NOT NULL,
+                chunker_id TEXT NOT NULL,
+                parse_diagnostics_json TEXT NOT NULL,
+                chunking_diagnostics_json TEXT NOT NULL,
+                ingested_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE chunks (
+                chunk_id TEXT PRIMARY KEY,
+                vector_id INTEGER UNIQUE,
+                paper_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                raw_text TEXT NOT NULL,
+                embedding_text TEXT NOT NULL,
+                section TEXT,
+                content_kind TEXT NOT NULL,
+                front_matter_type TEXT,
+                section_type TEXT NOT NULL DEFAULT 'content',
+                page_start INTEGER,
+                page_end INTEGER,
+                raw_token_count INTEGER NOT NULL,
+                embedding_token_count INTEGER NOT NULL,
+                prev_chunk_id TEXT,
+                next_chunk_id TEXT,
+                FOREIGN KEY (paper_id) REFERENCES documents(paper_id) ON DELETE CASCADE,
+                UNIQUE (paper_id, chunk_index)
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_info(key, value) VALUES('schema_version', '4')"
+        )
+        connection.execute(
+            """
+            INSERT INTO documents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "paper_legacy",
+                "legacy.pdf",
+                "legacy.pdf",
+                "a" * 64,
+                "Legacy paper",
+                "legacy",
+                "legacy_parser",
+                "legacy_chunker",
+                "{}",
+                "{}",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "paper_legacy_chunk_0000",
+                None,
+                "paper_legacy",
+                0,
+                "Legacy chunk.",
+                "Legacy embedding chunk.",
+                "1 Introduction",
+                "body",
+                None,
+                "content",
+                1,
+                1,
+                2,
+                3,
+                None,
+                None,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 if __name__ == "__main__":

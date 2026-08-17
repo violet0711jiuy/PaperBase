@@ -1,0 +1,231 @@
+"""Ask This Paper 的端到端服务与 staging 结果工件。"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+from pathlib import Path
+import sys
+from typing import Sequence
+from uuid import uuid4
+
+from paperbase.config import AppSettings, default_config_path, load_settings
+from paperbase.embedding import QueryEmbedder, create_document_embedder
+from paperbase.generation.answer_generator import (
+    AnswerGenerationOutcome,
+    GroundedAnswerGenerator,
+    create_answer_generator,
+)
+from paperbase.generation.section_expander import ExpansionResult
+from paperbase.reranking import create_reranker
+from paperbase.retrieval.query_rewriter import create_query_rewriter
+from paperbase.staging.bm25 import WorkspaceBM25IndexCache
+from paperbase.staging.sections import WorkspaceSectionRepository, WorkspaceSectionSnapshot
+
+from .evidence import WorkspaceSectionEvidenceExpander
+from .retriever import WorkspaceHybridRetriever
+
+
+class AskThisPaperError(RuntimeError):
+    """Ask This Paper 的工作区装配、检索或工件保存失败。"""
+
+
+@dataclass(frozen=True)
+class AskThisPaperResult:
+    """一次单论文问答的完整审计结果。"""
+
+    workspace_id: str
+    retrieval: object
+    expansion: ExpansionResult
+    answer: AnswerGenerationOutcome
+    result_path: Path
+
+
+class AskThisPaperService:
+    """只装配当前 Temporary Workspace 的问答链；不创建 MetadataDatabase。"""
+
+    def __init__(
+        self,
+        *,
+        snapshot: WorkspaceSectionSnapshot,
+        retriever: WorkspaceHybridRetriever,
+        expander: WorkspaceSectionEvidenceExpander,
+        generator: GroundedAnswerGenerator,
+    ) -> None:
+        self._snapshot = snapshot
+        self._retriever = retriever
+        self._expander = expander
+        self._generator = generator
+
+    def ask(
+        self,
+        query: str,
+        *,
+        conversation_context: Sequence[str] | None = None,
+        retrieval_result_limit: int | None = None,
+    ) -> AskThisPaperResult:
+        """执行当前论文独占的检索、证据扩展和一次 LLM 回答，并保存可审计结果。"""
+        retrieval = self._retriever.retrieve(
+            query,
+            conversation_context=conversation_context,
+            result_limit=retrieval_result_limit,
+        )
+        expansion = self._expander.expand(retrieval)
+        answer = self._generator.generate(
+            query=retrieval.query,
+            evidence=expansion.evidence,
+            conversation_context=conversation_context,
+        )
+        result_path = _write_result_artifact(
+            snapshot=self._snapshot,
+            retrieval=retrieval,
+            expansion=expansion,
+            answer=answer,
+        )
+        return AskThisPaperResult(
+            workspace_id=self._snapshot.workspace_id,
+            retrieval=retrieval,
+            expansion=expansion,
+            answer=answer,
+            result_path=result_path,
+        )
+
+
+def create_ask_this_paper_service(
+    *, workspace_id: str, config_path: Path | str | None = None
+) -> AskThisPaperService:
+    """从配置和 workspace 工件装配服务；所有路径均以 staging 根目录为边界。"""
+    settings = load_settings(config_path)
+    snapshot = WorkspaceSectionRepository(settings.storage.staging_dir).load(workspace_id)
+    embedder = create_document_embedder(settings.embedding)
+    if not isinstance(embedder, QueryEmbedder):
+        raise AskThisPaperError("Configured embedding backend does not implement query embeddings.")
+    cache = WorkspaceBM25IndexCache()
+    retriever = WorkspaceHybridRetriever.from_workspace(
+        snapshot=snapshot,
+        query_embedder=embedder,
+        settings=settings.retrieval,
+        query_rewriter=create_query_rewriter(
+            settings=settings.retrieval.query_rewrite,
+            env_path=settings.config_path.parent / ".env",
+        ),
+        reranker=create_reranker(settings.reranking) if settings.reranking.enabled else None,
+        reranking_settings=settings.reranking,
+        bm25_cache=cache,
+    )
+    return AskThisPaperService(
+        snapshot=snapshot,
+        retriever=retriever,
+        expander=WorkspaceSectionEvidenceExpander(
+            snapshot=snapshot, settings=settings.context_expansion
+        ),
+        generator=create_answer_generator(
+            settings=settings.answer_generation,
+            env_path=settings.config_path.parent / ".env",
+        ),
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """运行 ``python -m paperbase.ask_paper <workspace_id> <query>``。"""
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ask only the selected temporary paper.")
+    parser.add_argument("workspace_id", help="storage/staging 下的 staging_<uuid> 工作区。")
+    parser.add_argument("query", help="针对当前论文的自然语言问题。")
+    parser.add_argument("--context", action="append", default=[], metavar="TEXT")
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--config", type=Path, default=default_config_path())
+    args = parser.parse_args(argv)
+    if args.top_k is not None and args.top_k < 1:
+        parser.error("--top-k must be positive.")
+    result = create_ask_this_paper_service(
+        workspace_id=args.workspace_id, config_path=args.config
+    ).ask(
+        args.query,
+        conversation_context=args.context,
+        retrieval_result_limit=args.top_k,
+    )
+    print(json.dumps(_result_to_json(result), ensure_ascii=False, indent=2))
+
+
+def _write_result_artifact(
+    *,
+    snapshot: WorkspaceSectionSnapshot,
+    retrieval: object,
+    expansion: ExpansionResult,
+    answer: AnswerGenerationOutcome,
+) -> Path:
+    """把一次问答保存到 workspace 内，方便后续前端读取；不修改 chunks、索引或 PDF。"""
+    directory = snapshot.root_dir / "ask_paper"
+    directory.mkdir(exist_ok=True)
+    operation_id = uuid4().hex[:16]
+    path = directory / f"{operation_id}.json"
+    payload = _result_to_json(
+        AskThisPaperResult(
+            workspace_id=snapshot.workspace_id,
+            retrieval=retrieval,
+            expansion=expansion,
+            answer=answer,
+            result_path=path,
+        )
+    )
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _result_to_json(result: AskThisPaperResult) -> dict[str, object]:
+    """定义 CLI 与 workspace 工件共同使用的、可追溯 JSON 输出。"""
+    retrieval = result.retrieval
+    return {
+        "workspace_id": result.workspace_id,
+        "query": retrieval.query,
+        "rewrite_plan": {
+            "status": retrieval.rewrite_plan.status,
+            "semantic_query": retrieval.rewrite_plan.semantic_query,
+            "lexical_keywords_en": list(retrieval.rewrite_plan.lexical_keywords_en),
+            "search_bibliography": retrieval.rewrite_plan.search_bibliography,
+        },
+        "reranking_status": retrieval.reranking_status,
+        "answer_status": result.answer.status,
+        "answer": result.answer.answer,
+        "citations": list(result.answer.citations),
+        "insufficient_evidence": result.answer.insufficient_evidence,
+        "retrieved_chunks": [
+            {
+                "rank": chunk.rank,
+                "chunk_id": chunk.chunk_id,
+                "paper_id": chunk.paper_id,
+                "paper_title": chunk.paper_title,
+                "section": chunk.section,
+                "section_type": chunk.section_type,
+                "page_start": chunk.page_start,
+                "page_end": chunk.page_end,
+                "pre_rerank_rank": chunk.pre_rerank_rank,
+                "rerank_score": chunk.rerank_score,
+                "fused_score": chunk.fused_score,
+                "source_matches": [asdict(source) for source in chunk.source_matches],
+            }
+            for chunk in retrieval.chunks
+        ],
+        "evidence": [
+            {
+                "evidence_id": item.evidence_id,
+                "kind": item.kind,
+                "paper_id": item.paper_id,
+                "paper_title": item.paper_title,
+                "section": item.section,
+                "page_start": item.page_start,
+                "page_end": item.page_end,
+                "seed_chunk_ids": list(item.seed_chunk_ids),
+                "chunk_ids": list(item.chunk_ids),
+                "token_count": item.token_count,
+                "text": item.text,
+            }
+            for item in result.expansion.evidence
+        ],
+        "result_path": str(result.result_path),
+    }

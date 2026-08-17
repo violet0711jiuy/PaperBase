@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import hashlib
 import json
 import re
@@ -28,12 +29,19 @@ def _pages_for(item: Any) -> list[int]:
     return sorted({provenance.page_no for provenance in getattr(item, "prov", [])})
 
 
-def _item_record(item: Any, position: int) -> dict[str, Any]:
+def _item_record(item: Any, position: int, tree_level: int) -> dict[str, Any]:
     return {
         "position": position,
         "label": str(getattr(item, "label", "group")),
         "pages": _pages_for(item),
         "text": (getattr(item, "text", "") or "").strip(),
+        # tree_level 是 Docling 文档树深度；heading_level 是本轮启用的原生层级推断结果。
+        "docling_tree_level": tree_level,
+        "docling_heading_level": (
+            getattr(item, "level", None)
+            if getattr(item, "label", None) == DocItemLabel.SECTION_HEADER
+            else None
+        ),
     }
 
 
@@ -51,8 +59,8 @@ def build_inspection_report(parsed_paper: ParsedPaper) -> dict[str, Any]:
     document = _require_docling_document(parsed_paper)
     source = parsed_paper.source
     item_records = [
-        _item_record(item, position)
-        for position, (item, _level) in enumerate(document.iterate_items(), start=1)
+        _item_record(item, position, tree_level)
+        for position, (item, tree_level) in enumerate(document.iterate_items(), start=1)
     ]
     labels = Counter(record["label"] for record in item_records)
 
@@ -89,6 +97,8 @@ def build_inspection_report(parsed_paper: ParsedPaper) -> dict[str, Any]:
             }
             for block in parsed_paper.front_matter
         ],
+        # Step 2 已写入统一 Section Tree，检查报告与 staging 使用同一份序列化数据。
+        "sections": [asdict(section) for section in parsed_paper.sections],
         "page_count": len(document.pages),
         "item_count": len(item_records),
         "label_counts": dict(sorted(labels.items())),

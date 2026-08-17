@@ -33,6 +33,11 @@ def create_parser(settings: AppSettings) -> PaperParser:
                 remove_page_furniture=docling.remove_page_furniture,
                 remove_peer_review_artifacts=docling.remove_peer_review_artifacts,
                 list_style_heading_min_chars=docling.list_style_heading_min_chars,
+                enable_heading_hierarchy=docling.enable_heading_hierarchy,
+                heading_hierarchy_use_bookmarks=docling.heading_hierarchy_use_bookmarks,
+                heading_hierarchy_use_numbering=docling.heading_hierarchy_use_numbering,
+                heading_hierarchy_use_style=docling.heading_hierarchy_use_style,
+                heading_hierarchy_max_level=docling.heading_hierarchy_max_level,
                 enable_front_matter_recognition=settings.parsing.front_matter.enabled,
                 front_matter_max_pages=settings.parsing.front_matter.max_pages,
             )

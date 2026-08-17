@@ -11,7 +11,15 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationInfo, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 
 class ConfigurationError(ValueError):
@@ -57,6 +65,13 @@ class DoclingSettings(BaseModel):
     remove_page_furniture: bool = True
     remove_peer_review_artifacts: bool = True
     list_style_heading_min_chars: int = Field(ge=32, le=512)
+    # 启用 Docling 原生的 heading 层级推断；关闭时 PDF 标题都会停留在 level 1。
+    enable_heading_hierarchy: bool = True
+    # 以下信号的优先级由 Docling 固定为：PDF 书签、编号、字体样式。
+    heading_hierarchy_use_bookmarks: bool = True
+    heading_hierarchy_use_numbering: bool = True
+    heading_hierarchy_use_style: bool = True
+    heading_hierarchy_max_level: int = Field(default=6, ge=1, le=100)
 
     @field_validator("artifacts_path", mode="after")
     @classmethod
@@ -243,6 +258,8 @@ class AnswerGenerationSettings(BaseModel):
 
     enabled: bool = True
     max_evidence_units: int = Field(default=8, ge=1, le=30)
+    # 回答需要解释论文证据，单独覆盖全局 LLM_MAX_TOKENS；不影响短小的 Query Rewrite。
+    max_output_tokens: int = Field(default=1_600, ge=400, le=8_000)
 
 
 class PaperOverviewSettings(BaseModel):
@@ -270,6 +287,32 @@ class PaperOverviewSettings(BaseModel):
     max_output_tokens: int = Field(default=1_600, ge=400, le=8_000)
 
 
+class ExplainSectionSettings(BaseModel):
+    """v0.2 单篇临时论文 Explain Section 的受控上下文与输出预算。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 单个原始 chunk 过长时保留开头、中央和结尾的结构化片段，避免一块文本独占预算。
+    max_tokens_per_chunk: int = Field(default=700, ge=128, le=2_048)
+    # 父章节优先在此目标内覆盖各 direct child；若仍有空间可扩至绝对上限。
+    target_context_tokens: int = Field(default=5_000, ge=512, le=32_000)
+    # 任何 parent / leaf Explain 请求都绝不超过此上限。
+    max_context_tokens: int = Field(default=8_000, ge=512, le=32_000)
+    # 每个 direct child 的 subtree 最多提供几个代表 chunk，防止一支章节淹没其他分支。
+    max_representative_chunks_per_branch: int = Field(default=3, ge=1, le=8)
+    # 结构化输出中的阅读要点上限，防止输出退化为逐 chunk 摘要。
+    max_key_points: int = Field(default=5, ge=1, le=10)
+    # Explain 只覆盖一个章节，独立设置输出预算，不影响 Overview 或 KB QA。
+    max_output_tokens: int = Field(default=2_500, ge=300, le=8_000)
+
+    @model_validator(mode="after")
+    def validate_token_budgets(self) -> "ExplainSectionSettings":
+        """目标预算不能超过硬上限，避免 selector 出现相互矛盾的配置。"""
+        if self.target_context_tokens > self.max_context_tokens:
+            raise ValueError("target_context_tokens must not exceed max_context_tokens.")
+        return self
+
+
 class AppSettings(BaseModel):
     """PaperBase 当前阶段的完整、解析器无关配置根对象。"""
 
@@ -292,6 +335,9 @@ class AppSettings(BaseModel):
     )
     paper_overview: PaperOverviewSettings = Field(
         default_factory=PaperOverviewSettings
+    )
+    explain_section: ExplainSectionSettings = Field(
+        default_factory=ExplainSectionSettings
     )
 
     # 配置文件路径不是用户在 YAML 中填写的业务参数，因此作为 Pydantic 私有属性保存。

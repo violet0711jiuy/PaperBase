@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 from typing import Sequence
@@ -13,6 +13,7 @@ from paperbase.config import AnswerGenerationSettings
 from paperbase.llm.client import (
     ChatCompletionClient,
     LLMRequestError,
+    LLMRuntimeSettings,
     OpenAICompatibleChatClient,
     load_llm_runtime_settings,
 )
@@ -24,16 +25,31 @@ from paperbase.prompts.answer_generation import (
 from .section_expander import EvidenceUnit
 
 
-class AnswerGenerationResult(BaseModel):
-    """LLM 输出的最小结构化回答契约，所有字段均由 API 与 Pydantic 双重约束。"""
+class AnswerGenerationDraft(BaseModel):
+    """LLM 只填写语义内容；最终 ``answer`` 排版由程序确定性生成。"""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    # 最终回答正文：必须是非空字符串，关键事实应在文中标注 [E#] 或 [R#]。
-    answer: str = Field(min_length=1)
+    # 先回答用户问题，避免后续解释淹没明确结论。
+    direct_answer: str = Field(min_length=1)
+    # 展开论文中的步骤、推导、实验设置或比较依据，不能只复述结论。
+    evidence_explanation: str = Field(min_length=1)
+    # 有证据时解释阅读意义；极简事实或证据确实不足时允许为 null，但字段必须出现。
+    reading_interpretation: str | None
     # 使用到的证据编号：只能来自本次传入的 E#/R#，程序会再次验证。
-    citations: list[str] = Field(default_factory=list)
+    # 必须显式输出，避免模型在正文使用 [E#] 后由默认空列表掩盖遗漏。
+    citations: list[str]
     # 证据不足标志：true 时不得把模型常识包装成论文结论。
+    insufficient_evidence: bool
+
+
+class AnswerGenerationResult(BaseModel):
+    """程序拼接小标题后的最终回答契约，供 API、CLI 和前端稳定消费。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    answer: str = Field(min_length=1)
+    citations: list[str] = Field(default_factory=list)
     insufficient_evidence: bool
 
 
@@ -109,11 +125,11 @@ class GroundedAnswerGenerator:
             raw_response = self._client.complete_json(
                 system_prompt=ANSWER_GENERATION_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
-                json_schema=AnswerGenerationResult.model_json_schema(),
+                json_schema=AnswerGenerationDraft.model_json_schema(),
                 schema_name="paperbase_grounded_answer",
             )
             result = _normalize_and_validate_answer(
-                AnswerGenerationResult.model_validate_json(raw_response),
+                _compose_answer(AnswerGenerationDraft.model_validate_json(raw_response)),
                 allowed_evidence_ids={item.evidence_id for item in bounded_evidence},
             )
             return _to_outcome(result, status="success")
@@ -142,8 +158,20 @@ def create_answer_generator(
 ) -> GroundedAnswerGenerator:
     """构造回答生成器；显式注入 client 仅用于单元测试或未来替换 Provider。"""
     if client is None:
-        client = OpenAICompatibleChatClient(load_llm_runtime_settings(env_path))
+        # Query Rewrite 仍使用全局短输出预算；只有最终回答需要较长的论文阅读解释。
+        client = OpenAICompatibleChatClient(
+            _with_answer_output_budget(
+                load_llm_runtime_settings(env_path), settings.max_output_tokens
+            )
+        )
     return GroundedAnswerGenerator(settings=settings, client=client)
+
+
+def _with_answer_output_budget(
+    runtime_settings: LLMRuntimeSettings, max_output_tokens: int
+) -> LLMRuntimeSettings:
+    """仅复制 Answer Generation 的运行配置，不能修改共享的全局 LLM 默认值。"""
+    return replace(runtime_settings, max_tokens=max_output_tokens)
 
 
 def _normalize_and_validate_answer(
@@ -170,6 +198,26 @@ def _normalize_and_validate_answer(
         answer=answer,
         citations=citations,
         insufficient_evidence=result.insufficient_evidence,
+    )
+
+
+def _compose_answer(draft: AnswerGenerationDraft) -> AnswerGenerationResult:
+    """把 LLM 的三段内容固定排版，避免模型忽略单个字符串内的小标题要求。"""
+    direct_answer = draft.direct_answer.strip()
+    evidence_explanation = draft.evidence_explanation.strip()
+    interpretation = (draft.reading_interpretation or "").strip()
+    if not direct_answer or not evidence_explanation:
+        raise ValueError("Answer draft must include direct answer and evidence explanation.")
+    parts = [
+        f"### 直接回答\n{direct_answer}",
+        f"### 论文中的依据与推导\n{evidence_explanation}",
+    ]
+    if interpretation:
+        parts.append(f"### 如何理解\n{interpretation}")
+    return AnswerGenerationResult(
+        answer="\n\n".join(parts),
+        citations=draft.citations,
+        insufficient_evidence=draft.insufficient_evidence,
     )
 
 

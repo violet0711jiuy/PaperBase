@@ -1200,3 +1200,140 @@ Context 变长。
 **尚有限制：**关键词和章节名规则目前以中英文常见学术写法为主；非常规标题、其他语言或结果完全只存在图片中的
 论文仍可能遗漏候选，需要积累更多样本后增加评测集。`raw_token_count` 也只是 Context 预算，不是远端模型的
 精确计费。此前发现的论文标题/作者单位解析异常属于 Parser 质量问题，未纳入本次 selector 修复。
+
+---
+
+# Step 1 补充：Docling 首页标题的结构一致性解析
+
+**记录日期：2026-08-16；范围：只重构 `ParsedPaper.paper_title` resolver，不修改 authors / affiliations、
+abstract、keywords、publication information、availability 等 front matter 识别规则，也不修改 Chunker 的
+front matter 标记。**
+
+## 1. 问题与原始流程
+
+原标题 resolver 的逻辑为：优先取第一个被 Docling 标为 `TITLE` 的 item；如果没有，则在首页的
+`SECTION_HEADER` 中过滤少量出版栏名称和长度小于 20 的文本，选择第一个剩余候选：
+
+```text
+第一个 Docling TITLE
+或
+首页第一个“非噪声且足够长”的 SECTION_HEADER
+→ paper_title
+```
+
+该规则把“靠前位置”和“文本长度”当作主要判断依据。它无法区分期刊名和论文标题：短期刊名 `Energy` 只是
+因为长度不足而未被选中；较长的期刊名 `Expert Systems With Applications` 则满足长度要求并在真实标题前出现，
+被错误写为 `paper_title`。这证明长度是弱形态特征，不能承担标题判定职责。
+
+## 2. 根因
+
+Elsevier 首页常见阅读顺序为：
+
+```text
+Contents lists available at ScienceDirect
+→ Journal Name
+→ journal homepage
+→ Real Paper Title
+→ Authors / Affiliations
+→ Keywords / Abstract
+```
+
+Docling 在这类 PDF 中会把期刊名与真实标题都标成 `SECTION_HEADER`。旧 resolver 只要看到第一个足够长的
+header 就立即返回，未利用“期刊名后紧跟 journal homepage”这一强反证，也未验证候选后方是否能形成
+“标题 → 作者 → 单位 → 摘要/关键词”的论文首页结构。
+
+## 3. 最终方案
+
+在 [`paperbase/parsing/docling_parser.py`](../paperbase/parsing/docling_parser.py) 中，将标题解析改为多个候选的
+结构化评分器：
+
+```text
+前置窗口（默认前 2 页）中的 TITLE / SECTION_HEADER / TEXT
+→ 排除明确出版栏和前置标签
+→ 多信号评分
+→ 下游结构一致性验证
+→ 分数阈值与第一、二名分差校验
+→ 选择标题或 unresolved
+```
+
+候选对象保留其原始 `item`、文本、页码和 reading order；resolver 只决定业务层使用哪个 item 的文本，绝不改写
+`item.text`、不重排 Docling 文档树，也不手工修改 Markdown。原生文档和 provenance 因而保持可审计。
+
+评分参数集中在 `_TitleResolverWeights`，而不是散落在条件表达式中。主要信号为：
+
+| 信号 | 作用 |
+| --- | --- |
+| Docling label | `TITLE` 最高，`SECTION_HEADER` 次之，普通 `TEXT` 仅作兜底 |
+| 页码与 reading order | 首页、较早位置小幅加分，但不能单独决定结果 |
+| 文本形态 | 合理词数小幅加分、超长正文小幅减分；无最小字符数准入规则 |
+| 明确出版栏 | `Contents lists available`、`journal homepage`、DOI、ISSN、版权、许可证、Received 等不作为标题候选 |
+| 下游反证 | 候选后紧接 journal homepage 等出版栏时强降分 |
+| 下游一致性 | 候选后能看到作者行、机构/邮箱信号，以及 Keywords/Abstract 边界时加分；三者齐全额外加分 |
+
+真实标题与期刊名都不是硬编码名单。系统识别的是“期刊名后紧接 homepage”的出版栏结构，而不是识别
+`Energy` 或 `Expert Systems With Applications` 这两个具体字符串。
+
+若最高分低于可信阈值，或与第二名差距不足，返回 `paper_title=None`、`title_source='unresolved'`；不再回退到
+“第一个足够长的 header”。错误标题比缺失标题更危险。
+
+## 4. 一次真实回归：`ARTICLE INFO` 规范化时序
+
+首次接入评分器后，用户使用 staging 命令重新解析 Qiu 的 ESDTW PDF，得到 `paper_title=null`。检查新 workspace
+发现，并非没有识别到真实标题，而是其得分被压到 43，低于 45 的可信阈值。
+
+根因是执行时序：标题 resolver 在 front matter 标准化前运行。此时首页结构还是：
+
+```text
+Real Paper Title
+→ Authors / Affiliations
+→ ARTICLE INFO
+→ Keywords: ...
+→ Abstract
+```
+
+既有 front matter 逻辑会在之后把“仅承载 `Keywords:` 的 `ARTICLE INFO` 容器”提升为 `Keywords`。但 resolver 运行时
+尚未发生该提升，错误地把 `ARTICLE INFO` 视为真实标题后的出版栏，额外扣 38 分。把保存后的最终 Docling JSON
+重新送入 resolver 时已能识别标题，正是这个时序差异的直接证据。
+
+修复严格限制在 title resolver 内：
+
+- `ARTICLE INFO` 仍被排除为标题候选；
+- 但它不再作为“标题后紧跟 homepage/DOI”式的负面出版栏反证；
+- resolver 同时识别 `Keywords: ...` / `Abstract: ...` 这类行内强标签为下游 front matter 边界。
+
+这样不需要改变既有 `_promote_article_info_keyword_heading`、authors、keywords 或 abstract 的任何实现，同时标题
+resolver 在规范化前后都能获得一致结论。
+
+## 5. 真实验证与结果
+
+对保存的真实 Docling 首页工件运行 resolver，得到：
+
+| 样本 | 期刊名分数 | 真实标题分数 | 最终标题 |
+| --- | ---: | ---: | --- |
+| Saeed / `Energy` | -16 | 51 | `Enhanced wind speed forecasting for sustainable power systems: ...` |
+| Qiu / `Expert Systems With Applications` | -13 | 81 | `ESDTW:Extrema-based shape dynamic time warping` |
+
+此外，直接对用户的 Qiu PDF 运行新版 `DoclingParser.parse()`（只在内存中验证，不写正式 KB）返回：
+
+```text
+paper_title='ESDTW:Extrema-based shape dynamic time warping'
+title_source='front_matter_coherence_scoring'
+front_matter=[authors_affiliations, keywords, abstract]
+```
+
+其中 `authors_affiliations` 的出现不是修改作者识别规则的副作用；它是既有逻辑在拿到正确标题后，能够正确定位
+“标题到下一个元数据边界”范围的自然结果。
+
+## 6. 验证、结论与限制
+
+- 新增 5 个纯逻辑回归场景：两组真实首页候选序列、长期刊名/短真实标题、短期刊名/长真实标题、低可信度
+  unresolved；均通过。
+- 全项目单元测试：`73/73` 通过。
+- `git diff --check` 与 Python 编译检查通过。
+- 未修改任何其他 front matter 识别函数、Chunker、Markdown 导出或正式知识库文件。
+
+**结论：期刊名误识别问题及 `ARTICLE INFO` 导致的首次 staging 解析为 null 问题，均已在真实 PDF 与回归测试范围内解决。**
+
+**仍有限制：**该 resolver 基于常见学术首页结构和英文出版栏模式。标题、作者、摘要都没有明确结构证据的论文会
+保守返回 unresolved；这符合“错误标题比缺失标题危险”的约束。后续应以更多出版社、短标题、无摘要首页和非英语论文
+建立评测集，再调整权重或扩展通用版式信号。

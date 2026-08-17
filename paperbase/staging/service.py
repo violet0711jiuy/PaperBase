@@ -345,6 +345,8 @@ def _parsed_paper_record(parsed_paper: ParsedPaper) -> dict[str, Any]:
         "diagnostics": dict(parsed_paper.diagnostics),
         "page_furniture": [asdict(item) for item in parsed_paper.page_furniture],
         "front_matter": [asdict(item) for item in parsed_paper.front_matter],
+        # Step 2 起直接持久化统一 Section Tree；旧 Parser 未填充时仍安全写入空列表。
+        "sections": [asdict(section) for section in parsed_paper.sections],
     }
 
 

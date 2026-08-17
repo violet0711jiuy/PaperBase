@@ -22,11 +22,12 @@ from paperbase.chunking.base import ChunkingResult, PaperChunk
 from paperbase.chunking.factory import create_chunker
 from paperbase.config import default_config_path, load_settings
 from paperbase.parsing.factory import create_parser
+from paperbase.parsing.base import SectionRecord
 
 
 # 版本表用于未来的显式迁移。不要只靠 ``CREATE TABLE IF NOT EXISTS`` 猜测 schema
 # 是否兼容：一旦结构变化，必须提供可审计迁移，而不是静默让旧库以未知状态继续运行。
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 _SCHEMA_INFO_SQL = """
 CREATE TABLE IF NOT EXISTS schema_info (
@@ -54,6 +55,32 @@ CREATE TABLE IF NOT EXISTS documents (
     CHECK (length(source_sha256) = 64)
 );
 
+CREATE TABLE IF NOT EXISTS sections (
+    section_id TEXT PRIMARY KEY,
+    paper_id TEXT NOT NULL,
+    section_title TEXT NOT NULL,
+    section_number TEXT,
+    section_level INTEGER NOT NULL,
+    parent_section_id TEXT,
+    section_index INTEGER NOT NULL,
+    page_start INTEGER,
+    page_end INTEGER,
+    FOREIGN KEY (paper_id) REFERENCES documents(paper_id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_section_id) REFERENCES sections(section_id) ON DELETE CASCADE,
+    UNIQUE (paper_id, section_index),
+    CHECK (length(trim(section_id)) > 0),
+    CHECK (length(trim(section_title)) > 0),
+    CHECK (section_level >= 1),
+    CHECK (section_index >= 0),
+    CHECK (page_start IS NULL OR page_start >= 1),
+    CHECK (page_end IS NULL OR page_end >= page_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sections_paper_index
+    ON sections(paper_id, section_index);
+CREATE INDEX IF NOT EXISTS idx_sections_parent
+    ON sections(parent_section_id);
+
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id TEXT PRIMARY KEY,
     vector_id INTEGER UNIQUE,
@@ -62,6 +89,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     raw_text TEXT NOT NULL,
     embedding_text TEXT NOT NULL,
     section TEXT,
+    section_id TEXT,
     content_kind TEXT NOT NULL,
     front_matter_type TEXT,
     section_type TEXT NOT NULL DEFAULT 'content',
@@ -72,6 +100,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     prev_chunk_id TEXT,
     next_chunk_id TEXT,
     FOREIGN KEY (paper_id) REFERENCES documents(paper_id) ON DELETE CASCADE,
+    FOREIGN KEY (section_id) REFERENCES sections(section_id) ON DELETE SET NULL,
     UNIQUE (paper_id, chunk_index),
     CHECK (chunk_index >= 0),
     CHECK (length(trim(raw_text)) > 0),
@@ -275,11 +304,18 @@ class MetadataDatabase:
                 _migrate_v3_to_v4(connection)
                 connection.execute(
                     "UPDATE schema_info SET value = ? WHERE key = 'schema_version'",
+                    ("4",),
+                )
+                stored_version = {"value": "4"}
+            if stored_version["value"] == "4":
+                _migrate_v4_to_v5(connection)
+                connection.execute(
+                    "UPDATE schema_info SET value = ? WHERE key = 'schema_version'",
                     (str(_SCHEMA_VERSION),),
                 )
-                return
+                stored_version = {"value": str(_SCHEMA_VERSION)}
             if stored_version["value"] == str(_SCHEMA_VERSION):
-                # 为已是 V3 的数据库补齐可安全重复创建的索引与 FTS trigger，便于恢复。
+                # 为已是当前版本的数据库补齐可安全重复创建的表、索引与 FTS trigger。
                 connection.executescript(_SCHEMA_V4_SQL)
                 return
             if stored_version["value"] != str(_SCHEMA_VERSION):
@@ -347,14 +383,31 @@ class MetadataDatabase:
                     now,
                 ),
             )
+            # 父节点即使没有任何直属 chunk，也作为独立记录先写入；随后 chunks 的
+            # section_id 外键才能在同一个事务中可靠关联到它。
+            connection.executemany(
+                """
+                INSERT INTO sections (
+                    section_id, paper_id, section_title, section_number,
+                    section_level, parent_section_id, section_index, page_start, page_end
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                # 即使调用方传入的 tuple 未排序，也始终先写父节点、再写子节点，满足自引用 FK。
+                (
+                    _section_row(section)
+                    for section in sorted(
+                        parsed_paper.sections, key=lambda section: section.section_index
+                    )
+                ),
+            )
             connection.executemany(
                 """
                 INSERT INTO chunks (
                     chunk_id, vector_id, paper_id, chunk_index,
                     raw_text, embedding_text, section, content_kind, front_matter_type, section_type,
                     page_start, page_end,
-                    raw_token_count, embedding_token_count, prev_chunk_id, next_chunk_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    raw_token_count, embedding_token_count, prev_chunk_id, next_chunk_id, section_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (_chunk_row(chunk) for chunk in result.chunks),
             )
@@ -385,6 +438,25 @@ class MetadataDatabase:
         with self._connect() as connection:
             return connection.execute(
                 "SELECT * FROM documents WHERE paper_id = ?", (paper_id,)
+            ).fetchone()
+
+    def list_sections(self, paper_id: str) -> tuple[sqlite3.Row, ...]:
+        """按原始 heading 阅读顺序返回一篇论文的完整 Section Tree 节点。"""
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    "SELECT * FROM sections WHERE paper_id = ? ORDER BY section_index",
+                    (paper_id,),
+                ).fetchall()
+            )
+
+    def get_section(self, section_id: str) -> sqlite3.Row | None:
+        """按稳定 section_id 查询单个 Section，供后续 Explain Section 读取。"""
+        self.initialize()
+        with self._connect() as connection:
+            return connection.execute(
+                "SELECT * FROM sections WHERE section_id = ?", (section_id,)
             ).fetchone()
 
     def list_front_matter_chunks(self, paper_id: str) -> tuple[sqlite3.Row, ...]:
@@ -875,6 +947,44 @@ def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v4_to_v5(connection: sqlite3.Connection) -> None:
+    """增加 Section Tree 表及 chunks.section_id，不回填既有论文结构。"""
+    # 先创建父表，随后为旧 chunks 增加可空外键列；SQLite 会把已有的 265 条历史
+    # chunk 自动保留为 NULL。这里绝不重新解析 PDF，也不触碰 FTS5/FAISS 派生工件。
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS sections (
+            section_id TEXT PRIMARY KEY,
+            paper_id TEXT NOT NULL,
+            section_title TEXT NOT NULL,
+            section_number TEXT,
+            section_level INTEGER NOT NULL,
+            parent_section_id TEXT,
+            section_index INTEGER NOT NULL,
+            page_start INTEGER,
+            page_end INTEGER,
+            FOREIGN KEY (paper_id) REFERENCES documents(paper_id) ON DELETE CASCADE,
+            FOREIGN KEY (parent_section_id) REFERENCES sections(section_id) ON DELETE CASCADE,
+            UNIQUE (paper_id, section_index),
+            CHECK (length(trim(section_id)) > 0),
+            CHECK (length(trim(section_title)) > 0),
+            CHECK (section_level >= 1),
+            CHECK (section_index >= 0),
+            CHECK (page_start IS NULL OR page_start >= 1),
+            CHECK (page_end IS NULL OR page_end >= page_start)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sections_paper_index
+            ON sections(paper_id, section_index);
+        CREATE INDEX IF NOT EXISTS idx_sections_parent
+            ON sections(parent_section_id);
+        """
+    )
+    connection.execute(
+        "ALTER TABLE chunks ADD COLUMN section_id TEXT "
+        "REFERENCES sections(section_id) ON DELETE SET NULL"
+    )
+
+
 def _is_bibliography_section(section: str) -> bool:
     """为数据库迁移复用切块阶段相同的受控标题规则。"""
     leaf = section.rsplit(">", maxsplit=1)[-1].strip()
@@ -1012,6 +1122,8 @@ def _validate_chunking_result(result: ChunkingResult) -> tuple[str, str]:
             "Chunk indexes must be a contiguous 0..N-1 sequence before import."
         )
 
+    _validate_sections(result.parsed_paper.sections, paper_id=expected_paper_id)
+    known_section_ids = {section.section_id for section in result.parsed_paper.sections}
     known_chunk_ids = set(chunk_ids)
     for chunk in chunks:
         if chunk.content_kind not in {"body", "front_matter"}:
@@ -1027,6 +1139,10 @@ def _validate_chunking_result(result: ChunkingResult) -> tuple[str, str]:
             raise MetadataDatabaseError(
                 f"Unsupported section_type for {chunk.chunk_id}: {chunk.section_type!r}"
             )
+        if chunk.section_id is not None and chunk.section_id not in known_section_ids:
+            raise MetadataDatabaseError(
+                f"Unknown section_id for {chunk.chunk_id}: {chunk.section_id}"
+            )
         if chunk.prev_chunk_id is not None and chunk.prev_chunk_id not in known_chunk_ids:
             raise MetadataDatabaseError(
                 f"Unknown prev_chunk_id for {chunk.chunk_id}: {chunk.prev_chunk_id}"
@@ -1036,6 +1152,45 @@ def _validate_chunking_result(result: ChunkingResult) -> tuple[str, str]:
                 f"Unknown next_chunk_id for {chunk.chunk_id}: {chunk.next_chunk_id}"
             )
     return expected_paper_id, source_sha256
+
+
+def _validate_sections(
+    sections: tuple[SectionRecord, ...], *, paper_id: str
+) -> None:
+    """在写入前校验 Section Tree 的身份、父子引用与阅读顺序，不猜测或修复数据。"""
+    section_ids = [section.section_id for section in sections]
+    section_indexes = [section.section_index for section in sections]
+    if len(set(section_ids)) != len(section_ids):
+        raise MetadataDatabaseError("Section IDs must be unique within one import.")
+    if len(set(section_indexes)) != len(section_indexes):
+        raise MetadataDatabaseError("Section indexes must be unique within one import.")
+    by_id = {section.section_id: section for section in sections}
+    for section in sections:
+        if section.paper_id != paper_id:
+            raise MetadataDatabaseError(
+                f"Section paper_id mismatch for {section.section_id}: {section.paper_id!r}"
+            )
+        if section.section_level < 1:
+            raise MetadataDatabaseError(
+                f"Section level must be positive for {section.section_id}."
+            )
+        if section.page_start is not None and section.page_end is not None:
+            if section.page_end < section.page_start:
+                raise MetadataDatabaseError(
+                    f"Section page range is invalid for {section.section_id}."
+                )
+        parent_id = section.parent_section_id
+        if parent_id is None:
+            continue
+        parent = by_id.get(parent_id)
+        if parent is None:
+            raise MetadataDatabaseError(
+                f"Unknown parent_section_id for {section.section_id}: {parent_id}"
+            )
+        if parent.section_index >= section.section_index:
+            raise MetadataDatabaseError(
+                f"Parent Section must precede child {section.section_id}."
+            )
 
 
 def _chunk_row(chunk: PaperChunk) -> tuple[object, ...]:
@@ -1057,6 +1212,22 @@ def _chunk_row(chunk: PaperChunk) -> tuple[object, ...]:
         chunk.embedding_token_count,
         chunk.prev_chunk_id,
         chunk.next_chunk_id,
+        chunk.section_id,
+    )
+
+
+def _section_row(section: SectionRecord) -> tuple[object, ...]:
+    """将解析器无关的 SectionRecord 转为 SQLite 参数元组，字段顺序只维护一处。"""
+    return (
+        section.section_id,
+        section.paper_id,
+        section.section_title,
+        section.section_number,
+        section.section_level,
+        section.parent_section_id,
+        section.section_index,
+        section.page_start,
+        section.page_end,
     )
 
 

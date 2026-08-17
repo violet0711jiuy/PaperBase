@@ -1,6 +1,6 @@
 """PDF parsing utilities built on Docling."""
 
-from .base import FrontMatterBlock, PaperParser, ParsedPaper
+from .base import FrontMatterBlock, PaperParser, ParsedPaper, SectionRecord
 from .docling_parser import DoclingParser, ParserSettings
 from .factory import create_parser
 
@@ -9,6 +9,7 @@ __all__ = [
     "FrontMatterBlock",
     "PaperParser",
     "ParsedPaper",
+    "SectionRecord",
     "ParserSettings",
     "create_parser",
 ]

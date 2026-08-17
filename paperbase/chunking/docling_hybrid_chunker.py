@@ -11,7 +11,7 @@ from docling.chunking import HybridChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from docling_core.types.doc import DoclingDocument
 
-from paperbase.parsing.base import FrontMatterBlock, ParsedPaper
+from paperbase.parsing.base import FrontMatterBlock, ParsedPaper, SectionRecord
 
 from .base import ChunkingResult, PaperChunk, PaperChunker
 
@@ -72,7 +72,10 @@ class DoclingHybridPaperChunker(PaperChunker):
             if not raw_text:
                 # 空对象对向量检索没有意义，也不能提供有效证据，因此不建立空 chunk。
                 continue
-            section = _section_from_headings(docling_chunk.meta.headings)
+            section = _section_from_headings(
+                docling_chunk.meta.headings,
+                sections=parsed_paper.sections,
+            )
             page_start, page_end = _page_range(docling_chunk)
             if _is_layout_noise_chunk(
                 raw_text=raw_text,
@@ -97,6 +100,11 @@ class DoclingHybridPaperChunker(PaperChunker):
             # 基于 Docling 已恢复的标题层级分类，而非在段落正文中搜索 “references”。
             # 因此 “Related Work” 即使讨论引用，也仍然是正文 content。
             section_type = _section_type_from_headings(docling_chunk.meta.headings)
+            section_id = _section_id_from_headings(
+                headings=docling_chunk.meta.headings,
+                sections=parsed_paper.sections,
+                page_start=page_start,
+            )
             draft_chunks.append(
                 _DraftChunk(
                     raw_text=raw_text,
@@ -109,6 +117,7 @@ class DoclingHybridPaperChunker(PaperChunker):
                     content_kind=("front_matter" if front_matter_type else "body"),
                     front_matter_type=front_matter_type,
                     section_type=section_type,
+                    section_id=section_id,
                 )
             )
 
@@ -170,6 +179,7 @@ class _DraftChunk:
     content_kind: str
     front_matter_type: str | None
     section_type: str
+    section_id: str | None
 
 
 def _require_docling_document(parsed_paper: ParsedPaper) -> DoclingDocument:
@@ -227,15 +237,75 @@ def _to_paper_chunk(
         content_kind=draft.content_kind,
         front_matter_type=draft.front_matter_type,
         section_type=draft.section_type,
+        section_id=draft.section_id,
     )
 
 
-def _section_from_headings(headings: list[str] | None) -> str | None:
-    """将 Docling 的标题层级序列转为稳定、易读的章节路径。"""
+def _section_from_headings(
+    headings: list[str] | None,
+    *,
+    sections: tuple[SectionRecord, ...] = (),
+) -> str | None:
+    """将 Docling 标题链转为展示路径，并从正文路径剔除非正文祖先。"""
     normalized_headings = [
         _normalize_whitespace(heading) for heading in (headings or []) if heading.strip()
     ]
+    if sections:
+        body_heading_keys = {
+            _normalized_heading_key(section.section_title) for section in sections
+        }
+        body_headings = [
+            heading
+            for heading in normalized_headings
+            if _normalized_heading_key(heading) in body_heading_keys
+        ]
+        # 只要路径中出现一个正文节点，就使用已建立的正文树标题。若完全没有命中，说明
+        # 它属于 front matter、bibliography 或旧兼容内容，继续保留原有 Docling 路径。
+        if body_headings:
+            normalized_headings = body_headings
     return " > ".join(normalized_headings) if normalized_headings else None
+
+
+def _section_id_from_headings(
+    *,
+    headings: list[str] | None,
+    sections: tuple[SectionRecord, ...],
+    page_start: int | None,
+) -> str | None:
+    """将 HybridChunker 标题链映射到最近的真实 Section，算法标签可回退到父章节。"""
+    if not headings or not sections:
+        return None
+    # 通常第一个命中就是末级 heading。若末级是 Algorithm/Input/Output 这类非 Section
+    # 标签，则沿 Docling 原生 ancestor chain 向上回退到最近的真实父 Section。
+    for heading in reversed(headings):
+        candidates = [
+            section
+            for section in sections
+            if _normalized_heading_key(section.section_title)
+            == _normalized_heading_key(heading)
+        ]
+        if not candidates:
+            continue
+        if page_start is not None:
+            # 重复标题时，以不晚于该 chunk 页码的最近一个 heading 为准，保持阅读顺序语义。
+            preceding = [
+                section
+                for section in candidates
+                if section.page_start is None or section.page_start <= page_start
+            ]
+            if preceding:
+                return max(
+                    preceding,
+                    key=lambda section: (section.page_start or -1, section.section_index),
+                ).section_id
+        return candidates[-1].section_id
+    # front matter、bibliography 或无标题的出版栏不强行猜测 section_id。
+    return None
+
+
+def _normalized_heading_key(text: str) -> str:
+    """以现有标题文本的空白、大小写归一化键匹配，不从 chunk 正文推断章节。"""
+    return _normalize_whitespace(text).casefold()
 
 
 def _section_type_from_headings(headings: list[str] | None) -> str:

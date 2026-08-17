@@ -6,6 +6,7 @@
 
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+import hashlib
 from io import BytesIO
 from pathlib import Path
 import re
@@ -20,7 +21,7 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import DocItemLabel, DoclingDocument
 from docling_core.types.io import DocumentStream
 
-from .base import FrontMatterBlock, PageFurniture, PaperParser, ParsedPaper
+from .base import FrontMatterBlock, PageFurniture, PaperParser, ParsedPaper, SectionRecord
 
 
 # 标题 resolver 只识别“出版栏模式”，绝不维护具体期刊名白名单。键已去除大小写、
@@ -211,6 +212,16 @@ _MERGED_NUMBERED_HEADING_BOUNDARY = re.compile(
     r"\s+(?=(?:\d+\.){1,3}\s+[A-Z])"
 )
 _NUMBERED_HEADING = re.compile(r"^(?:\d+\.){1,3}\s+\S.*$")
+
+# 章节编号只用于提取原文中已存在的 ``3``、``3.1``、``3.1.2``，绝不据此生成标题。
+# Docling 原生 level 是主信号；仅当后处理新插入的 heading 没有原生层级时才作为兜底。
+_SECTION_NUMBER_PREFIX = re.compile(r"^(?P<number>\d+(?:\.\d+)*)(?:\.)?\s+\S")
+
+# 算法伪代码的标题和 Input/Output 标签会被版面模型标为 SECTION_HEADER，但它们不是
+# 论文目录节点，也不会成为 HybridChunker 的正文 section，因此不能污染 Section Tree。
+_NON_SECTION_HEADER = re.compile(
+    r"^(?:algorithm\s+\d+\b|input\s*:|output\s*:)", re.IGNORECASE
+)
 
 # 图表标题通常以 ``Figure 1.`` 或 ``Table 2.`` 开始。只有同一 caption 内第二次出现
 # 与开头完全相同的编号标记时，才进一步检查是否为文本层重复，而不处理正文中的交叉引用。
@@ -462,8 +473,24 @@ class ParserSettings:
     remove_page_furniture: bool = True
     remove_peer_review_artifacts: bool = True
     list_style_heading_min_chars: int = 80
+    enable_heading_hierarchy: bool = True
+    heading_hierarchy_use_bookmarks: bool = True
+    heading_hierarchy_use_numbering: bool = True
+    heading_hierarchy_use_style: bool = True
+    heading_hierarchy_max_level: int = 6
     enable_front_matter_recognition: bool = True
     front_matter_max_pages: int = 2
+
+
+@dataclass(frozen=True)
+class _SectionHeadingCandidate:
+    """构建统一章节树前暂存一个已有 Docling heading 的最小事实。"""
+
+    item: object
+    reading_order: int
+    text: str
+    native_level: int
+    section_number: str | None
 
 
 class DoclingParser(PaperParser):
@@ -537,6 +564,13 @@ class DoclingParser(PaperParser):
             )
         else:
             front_matter = ()
+        # 章节树只读取 Docling 已解析出的 heading、level、页码和阅读顺序；不修改原生树。
+        sections = _build_section_records(
+            document=document,
+            paper_id=_paper_id(source),
+            paper_title=paper_title,
+            front_matter=front_matter,
+        )
 
         diagnostics: dict[str, int | str] = {
             # 诊断字段全部采用解析器前缀，避免未来不同工具使用同名指标时语义混淆。
@@ -562,6 +596,10 @@ class DoclingParser(PaperParser):
             "docling.extracted_page_furniture_count": len(page_furniture),
             "docling.front_matter_block_count": len(front_matter),
             "docling.formula_preset": self._settings.formula_preset,
+            "docling.heading_hierarchy_enabled": str(
+                self._settings.enable_heading_hierarchy
+            ).lower(),
+            "docling.section_count": len(sections),
         }
         for block_type in _FRONT_MATTER_SECTION_NAMES:
             diagnostics[f"docling.front_matter_{block_type}_count"] = sum(
@@ -578,6 +616,7 @@ class DoclingParser(PaperParser):
             title_candidates=title_candidates,
             diagnostics=diagnostics,
             native_document=document,
+            sections=sections,
         )
 
     def _build_converter(self) -> DocumentConverter:
@@ -609,6 +648,16 @@ class DoclingParser(PaperParser):
         options.do_chart_extraction = False
         options.generate_page_images = False
         options.generate_picture_images = False
+        # Docling 2.119 默认关闭 heading hierarchy，因而所有 SECTION_HEADER 都是 level 1。
+        # 开启后由其原生模型按书签、编号、字体样式依次推断；不在 PaperBase 里复制规则。
+        hierarchy = options.heading_hierarchy_options
+        hierarchy.enabled = self._settings.enable_heading_hierarchy
+        hierarchy.use_bookmarks = self._settings.heading_hierarchy_use_bookmarks
+        hierarchy.use_numbering = self._settings.heading_hierarchy_use_numbering
+        hierarchy.use_style = self._settings.heading_hierarchy_use_style
+        hierarchy.max_level = self._settings.heading_hierarchy_max_level
+        # 字体样式兜底需要 Docling 在层级推断阶段保留 parsed pages；该中间态不会写入 KB。
+        options.generate_parsed_pages = self._settings.heading_hierarchy_use_style
         options.layout_options.engine_options.compile_model = (
             self._settings.compile_layout_model
         )
@@ -1575,6 +1624,171 @@ def _collect_root_content(
             texts.append(text)
             pages.update(provenance.page_no for provenance in getattr(item, "prov", []))
     return "\n".join(texts).strip(), tuple(sorted(pages)), len(texts)
+
+
+def _build_section_records(
+    *,
+    document: DoclingDocument,
+    paper_id: str,
+    paper_title: str | None,
+    front_matter: tuple[FrontMatterBlock, ...],
+) -> tuple[SectionRecord, ...]:
+    """把 Docling 原生 heading level 转为解析器无关的完整正文 Section Tree。
+
+    Docling 的 PDF pipeline 已负责书签、编号、样式三类 hierarchy inference。本函数只
+    消费它写入 ``SectionHeaderItem.level`` 的结果，按阅读顺序维护父节点栈；当后处理
+    新插入 heading 导致 level 缺失时，才以该 heading 自己已有的编号深度受控兜底。
+    """
+    front_matter_keys = {
+        _normalized_front_matter_label(block.canonical_section)
+        for block in front_matter
+    }
+    title_key = _normalized_front_matter_label(paper_title or "")
+    candidates: list[_SectionHeadingCandidate] = []
+    last_front_matter_order = -1
+
+    for reading_order, (item, _tree_level) in enumerate(document.iterate_items()):
+        if getattr(item, "label", None) != DocItemLabel.SECTION_HEADER:
+            continue
+        text = _normalize_inline_whitespace(getattr(item, "text", "") or "")
+        if not text:
+            continue
+        text_key = _normalized_front_matter_label(text)
+        if text_key in front_matter_keys:
+            # 只有实际写入 ParsedPaper.front_matter 的元数据才排除。不能仅因标题名称相同
+            # 就丢掉文末的 Data availability 等真实后置章节。
+            last_front_matter_order = reading_order
+            continue
+        if text_key == title_key or _NON_SECTION_HEADER.match(text):
+            continue
+        if _is_bibliography_heading(text):
+            # References / Bibliography 是既有 section_type 的专用语义，不混入正文树。
+            continue
+        candidates.append(
+            _SectionHeadingCandidate(
+                item=item,
+                reading_order=reading_order,
+                text=text,
+                native_level=_native_heading_level(item),
+                section_number=_section_number(text),
+            )
+        )
+
+    if not candidates:
+        return ()
+
+    start_offset = _body_section_start_offset(
+        candidates=candidates,
+        last_front_matter_order=last_front_matter_order,
+    )
+    body_candidates = candidates[start_offset:]
+    native_root_level = _native_body_root_level(body_candidates)
+    sections: list[SectionRecord] = []
+    parent_stack: list[SectionRecord] = []
+
+    for section_index, candidate in enumerate(body_candidates):
+        section_level = _normalized_section_level(
+            native_level=candidate.native_level,
+            native_root_level=native_root_level,
+            section_number=candidate.section_number,
+        )
+        # 栈顶始终是阅读顺序中最近、且层级更浅的真实 Section，因此就是直属父节点。
+        while parent_stack and parent_stack[-1].section_level >= section_level:
+            parent_stack.pop()
+        parent_section_id = parent_stack[-1].section_id if parent_stack else None
+        pages = _item_pages(document, candidate.item)
+        section = SectionRecord(
+            section_id=f"{paper_id}_section_{section_index:04d}",
+            paper_id=paper_id,
+            section_title=candidate.text,
+            section_number=candidate.section_number,
+            section_level=section_level,
+            parent_section_id=parent_section_id,
+            section_index=section_index,
+            page_start=pages[0] if pages else None,
+            page_end=pages[-1] if pages else None,
+        )
+        sections.append(section)
+        parent_stack.append(section)
+    return tuple(sections)
+
+
+def _body_section_start_offset(
+    *,
+    candidates: list[_SectionHeadingCandidate],
+    last_front_matter_order: int,
+) -> int:
+    """定位正文第一个真实章节，避免把期刊名等首页出版栏写进 Section Tree。"""
+    for index, candidate in enumerate(candidates):
+        if candidate.section_number is not None or _INTRODUCTION_HEADING.fullmatch(
+            candidate.text
+        ):
+            return index
+    # 无编号论文以已识别 front matter 之后的第一个 heading 为保守兜底；若没有前置块，
+    # 才接受第一个已有 heading。该分支不凭正文文本创建任何不存在的标题。
+    for index, candidate in enumerate(candidates):
+        if candidate.reading_order > last_front_matter_order:
+            return index
+    return 0
+
+
+def _native_body_root_level(candidates: list[_SectionHeadingCandidate]) -> int:
+    """取得正文顶层编号章节的 Docling level，用于把业务根节点规范为 level 1。"""
+    root_levels = [
+        candidate.native_level
+        for candidate in candidates
+        if candidate.native_level > 1
+        and candidate.section_number is not None
+        and _section_number_depth(candidate.section_number) == 1
+    ]
+    return min(root_levels, default=1)
+
+
+def _normalized_section_level(
+    *,
+    native_level: int,
+    native_root_level: int,
+    section_number: str | None,
+) -> int:
+    """保留 Docling 相对层级，同时让正文根节点稳定从 1 开始。"""
+    if native_level > 1:
+        return max(1, native_level - native_root_level + 1)
+    if section_number is not None:
+        # 后处理插入的编号标题没有 native level 时，编号深度是已有标题的唯一可靠兜底。
+        return _section_number_depth(section_number)
+    # 无编号且无原生层级信号的 heading 不推测父节点，保守作为新的正文根节点。
+    return 1
+
+
+def _native_heading_level(item: object) -> int:
+    """安全读取 Docling 写入 heading 的 level；异常值视为缺失的默认 level 1。"""
+    try:
+        return max(1, int(getattr(item, "level", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _section_number(text: str) -> str | None:
+    """从真实 heading 文本提取已有数字编号；不改写标题，也不生成编号。"""
+    match = _SECTION_NUMBER_PREFIX.match(text)
+    return match.group("number") if match is not None else None
+
+
+def _section_number_depth(section_number: str) -> int:
+    """编号 ``3.1.2`` 的深度是 3，用于原生 level 缺失时的局部兜底。"""
+    return len(section_number.split("."))
+
+
+def _is_bibliography_heading(text: str) -> bool:
+    """与 Chunker 的 bibliography 语义保持一致，只过滤受控的末级标题。"""
+    leaf = re.sub(r"^\d+(?:\.\d+)*(?:\.)?\s+", "", text).casefold().rstrip(": ")
+    return leaf in {"references", "bibliography", "works cited", "literature cited"}
+
+
+def _paper_id(source: Path) -> str:
+    """与 HybridChunker 使用相同的 PDF 字节哈希身份，保证 sections/chunks 属于同一论文。"""
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16]
+    return f"paper_{digest}"
 
 
 def _normalized_front_matter_label(text: str) -> str:

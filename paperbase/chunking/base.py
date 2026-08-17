@@ -44,6 +44,8 @@ class PaperChunk:
     front_matter_type: str | None = None
     # 章节语义：content 可作为正文问答证据；bibliography 仅用于引用/参考文献查询。
     section_type: str = "content"
+    # Step 1 仅预留直属章节树节点引用；旧 Chunker 暂不填充，继续使用已有 section 文本。
+    section_id: str | None = None
 
 
 @dataclass(frozen=True)

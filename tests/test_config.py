@@ -44,6 +44,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.retrieval.bm25_original_top_k, 10)
         self.assertEqual(settings.retrieval.bm25_rewrite_top_k, 20)
         self.assertTrue(settings.retrieval.query_rewrite.enabled)
+        self.assertEqual(settings.answer_generation.max_output_tokens, 1600)
         self.assertEqual(
             settings.database.path,
             project_root / "storage" / "paperbase.sqlite3",

@@ -7,6 +7,7 @@ import unittest
 from paperbase.config import AnswerGenerationSettings, ContextExpansionSettings
 from paperbase.generation.answer_generator import GroundedAnswerGenerator
 from paperbase.generation.section_expander import EvidenceUnit, SectionAwareNeighborExpander
+from paperbase.prompts.answer_generation import ANSWER_GENERATION_SYSTEM_PROMPT
 from paperbase.retrieval.hybrid_retriever import RetrievedChunk, RetrievalResult
 from paperbase.retrieval.query_rewriter import QueryRewritePlan
 
@@ -218,7 +219,7 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
 
     def test_uses_json_schema_and_accepts_only_known_citations(self) -> None:
         client = _FakeClient(
-            ['{"answer":"该方法使用动态图。[E1]","citations":[" E1 ","E1"],"insufficient_evidence":false}']
+            ['{"direct_answer":"该方法使用动态图。[E1]","evidence_explanation":"证据说明其使用动态图。[E1]","reading_interpretation":"这表示动态图是该方法的核心机制。[E1]","citations":[" E1 ","E1"],"insufficient_evidence":false}']
         )
         generator = GroundedAnswerGenerator(
             settings=AnswerGenerationSettings(),
@@ -228,12 +229,19 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
 
         self.assertEqual(outcome.status, "success")
         self.assertEqual(outcome.citations, ("E1",))
+        self.assertIn("### 论文中的依据与推导", outcome.answer or "")
         self.assertEqual(client.calls[0]["schema_name"], "paperbase_grounded_answer")
         self.assertEqual(client.calls[0]["json_schema"]["additionalProperties"], False)
 
+    def test_prompt_requests_reading_level_explanation(self) -> None:
+        """回答提示词应要求解释推导与含义，而不是只复制一行检索结论。"""
+        self.assertIn("阅读式解释深度", ANSWER_GENERATION_SYSTEM_PROMPT)
+        self.assertIn("公式、复杂度或定量结果问题", ANSWER_GENERATION_SYSTEM_PROMPT)
+        self.assertIn("### 论文中的依据与推导", ANSWER_GENERATION_SYSTEM_PROMPT)
+
     def test_rejects_fabricated_citation_and_falls_back_to_evidence(self) -> None:
         client = _FakeClient(
-            ['{"answer":"模型编造了来源。[E9]","citations":["E9"],"insufficient_evidence":false}']
+            ['{"direct_answer":"模型编造了来源。[E9]","evidence_explanation":"该结论来自不存在的来源。[E9]","reading_interpretation":null,"citations":["E9"],"insufficient_evidence":false}']
         )
         generator = GroundedAnswerGenerator(
             settings=AnswerGenerationSettings(),
@@ -249,8 +257,9 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
         """Pydantic 拒绝额外字段后，系统只保留证据，不再发起第二次 LLM 修复请求。"""
         client = _FakeClient(
             [
-                '{"answer":"有额外字段的回答 [E1]","citations":["E1"],'
-                '"insufficient_evidence":false,"unexpected":true}',
+                '{"direct_answer":"有额外字段的回答 [E1]",'
+                '"evidence_explanation":"依据说明。[E1]","reading_interpretation":null,'
+                '"citations":["E1"],"insufficient_evidence":false,"unexpected":true}',
             ]
         )
         generator = GroundedAnswerGenerator(
@@ -284,7 +293,7 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
 
     def test_conversation_context_is_passed_to_prompt_for_follow_up_resolution(self) -> None:
         client = _FakeClient(
-            ['{"answer":"该论文使用动态图。[E1]","citations":["E1"],"insufficient_evidence":false}']
+            ['{"direct_answer":"该论文使用动态图。[E1]","evidence_explanation":"证据描述了动态图的使用。[E1]","reading_interpretation":null,"citations":["E1"],"insufficient_evidence":false}']
         )
         generator = GroundedAnswerGenerator(
             settings=AnswerGenerationSettings(),
