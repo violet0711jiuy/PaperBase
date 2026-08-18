@@ -2,6 +2,9 @@
 # CUDA 版 PyTorch 已按本机显卡环境安装；不要通过此文件将其替换为 CPU 版本。
 docling==2.119.0
 PyYAML>=6.0,<7.0
+# PaperBase directly imports these packages (not only through transitive dependencies).
+numpy>=2.0,<3.0
+pydantic>=2.0,<3.0
 # Step 4 直接依赖其 SentenceTransformer 封装加载本地 Qwen3-Embedding 模型。
 sentence-transformers>=5.7,<6.0
 # Step 5 使用 CPU 版 FAISS 建立 MVP 的全局 IndexIDMap2(IndexFlatIP)；对当前小型知识库
@@ -10,3 +13,7 @@ faiss-cpu>=1.15,<2.0
 # Step 6 使用 ModelScope 的 OpenAI 兼容接口，并从本机未提交的 .env 加载密钥。
 openai>=2.0,<3.0
 python-dotenv>=1.0,<2.0
+# Streamlit frontend (Frontend Step 1/2：骨架、Knowledge Base Chat 与 Evidence UI）。
+streamlit>=1.61,<2.0
+# Test runner for the repository test suite.
+pytest>=9.0,<10.0

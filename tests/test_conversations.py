@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+import json
+import sqlite3
 
 from paperbase.config import QueryRewriteSettings
 from paperbase.conversations import (
@@ -71,6 +73,75 @@ class _RecordingGenerator:
 
 
 class ConversationStoreTests(unittest.TestCase):
+    def test_turn_evidence_snapshot_is_persisted_and_old_schema_migrates(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "conversations.sqlite3"
+            store = ConversationStore(path)
+            conversation = store.create_conversation("knowledge_base", "default")
+            snapshot = json.dumps(
+                [
+                    {
+                        "evidence_id": "E1",
+                        "type": "content",
+                        "paper_title": "示例论文",
+                        "raw_text": "证据原文",
+                    }
+                ],
+                ensure_ascii=False,
+            )
+            store.append_turn(
+                conversation.conversation_id,
+                user_query="问题",
+                assistant_answer="回答 [E1]",
+                evidence_json=snapshot,
+            )
+            self.assertEqual(
+                store.get_turns(conversation.conversation_id)[0].evidence_json,
+                snapshot,
+            )
+
+            # 模拟 Frontend Step 2 之前创建的旧 conversations.sqlite3，确认 initialize
+            # 只补列而不破坏已经存在的 User/Assistant 历史。
+            old_path = Path(temporary_directory) / "old.sqlite3"
+            connection = sqlite3.connect(old_path)
+            connection.executescript(
+                """
+                CREATE TABLE conversations (
+                    conversation_id TEXT PRIMARY KEY,
+                    scope_type TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE conversation_turns (
+                    turn_id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    turn_index INTEGER NOT NULL,
+                    user_query TEXT NOT NULL,
+                    assistant_answer TEXT NOT NULL,
+                    resolved_query TEXT,
+                    resolution_status TEXT,
+                    audit_path TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO conversations VALUES (?, ?, ?, ?, ?)",
+                ("old-c", "knowledge_base", "default", "now", "now"),
+            )
+            connection.execute(
+                "INSERT INTO conversation_turns VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("old-t", "old-c", 0, "旧问题", "旧回答", None, None, None, "now"),
+            )
+            connection.commit()
+            connection.close()
+
+            migrated = ConversationStore(old_path)
+            old_turn = migrated.get_turns("old-c")[0]
+            self.assertEqual(old_turn.assistant_answer, "旧回答")
+            self.assertIsNone(old_turn.evidence_json)
+
     def test_turns_survive_store_reinstantiation_and_keep_recent_order(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "conversations.sqlite3"
@@ -178,6 +249,23 @@ class ConversationStoreTests(unittest.TestCase):
             self.assertIn("User: ESDTW 的整体流程是什么？", retriever.contexts[1][0])
             self.assertIn("Assistant: 最终展示答案。", retriever.contexts[1][0])
             self.assertEqual(generator.contexts, [None, None])
+
+    def test_answer_service_can_use_formal_frontend_scope_without_changing_default(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            store = ConversationStore(Path(temporary_directory) / "conversations.sqlite3")
+            service = AnswerService(
+                retriever=_ContextRecordingRetriever(),
+                expander=_EmptyExpander(),  # type: ignore[arg-type]
+                generator=_RecordingGenerator(),  # type: ignore[arg-type]
+                conversation_store=store,
+                conversation_scope_id="paperbase_formal_knowledge_base",
+            )
+
+            result = service.answer_query("正式库问题")
+
+            self.assertIsNotNone(result.conversation_id)
+            record = store.get_conversation(result.conversation_id or "")
+            self.assertEqual(record.scope_id, "paperbase_formal_knowledge_base")
 
 
 if __name__ == "__main__":

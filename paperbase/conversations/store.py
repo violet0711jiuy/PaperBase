@@ -1,4 +1,8 @@
-"""Conversation Store：只保存最终可见回合，不保存检索证据或 LLM 原始输出。"""
+"""Conversation Store：保存最终可见回合和可展示的 Evidence 快照。
+
+Evidence 只保存回答实际使用的用户可见字段，不保存候选集、分数、向量或
+其它检索内部状态，因此不会改变 RAG 链路的审计边界。
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
+import json
 from typing import Iterator, Literal, Sequence
 from uuid import uuid4
 
@@ -35,7 +40,11 @@ class ConversationRecord:
 
 @dataclass(frozen=True)
 class ConversationTurn:
-    """一轮用户问题与最终展示答案；不复制 Evidence、chunk 或模型原始 JSON。"""
+    """一轮用户问题、最终展示答案和可选 Evidence 快照。
+
+    ``evidence_json`` 是 nullable 的 JSON 文本。旧数据库或旧 turn 没有该值
+    时保持 ``None``，页面会正常显示答案但不显示证据入口。
+    """
 
     turn_id: str
     conversation_id: str
@@ -46,6 +55,7 @@ class ConversationTurn:
     resolution_status: str | None
     audit_path: str | None
     created_at: str
+    evidence_json: str | None = None
 
 
 _SCHEMA_SQL = """
@@ -69,6 +79,7 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     resolved_query TEXT,
     resolution_status TEXT,
     audit_path TEXT,
+    evidence_json TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
     UNIQUE (conversation_id, turn_index),
@@ -99,6 +110,16 @@ class ConversationStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as connection:
             connection.executescript(_SCHEMA_SQL)
+            # 旧版本的 conversations.sqlite3 没有 evidence_json；使用幂等迁移，
+            # 不删除已有聊天记录，也不要求用户手动重建数据库。
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(conversation_turns)")
+            }
+            if "evidence_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN evidence_json TEXT"
+                )
 
     def create_conversation(
         self, scope_type: ConversationScopeType, scope_id: str
@@ -161,6 +182,30 @@ class ConversationStore:
             )
         return record
 
+    def list_conversations(
+        self,
+        scope_type: ConversationScopeType,
+        scope_id: str,
+    ) -> tuple[ConversationRecord, ...]:
+        """列出指定 scope 下的会话，最新有活动的会话排在前面。
+
+        这个查询只返回会话元数据，不读取 turn 正文；调用方如果需要历史，
+        再通过 ``get_turns`` 读取，从而保持列表和聊天内容的职责分离。
+        """
+        _validate_scope(scope_type, scope_id)
+        self.initialize()
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT conversation_id, scope_type, scope_id, created_at, updated_at
+                FROM conversations
+                WHERE scope_type = ? AND scope_id = ?
+                ORDER BY updated_at DESC, created_at DESC, conversation_id DESC
+                """,
+                (scope_type, scope_id.strip()),
+            ).fetchall()
+        return tuple(_conversation_from_row(row) for row in rows)
+
     def append_turn(
         self,
         conversation_id: str,
@@ -170,10 +215,15 @@ class ConversationStore:
         resolved_query: str | None = None,
         resolution_status: str | None = None,
         audit_path: str | None = None,
+        evidence_json: str | None = None,
     ) -> ConversationTurn:
-        """原子追加回合；turn_index 在同一会话中严格单调递增。"""
+        """原子追加回合；turn_index 在同一会话中严格单调递增。
+
+        ``evidence_json`` 只接受合法 JSON 文本；空值会以 SQL NULL 保存。
+        """
         normalized_user = _required_text(user_query, field_name="user_query")
         normalized_answer = _required_text(assistant_answer, field_name="assistant_answer")
+        normalized_evidence = _optional_json_text(evidence_json, field_name="evidence_json")
         self.initialize()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -202,13 +252,14 @@ class ConversationStore:
                     resolution_status=_optional_text(resolution_status),
                     audit_path=_optional_text(audit_path),
                     created_at=_utc_now(),
+                    evidence_json=normalized_evidence,
                 )
                 connection.execute(
                     """
                     INSERT INTO conversation_turns (
                         turn_id, conversation_id, turn_index, user_query, assistant_answer,
-                        resolved_query, resolution_status, audit_path, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        resolved_query, resolution_status, audit_path, evidence_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn.turn_id,
@@ -219,6 +270,7 @@ class ConversationStore:
                         turn.resolved_query,
                         turn.resolution_status,
                         turn.audit_path,
+                        turn.evidence_json,
                         turn.created_at,
                     ),
                 )
@@ -246,7 +298,7 @@ class ConversationStore:
             rows = connection.execute(
                 """
                 SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
-                       resolved_query, resolution_status, audit_path, created_at
+                       resolved_query, resolution_status, audit_path, evidence_json, created_at
                 FROM conversation_turns
                 WHERE conversation_id = ?
                 ORDER BY turn_index DESC
@@ -255,6 +307,23 @@ class ConversationStore:
                 (conversation_id, max_turns),
             ).fetchall()
         return tuple(_turn_from_row(row) for row in reversed(rows))
+
+    def get_turns(self, conversation_id: str) -> tuple[ConversationTurn, ...]:
+        """按完整会话顺序返回全部历史回合，供聊天历史恢复使用。"""
+        # 即使当前没有 turn，也先校验会话存在，避免无效 ID 被误当成空历史。
+        self.get_conversation(conversation_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
+                       resolved_query, resolution_status, audit_path, evidence_json, created_at
+                FROM conversation_turns
+                WHERE conversation_id = ?
+                ORDER BY turn_index ASC
+                """,
+                (conversation_id,),
+            ).fetchall()
+        return tuple(_turn_from_row(row) for row in rows)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -289,7 +358,12 @@ def _conversation_from_row(row: sqlite3.Row) -> ConversationRecord:
 
 
 def _turn_from_row(row: sqlite3.Row) -> ConversationTurn:
-    """集中转换 turn 行，保留可选审计字段的 null 语义。"""
+    """集中转换 turn 行，保留可选审计和 Evidence 字段的 null 语义。"""
+    try:
+        evidence_json = _optional_json_text(row["evidence_json"], field_name="evidence_json")
+    except ValueError:
+        # 外部旧脚本可能写入了损坏的快照；答案历史仍应可读，只跳过这条 Evidence。
+        evidence_json = None
     return ConversationTurn(
         turn_id=str(row["turn_id"]),
         conversation_id=str(row["conversation_id"]),
@@ -300,6 +374,7 @@ def _turn_from_row(row: sqlite3.Row) -> ConversationTurn:
         resolution_status=_optional_text(row["resolution_status"]),
         audit_path=_optional_text(row["audit_path"]),
         created_at=str(row["created_at"]),
+        evidence_json=evidence_json,
     )
 
 
@@ -324,6 +399,22 @@ def _optional_text(value: object) -> str | None:
         return None
     normalized = " ".join(str(value).split())
     return normalized or None
+
+
+def _optional_json_text(value: object, *, field_name: str) -> str | None:
+    """规范化 nullable JSON 文本，损坏的数据不会悄悄进入会话库。"""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    try:
+        json.loads(normalized)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{field_name} must contain valid JSON.") from error
+    return normalized
 
 
 def _utc_now() -> str:

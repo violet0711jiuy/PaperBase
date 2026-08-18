@@ -16,6 +16,7 @@ __pycache__/
 storage/papers/*
 storage/parsed/*
 storage/staging/*
+storage/knowledge_base_answers/*
 storage/*.faiss
 storage/*.faiss.manifest.json
 storage/*.faiss.pending.json

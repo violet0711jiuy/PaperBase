@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
 from typing import Sequence
 
 from paperbase.config import load_settings
-from paperbase.conversations import ConversationStore, format_turns_as_context
+from paperbase.conversations import (
+    FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
+    ConversationStore,
+    format_turns_as_context,
+)
 from paperbase.database import MetadataDatabase
 from paperbase.retrieval.hybrid_retriever import RetrievalResult
 from paperbase.retrieval.service import create_hybrid_retriever
@@ -38,6 +43,7 @@ class AnswerService:
         generator: GroundedAnswerGenerator,
         conversation_store: ConversationStore | None = None,
         conversation_max_context_turns: int = 0,
+        conversation_scope_id: str = "default",
         min_rerank_score: float = 0.05,
     ) -> None:
         self._retriever = retriever
@@ -45,6 +51,9 @@ class AnswerService:
         self._generator = generator
         self._conversation_store = conversation_store
         self._conversation_max_context_turns = conversation_max_context_turns
+        # 直接实例化 AnswerService 时保留旧的 default 行为；统一 factory 会使用正式 KB
+        # scope。这样旧的底层单元测试/调用仍可运行，同时产品入口不会再混用 scope。
+        self._conversation_scope_id = conversation_scope_id
         self._min_rerank_score = min_rerank_score
 
     def answer_query(
@@ -100,6 +109,11 @@ class AnswerService:
                 assistant_answer=answer.answer,
                 resolved_query=retrieval.rewrite_plan.resolved_query,
                 resolution_status=retrieval.rewrite_plan.resolution_status,
+                evidence_json=_evidence_snapshot_json(
+                    expansion,
+                    answer.citations,
+                    answer_status=answer.status,
+                ),
             )
         return AnswerServiceResult(
             retrieval=retrieval,
@@ -117,12 +131,14 @@ class AnswerService:
                 raise ValueError("Conversation Store is not configured for this AnswerService.")
             return None, ()
         if conversation_id is None:
-            record = self._conversation_store.create_conversation("knowledge_base", "default")
+            record = self._conversation_store.create_conversation(
+                "knowledge_base", self._conversation_scope_id
+            )
         else:
             record = self._conversation_store.get_conversation(
                 conversation_id,
                 expected_scope_type="knowledge_base",
-                expected_scope_id="default",
+                expected_scope_id=self._conversation_scope_id,
             )
         turns = self._conversation_store.get_recent_turns(
             record.conversation_id, self._conversation_max_context_turns
@@ -130,8 +146,53 @@ class AnswerService:
         return record.conversation_id, format_turns_as_context(turns)
 
 
-def create_answer_service(*, config_path: Path | str | None = None) -> AnswerService:
-    """从统一配置装配 Step 8；LLM 凭证仍只从项目根目录 .env 读取。"""
+def _evidence_snapshot_json(
+    expansion: ExpansionResult,
+    citations: Sequence[str] = (),
+    *,
+    answer_status: str | None = None,
+) -> str | None:
+    """把本轮最终可展示 Evidence 序列化为最小快照。
+
+    这里故意不保存 chunk、向量、候选集或分数，只保留前端需要恢复的论文定位
+    和原文；因此不会把 UI 持久化扩展成检索审计数据。
+    """
+    # 澄清和证据不足分支没有可展示的正常回答 Evidence；不要把检索候选误当成
+    # 这类 turn 的证据入口。disabled 分支则保留原文，提示用户可以直接阅读证据。
+    if answer_status in {"needs_clarification", "insufficient_evidence"}:
+        return None
+    citation_set = set(citations)
+    # 正常生成答案时只落正文实际引用的 E#/R#；无引用的降级答案仍保留检索到的
+    # 用户可读证据，方便“回答生成未启用”时查看原文。
+    selected_evidence = (
+        tuple(item for item in expansion.evidence if item.evidence_id in citation_set)
+        if citation_set
+        else expansion.evidence
+    )
+    evidence = []
+    for item in selected_evidence:
+        evidence.append(
+            {
+                "evidence_id": item.evidence_id,
+                "type": item.kind,
+                "paper_title": item.paper_title,
+                "section": item.section or None,
+                "page_start": item.page_start,
+                "page_end": item.page_end,
+                "raw_text": item.text,
+            }
+        )
+    if not evidence:
+        return None
+    return json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))
+
+
+def create_answer_service(
+    *,
+    config_path: Path | str | None = None,
+    conversation_scope_id: str = FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
+) -> AnswerService:
+    """从统一配置装配 Step 8，默认连接正式 Knowledge Base scope。"""
     settings = load_settings(config_path)
     database = MetadataDatabase(
         settings.database.path,
@@ -153,5 +214,6 @@ def create_answer_service(*, config_path: Path | str | None = None) -> AnswerSer
             busy_timeout_ms=settings.conversation.busy_timeout_ms,
         ),
         conversation_max_context_turns=settings.conversation.max_context_turns,
+        conversation_scope_id=conversation_scope_id,
         min_rerank_score=settings.answer_generation.min_rerank_score,
     )

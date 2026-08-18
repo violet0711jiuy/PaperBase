@@ -1,0 +1,5 @@
+# 关闭 Streamlit 根据 app/pages 目录自动生成的原生多页导航。
+# PaperBase 使用自定义中文 Sidebar 导航，因此页面只保留一套入口。
+[client]
+showSidebarNavigation = false
+toolbarMode = "minimal"

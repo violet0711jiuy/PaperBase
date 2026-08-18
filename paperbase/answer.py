@@ -9,6 +9,7 @@ import sys
 from typing import Sequence
 
 from paperbase.config import default_config_path
+from paperbase.conversations import FORMAL_KNOWLEDGE_BASE_SCOPE_ID
 from paperbase.generation.service import AnswerServiceResult, create_answer_service
 
 
@@ -24,6 +25,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--conversation-id",
         default=None,
         help="复用此前返回的 KB conversation_id；省略时自动创建新会话。",
+    )
+    parser.add_argument(
+        "--conversation-scope-id",
+        default=FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
+        help=(
+            "conversation 所属的 KB scope；默认使用正式 Knowledge Base。"
+            "旧的 default 会话可显式传入 --conversation-scope-id default。"
+        ),
     )
     parser.add_argument(
         "--context",
@@ -47,7 +56,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.top_k is not None and args.top_k < 1:
         parser.error("--top-k must be positive.")
-    result = create_answer_service(config_path=args.config).answer_query(
+    result = create_answer_service(
+        config_path=args.config,
+        conversation_scope_id=args.conversation_scope_id,
+    ).answer_query(
         args.query,
         conversation_id=args.conversation_id,
         conversation_context=args.context,
