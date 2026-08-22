@@ -45,6 +45,23 @@ class FrontMatterBlock:
 
 
 @dataclass(frozen=True)
+class FrontMatterHeading:
+    """被 Parser 确认属于前置元数据的 heading provenance。
+
+    ``FrontMatterBlock`` 保存可检索的文本内容；这个轻量记录保存标题自身在
+    Docling reading order 中的位置、页码和稳定语义类型。Section Tree 与 Chunker
+    只消费这份 Parser 决议，不需要各自重新猜测出版信息标题。
+    """
+
+    heading_text: str
+    block_type: str
+    canonical_section: str
+    page_start: int | None
+    page_end: int | None
+    reading_order: int
+
+
+@dataclass(frozen=True)
 class SectionRecord:
     """论文章节树中的一个真实 heading 节点。
 
@@ -97,6 +114,8 @@ class ParsedPaper:
     native_document: object
     # 默认空元组保持旧 Parser 与测试夹具兼容；DoclingParser 在 Step 2 会实际填充章节树。
     sections: tuple[SectionRecord, ...] = ()
+    # 保留被 Front Matter Resolver 确认的 heading provenance，供正文树和 Chunker 消费。
+    front_matter_headings: tuple[FrontMatterHeading, ...] = ()
 
 
 @runtime_checkable

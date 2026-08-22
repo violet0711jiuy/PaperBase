@@ -21,7 +21,14 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import DocItemLabel, DoclingDocument
 from docling_core.types.io import DocumentStream
 
-from .base import FrontMatterBlock, PageFurniture, PaperParser, ParsedPaper, SectionRecord
+from .base import (
+    FrontMatterBlock,
+    FrontMatterHeading,
+    PageFurniture,
+    PaperParser,
+    ParsedPaper,
+    SectionRecord,
+)
 
 
 # 标题 resolver 只识别“出版栏模式”，绝不维护具体期刊名白名单。键已去除大小写、
@@ -254,6 +261,7 @@ _FRONT_MATTER_HEADING_TYPES = {
     "indexterms": "keywords",
     "articleinfo": "article_info",
     "articleinformation": "article_info",
+    "articlehistory": "article_info",
     "authorinformation": "authors_affiliations",
     "authorsandaffiliations": "authors_affiliations",
     "pvdblreferenceformat": "publication_info",
@@ -564,12 +572,19 @@ class DoclingParser(PaperParser):
             )
         else:
             front_matter = ()
+        front_matter_headings = _resolve_front_matter_headings(
+            document=document,
+            front_matter=front_matter,
+            max_pages=self._settings.front_matter_max_pages,
+        )
         # 章节树只读取 Docling 已解析出的 heading、level、页码和阅读顺序；不修改原生树。
         sections = _build_section_records(
             document=document,
             paper_id=_paper_id(source),
             paper_title=paper_title,
             front_matter=front_matter,
+            front_matter_headings=front_matter_headings,
+            front_matter_max_pages=self._settings.front_matter_max_pages,
         )
 
         diagnostics: dict[str, int | str] = {
@@ -595,6 +610,7 @@ class DoclingParser(PaperParser):
             "docling.removed_page_furniture_count": removed_page_furniture_count,
             "docling.extracted_page_furniture_count": len(page_furniture),
             "docling.front_matter_block_count": len(front_matter),
+            "docling.front_matter_heading_count": len(front_matter_headings),
             "docling.formula_preset": self._settings.formula_preset,
             "docling.heading_hierarchy_enabled": str(
                 self._settings.enable_heading_hierarchy
@@ -617,6 +633,7 @@ class DoclingParser(PaperParser):
             diagnostics=diagnostics,
             native_document=document,
             sections=sections,
+            front_matter_headings=front_matter_headings,
         )
 
     def _build_converter(self) -> DocumentConverter:
@@ -1632,6 +1649,8 @@ def _build_section_records(
     paper_id: str,
     paper_title: str | None,
     front_matter: tuple[FrontMatterBlock, ...],
+    front_matter_headings: tuple[FrontMatterHeading, ...] = (),
+    front_matter_max_pages: int = 2,
 ) -> tuple[SectionRecord, ...]:
     """把 Docling 原生 heading level 转为解析器无关的完整正文 Section Tree。
 
@@ -1640,23 +1659,55 @@ def _build_section_records(
     新插入 heading 导致 level 缺失时，才以该 heading 自己已有的编号深度受控兜底。
     """
     front_matter_keys = {
-        _normalized_front_matter_label(block.canonical_section)
+        _normalized_front_matter_label(heading.heading_text)
+        for heading in front_matter_headings
+    }
+    # 兼容只构造 FrontMatterBlock 的旧 Parser/测试夹具；真实 DoclingParser 会提供
+    # 带 heading provenance 的记录，避免再从 Section Tree 反向猜类型。
+    front_matter_keys.update(
+        _normalized_front_matter_label(_FRONT_MATTER_HEADING_TEXT[block.block_type])
         for block in front_matter
+        if block.block_type in _FRONT_MATTER_HEADING_TEXT
+    )
+    front_matter_types = {
+        *(block.block_type for block in front_matter),
+        *(heading.block_type for heading in front_matter_headings),
     }
     title_key = _normalized_front_matter_label(paper_title or "")
     candidates: list[_SectionHeadingCandidate] = []
     last_front_matter_order = -1
+    # `iterate_items()` 的 tree level 是 provenance 的结构事实。即使双栏 PDF 的阅读
+    # 顺序把 ARTICLE HISTORY 排在 Introduction 后，只要它仍是前置元数据标题，子 heading
+    # 也会沿用这条已确认的 Front Matter 边界，而不会成为孤立正文节点。
+    heading_stack: list[tuple[int, bool]] = []
 
-    for reading_order, (item, _tree_level) in enumerate(document.iterate_items()):
+    for reading_order, (item, tree_level) in enumerate(document.iterate_items()):
         if getattr(item, "label", None) != DocItemLabel.SECTION_HEADER:
             continue
+        while heading_stack and heading_stack[-1][0] >= tree_level:
+            heading_stack.pop()
         text = _normalize_inline_whitespace(getattr(item, "text", "") or "")
         if not text:
             continue
         text_key = _normalized_front_matter_label(text)
-        if text_key in front_matter_keys:
-            # 只有实际写入 ParsedPaper.front_matter 的元数据才排除。不能仅因标题名称相同
-            # 就丢掉文末的 Data availability 等真实后置章节。
+        is_in_front_window = _item_is_in_front_matter_window(
+            document, item, front_matter_max_pages
+        )
+        parent_is_front_matter = bool(heading_stack and heading_stack[-1][1])
+        semantic_type = _front_matter_heading_type(text)
+        is_front_matter_heading = (
+            is_in_front_window
+            and (
+                text_key in front_matter_keys
+                or semantic_type in front_matter_types
+                # Resolver 的受控语义类型 + 页码 provenance 是 FMB 内容为空或被侧栏
+                # 容器吸收时的兜底；不依据“位于 Introduction 前”这类顺序猜测。
+                or semantic_type is not None
+                or parent_is_front_matter
+            )
+        )
+        heading_stack.append((tree_level, is_front_matter_heading))
+        if is_front_matter_heading:
             last_front_matter_order = reading_order
             continue
         if text_key == title_key or _NON_SECTION_HEADER.match(text):
@@ -1711,6 +1762,57 @@ def _build_section_records(
         sections.append(section)
         parent_stack.append(section)
     return tuple(sections)
+
+
+def _resolve_front_matter_headings(
+    *,
+    document: DoclingDocument,
+    front_matter: tuple[FrontMatterBlock, ...],
+    max_pages: int,
+) -> tuple[FrontMatterHeading, ...]:
+    """把 Front Matter Resolver 的标题决议保留为可审计的 Parser 结构数据。
+
+    标题需要同时满足：受控 Front Matter 语义、前置页码窗口，以及 Docling 自身的
+    heading/provenance。子 heading 只有在已确认的前置元数据 heading 之下且仍在窗口内
+    才继承该类型，避免侧栏 reading order 造成正文树污染。
+    """
+    resolved: list[FrontMatterHeading] = []
+    heading_stack: list[tuple[int, FrontMatterHeading | None]] = []
+    known_types = {block.block_type for block in front_matter}
+
+    for reading_order, (item, tree_level) in enumerate(document.iterate_items()):
+        if getattr(item, "label", None) != DocItemLabel.SECTION_HEADER:
+            continue
+        while heading_stack and heading_stack[-1][0] >= tree_level:
+            heading_stack.pop()
+        text = _normalize_inline_whitespace(getattr(item, "text", "") or "")
+        if not text or not _item_is_in_front_matter_window(document, item, max_pages):
+            heading_stack.append((tree_level, None))
+            continue
+
+        direct_type = _front_matter_heading_type(text)
+        parent_heading = heading_stack[-1][1] if heading_stack else None
+        block_type = direct_type or (
+            parent_heading.block_type if parent_heading is not None else None
+        )
+        # 明确 heading 的受控语义是主判据；已实际提取出的 FMB 类型提供额外一致性
+        # 证据。两者都缺失时，不能把普通正文标题写入这个 Parser 决议表。
+        if block_type is None or (block_type not in known_types and direct_type is None):
+            heading_stack.append((tree_level, None))
+            continue
+
+        pages = _item_pages(document, item)
+        record = FrontMatterHeading(
+            heading_text=text,
+            block_type=block_type,
+            canonical_section=_FRONT_MATTER_SECTION_NAMES[block_type],
+            page_start=pages[0] if pages else None,
+            page_end=pages[-1] if pages else None,
+            reading_order=reading_order,
+        )
+        resolved.append(record)
+        heading_stack.append((tree_level, record))
+    return tuple(resolved)
 
 
 def _body_section_start_offset(

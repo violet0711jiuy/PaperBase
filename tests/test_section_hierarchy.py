@@ -7,9 +7,19 @@ import unittest
 
 from docling_core.types.doc import DocItemLabel
 
-from paperbase.chunking.docling_hybrid_chunker import _section_id_from_headings
-from paperbase.parsing.base import FrontMatterBlock, SectionRecord
-from paperbase.parsing.docling_parser import _build_section_records
+from paperbase.chunking.docling_hybrid_chunker import (
+    _front_matter_heading_for_chunk,
+    _section_id_from_headings,
+)
+from paperbase.parsing.base import (
+    FrontMatterBlock,
+    FrontMatterHeading,
+    SectionRecord,
+)
+from paperbase.parsing.docling_parser import (
+    _build_section_records,
+    _resolve_front_matter_headings,
+)
 
 
 class SectionHierarchyTests(unittest.TestCase):
@@ -83,13 +93,127 @@ class SectionHierarchyTests(unittest.TestCase):
         self.assertIsNone(missing)
         self.assertEqual(algorithm, "paper_fixture_section_0005")
 
+    def test_late_reading_order_front_matter_parent_and_children_stay_out_of_body_tree(self) -> None:
+        """双栏侧栏可在 Introduction 后出现，但其自身 provenance 仍优先于阅读顺序。"""
+        document = _document(
+            _heading("1. Introduction", level=1, page=2, tree_level=1),
+            _heading("ARTICLEHISTORY", level=1, page=2, tree_level=1),
+            _heading("Publisher note", level=2, page=2, tree_level=2),
+            _heading("Keywords", level=2, page=2, tree_level=2),
+            _heading("2. Related work", level=1, page=4, tree_level=1),
+        )
+        front_matter = (
+            _front_matter("article_info", "Front matter > Article information"),
+            _front_matter("keywords", "Front matter > Keywords"),
+        )
+        front_matter_headings = _resolve_front_matter_headings(
+            document=document,
+            front_matter=front_matter,
+            max_pages=2,
+        )
+        sections = _build_section_records(
+            document=document,
+            paper_id="paper_fixture",
+            paper_title="Fixture paper",
+            front_matter=front_matter,
+            front_matter_headings=front_matter_headings,
+            front_matter_max_pages=2,
+        )
 
-def _heading(text: str, *, level: int, page: int) -> SimpleNamespace:
+        self.assertEqual(
+            [(heading.heading_text, heading.block_type) for heading in front_matter_headings],
+            [
+                ("ARTICLEHISTORY", "article_info"),
+                ("Publisher note", "article_info"),
+                ("Keywords", "keywords"),
+            ],
+        )
+        self.assertEqual(
+            [section.section_title for section in sections],
+            ["1. Introduction", "2. Related work"],
+        )
+
+    def test_front_matter_before_body_is_filtered_without_changing_body_hierarchy(self) -> None:
+        """常规首页元数据也走同一条页码、语义和 provenance 规则。"""
+        document = _document(
+            _heading("ARTICLE HISTORY", level=1, page=1, tree_level=1),
+            _heading("Keywords", level=2, page=1, tree_level=2),
+            _heading("1. Introduction", level=1, page=2, tree_level=1),
+            _heading("1.1 Contributions", level=2, page=2, tree_level=2),
+        )
+        front_matter = (
+            _front_matter("article_info", "Front matter > Article information"),
+            _front_matter("keywords", "Front matter > Keywords"),
+        )
+        headings = _resolve_front_matter_headings(
+            document=document, front_matter=front_matter, max_pages=2
+        )
+        sections = _build_section_records(
+            document=document,
+            paper_id="paper_fixture",
+            paper_title="Fixture paper",
+            front_matter=front_matter,
+            front_matter_headings=headings,
+            front_matter_max_pages=2,
+        )
+        self.assertEqual(
+            [section.section_title for section in sections],
+            ["1. Introduction", "1.1 Contributions"],
+        )
+        self.assertEqual(sections[1].parent_section_id, sections[0].section_id)
+
+    def test_normal_body_heading_on_early_page_is_not_removed_by_front_matter_filter(self) -> None:
+        """前置页码窗口本身不能删除普通正文标题或字符串相近的标题。"""
+        document = _document(
+            _heading("1. Introduction", level=1, page=1, tree_level=1),
+            _heading("Keywords analysis for model selection", level=2, page=1, tree_level=2),
+            _heading("2. Methodology", level=1, page=3, tree_level=1),
+        )
+        sections = _build_section_records(
+            document=document,
+            paper_id="paper_fixture",
+            paper_title="Fixture paper",
+            front_matter=(),
+            front_matter_headings=(),
+            front_matter_max_pages=2,
+        )
+        self.assertEqual(
+            [section.section_title for section in sections],
+            [
+                "1. Introduction",
+                "Keywords analysis for model selection",
+                "2. Methodology",
+            ],
+        )
+
+    def test_chunk_front_matter_match_uses_parser_heading_provenance(self) -> None:
+        """Chunker 仅消费 Parser 决议，前置 chunk 不会错误绑定 Introduction。"""
+        record = FrontMatterHeading(
+            heading_text="Article information",
+            block_type="article_info",
+            canonical_section="Front matter > Article information",
+            page_start=2,
+            page_end=2,
+            reading_order=8,
+        )
+        matched = _front_matter_heading_for_chunk(
+            headings=["1. Introduction", "Article information"],
+            page_start=2,
+            page_end=2,
+            front_matter_headings=(record,),
+        )
+        self.assertEqual(matched, record)
+
+
+def _heading(
+    text: str, *, level: int, page: int, tree_level: int = 1
+) -> SimpleNamespace:
     """构造带原生 heading level 与 provenance 的最小 Docling 标题替身。"""
     return SimpleNamespace(
         label=DocItemLabel.SECTION_HEADER,
         text=text,
         level=level,
+        tree_level=tree_level,
         prov=[SimpleNamespace(page_no=page)],
         children=[],
     )
@@ -97,7 +221,9 @@ def _heading(text: str, *, level: int, page: int) -> SimpleNamespace:
 
 def _document(*items: SimpleNamespace) -> SimpleNamespace:
     """以固定 reading order 返回标题，模拟本轮实际消费的 Docling 接口。"""
-    return SimpleNamespace(iterate_items=lambda: iter((item, 1) for item in items))
+    return SimpleNamespace(
+        iterate_items=lambda: iter((item, item.tree_level) for item in items)
+    )
 
 
 def _front_matter(block_type: str, canonical_section: str) -> FrontMatterBlock:

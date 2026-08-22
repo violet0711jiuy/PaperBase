@@ -11,7 +11,12 @@ from docling.chunking import HybridChunker
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from docling_core.types.doc import DoclingDocument
 
-from paperbase.parsing.base import FrontMatterBlock, ParsedPaper, SectionRecord
+from paperbase.parsing.base import (
+    FrontMatterBlock,
+    FrontMatterHeading,
+    ParsedPaper,
+    SectionRecord,
+)
 
 from .base import ChunkingResult, PaperChunk, PaperChunker
 
@@ -72,11 +77,21 @@ class DoclingHybridPaperChunker(PaperChunker):
             if not raw_text:
                 # 空对象对向量检索没有意义，也不能提供有效证据，因此不建立空 chunk。
                 continue
-            section = _section_from_headings(
-                docling_chunk.meta.headings,
-                sections=parsed_paper.sections,
-            )
             page_start, page_end = _page_range(docling_chunk)
+            front_matter_heading = _front_matter_heading_for_chunk(
+                headings=docling_chunk.meta.headings,
+                page_start=page_start,
+                page_end=page_end,
+                front_matter_headings=parsed_paper.front_matter_headings,
+            )
+            section = (
+                front_matter_heading.canonical_section
+                if front_matter_heading is not None
+                else _section_from_headings(
+                    docling_chunk.meta.headings,
+                    sections=parsed_paper.sections,
+                )
+            )
             if _is_layout_noise_chunk(
                 raw_text=raw_text,
                 section=section,
@@ -91,19 +106,27 @@ class DoclingHybridPaperChunker(PaperChunker):
                 section=section,
                 raw_text=raw_text,
             )
-            front_matter_type = _front_matter_type_for_chunk(
-                section=section,
-                page_start=page_start,
-                page_end=page_end,
-                front_matter_blocks=parsed_paper.front_matter,
+            front_matter_type = (
+                front_matter_heading.block_type
+                if front_matter_heading is not None
+                else _front_matter_type_for_chunk(
+                    section=section,
+                    page_start=page_start,
+                    page_end=page_end,
+                    front_matter_blocks=parsed_paper.front_matter,
+                )
             )
             # 基于 Docling 已恢复的标题层级分类，而非在段落正文中搜索 “references”。
             # 因此 “Related Work” 即使讨论引用，也仍然是正文 content。
             section_type = _section_type_from_headings(docling_chunk.meta.headings)
-            section_id = _section_id_from_headings(
-                headings=docling_chunk.meta.headings,
-                sections=parsed_paper.sections,
-                page_start=page_start,
+            section_id = (
+                None
+                if front_matter_type is not None
+                else _section_id_from_headings(
+                    headings=docling_chunk.meta.headings,
+                    sections=parsed_paper.sections,
+                    page_start=page_start,
+                )
             )
             draft_chunks.append(
                 _DraftChunk(
@@ -300,6 +323,31 @@ def _section_id_from_headings(
                 ).section_id
         return candidates[-1].section_id
     # front matter、bibliography 或无标题的出版栏不强行猜测 section_id。
+    return None
+
+
+def _front_matter_heading_for_chunk(
+    *,
+    headings: list[str] | None,
+    page_start: int | None,
+    page_end: int | None,
+    front_matter_headings: tuple[FrontMatterHeading, ...],
+) -> FrontMatterHeading | None:
+    """仅匹配 Parser 已确认的前置 heading，不在 Chunker 内重新分类文本。"""
+    if not headings or not front_matter_headings:
+        return None
+    for heading in reversed(headings):
+        heading_key = _normalized_heading_key(heading)
+        matches = [
+            record
+            for record in front_matter_headings
+            if _normalized_heading_key(record.heading_text) == heading_key
+            and _page_ranges_overlap(
+                page_start, page_end, record.page_start, record.page_end
+            )
+        ]
+        if matches:
+            return max(matches, key=lambda record: record.reading_order)
     return None
 
 

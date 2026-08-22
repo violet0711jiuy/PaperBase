@@ -20,6 +20,8 @@ class FrontMatterHelperTests(unittest.TestCase):
         self.assertEqual(_front_matter_heading_type("A B S T R A C T"), "abstract")
         self.assertEqual(_front_matter_heading_type("PVLDBReference Format:"), "publication_info")
         self.assertEqual(_front_matter_heading_type("Data Availability"), "availability")
+        self.assertEqual(_front_matter_heading_type("ARTICLE HISTORY"), "article_info")
+        self.assertEqual(_front_matter_heading_type("ARTICLEHISTORY"), "article_info")
         self.assertIsNone(_front_matter_heading_type("2. Materials and Methods"))
 
     def test_inline_abstract_and_keywords_need_explicit_labels(self) -> None:
