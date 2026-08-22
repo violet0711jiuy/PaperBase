@@ -6,8 +6,8 @@
 2. 初始化 Streamlit 页面和会话状态；
 3. 根据全局导航的选择渲染 Knowledge Base 或 Paper Workspace。
 
-当前版本接入 Knowledge Base 多会话问答；Paper Workspace 的 Overview、Explain Section
-和 Ask This Paper 仍保持前端占位，等待后续步骤接入。
+当前版本接入 Knowledge Base 多会话问答、Paper Overview、Explain Section 和
+Paper Workspace 的 Ask This Paper；各页面仍通过 Service Layer 调用后端能力。
 """
 
 # 允许使用 ``from __future__`` 的类型标注语法，同时不影响旧版本 Python 的解析方式。
@@ -67,12 +67,14 @@ def main() -> None:
     if current_page == KNOWLEDGE_BASE_PAGE:
         with context_column:
             knowledge_base.render_context_panel(service)
-        with main_column:
+        # 两个页面共用同一张主内容卡片。页面模块只提供业务内容，避免它们
+        # 各自用 CSS 猜测右栏边界，从而造成布局和滚动规则互相污染。
+        with main_column, st.container(key="pb-main-card"):
             knowledge_base.render_main_panel(service)
     else:
         with context_column:
             paper_workspace.render_context_panel(service)
-        with main_column:
+        with main_column, st.container(key="pb-main-card"):
             paper_workspace.render_main_panel(service)
 
 if __name__ == "__main__":

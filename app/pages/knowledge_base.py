@@ -9,6 +9,12 @@ import re
 import streamlit as st
 
 if __package__ == "app.pages":
+    from app.components.answer_sections import split_answer_sections as _split_answer_sections
+    from app.components.evidence_preview import build_evidence_preview
+    from app.components.scientific_text import (
+        normalize_scientific_text as _normalize_scientific_text,
+        render_scientific_text as _render_scientific_text,
+    )
     from app.services.paperbase_service import (
         FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
         KnowledgeBaseConversation,
@@ -17,6 +23,12 @@ if __package__ == "app.pages":
         PaperBaseService,
     )
 else:
+    from components.answer_sections import split_answer_sections as _split_answer_sections
+    from components.evidence_preview import build_evidence_preview
+    from components.scientific_text import (
+        normalize_scientific_text as _normalize_scientific_text,
+        render_scientific_text as _render_scientific_text,
+    )
     from services.paperbase_service import (
         FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
         KnowledgeBaseConversation,
@@ -26,17 +38,31 @@ else:
     )
 
 
-def _render_conversation(service: PaperBaseService, conversation_id: str) -> None:
-    """从 ConversationStore 读取并渲染完整 User/Assistant 历史。
+def _avatar_html(kind: str) -> str:
+    """返回稳定的内联 SVG 头像，避免不同系统 emoji 造成布局跳动。"""
+    if kind == "user":
+        return (
+            "<div class='pb-avatar pb-avatar-user' aria-label='用户头像'>"
+            "<svg viewBox='0 0 24 24' aria-hidden='true'>"
+            "<circle cx='12' cy='8' r='4.1' fill='currentColor'/>"
+            "<path d='M4.8 20c.45-4.2 3.05-6.3 7.2-6.3s6.75 2.1 7.2 6.3' "
+            "fill='currentColor'/></svg></div>"
+        )
+    return (
+        "<div class='pb-avatar pb-avatar-assistant' aria-label='PaperBase 头像'>"
+        "<svg viewBox='0 0 28 28' aria-hidden='true'>"
+        "<rect class='sq-a' x='4' y='4' width='10' height='13' rx='1.6'/>"
+        "<rect class='sq-b' x='9' y='7' width='10' height='13' rx='1.6'/>"
+        "<rect class='sq-c' x='14' y='10' width='10' height='13' rx='1.6'/>"
+        "</svg></div>"
+    )
 
-    每一轮消息都是一组普通的 ``st.columns``：用户是“留白 / 气泡 / 头像”，
-    PaperBase 是“头像 / 气泡 /
-    留白”。这样头像只由一个 Streamlit markdown 控件绘制，不需要隐藏或
-    重排 Streamlit 内置头像。
-    """
+
+def _render_conversation(service: PaperBaseService, conversation_id: str) -> None:
+    """恢复完整历史，并按右侧用户 / 左侧 PaperBase 的聊天布局展示。"""
     try:
         turns = service.get_conversation_turns(conversation_id)
-    except Exception as error:  # noqa: BLE001 - 会话被删除或 scope 错误时安全降级。
+    except Exception as error:  # noqa: BLE001 - 会话失效时安全降级。
         st.warning(f"当前会话暂时无法读取：{_friendly_error(error)}")
         return
 
@@ -47,49 +73,42 @@ def _render_conversation(service: PaperBaseService, conversation_id: str) -> Non
     for turn in turns:
         message_time = _conversation_timestamp(turn.created_at)
 
-        # 用户消息：右侧气泡，头像单独放在最右列。
-        user_spacer, user_bubble, user_avatar = st.columns(
-            [0.42, 0.52, 0.06], gap="small", vertical_alignment="top"
+        # 用户消息：名称/时间放在气泡上方，头像与气泡属于同一行。
+        user_spacer, user_group, user_avatar = st.columns(
+            [0.35, 0.59, 0.06], gap="small", vertical_alignment="top"
         )
         user_spacer.empty()
-        with user_bubble:
-            with st.container(border=True, key=f"kb-user-bubble-{turn.turn_id}"):
-                st.markdown(
-                    "<div class='pb-message-header pb-user-header'>"
-                    f"<span>你</span><span class='pb-message-time'>{escape(message_time)}</span></div>",
-                    unsafe_allow_html=True,
-                )
+        with user_group:
+            st.markdown(
+                "<div class='pb-message-header pb-user-header'>"
+                f"<span>你</span><span class='pb-message-time'>{escape(message_time)}</span></div>",
+                unsafe_allow_html=True,
+            )
+            with st.container(border=False, key=f"kb-user-bubble-{turn.turn_id}"):
                 _render_scientific_text(turn.user_query)
         with user_avatar:
-            st.markdown(
-                "<div class='pb-chat-avatar pb-user-avatar'>👤</div>",
-                unsafe_allow_html=True,
-            )
+            st.markdown(_avatar_html("user"), unsafe_allow_html=True)
 
-        # PaperBase 消息：左侧头像，中间回答气泡，右侧留白。
-        assistant_avatar, assistant_bubble, assistant_spacer = st.columns(
-            [0.055, 0.80, 0.145], gap="small", vertical_alignment="top"
+        # PaperBase 消息：头像在左，名称/时间位于回答卡片上方。
+        assistant_avatar, assistant_group, assistant_spacer = st.columns(
+            [0.06, 0.84, 0.10], gap="small", vertical_alignment="top"
         )
         with assistant_avatar:
+            st.markdown(_avatar_html("assistant"), unsafe_allow_html=True)
+        with assistant_group:
             st.markdown(
-                "<div class='pb-chat-avatar pb-assistant-avatar'>📚</div>",
+                "<div class='pb-message-header pb-assistant-header'>"
+                "<span>PaperBase</span>"
+                f"<span class='pb-message-time'>{escape(message_time)}</span></div>",
                 unsafe_allow_html=True,
             )
-        with assistant_bubble:
-            with st.container(border=True, key=f"kb-assistant-bubble-{turn.turn_id}"):
-                st.markdown(
-                    "<div class='pb-message-header pb-assistant-header'>"
-                    "<span>PaperBase</span>"
-                    f"<span class='pb-message-time'>{escape(message_time)}</span></div>",
-                    unsafe_allow_html=True,
-                )
+            with st.container(border=False, key=f"kb-assistant-bubble-{turn.turn_id}"):
                 _render_answer_body(turn.assistant_answer)
                 is_unresolved = turn.resolution_status == "unresolved"
                 if is_unresolved:
                     st.info("这是后端根据当前上下文返回的澄清提示，请补充明确的论文或主题。")
                 metadata = service.get_conversation_turn_metadata(turn)
                 _render_answer_status(metadata, turn.assistant_answer, is_unresolved=is_unresolved)
-                # Evidence 从 Service 的快照读取，不根据 [E#]/[R#] 重新检索。
                 evidence = service.get_conversation_turn_evidence(turn)
                 _render_evidence(
                     evidence,
@@ -98,7 +117,6 @@ def _render_conversation(service: PaperBaseService, conversation_id: str) -> Non
                     citations=_citation_ids(turn.assistant_answer),
                 )
         assistant_spacer.empty()
-
 
 def _render_answer_body(answer: str) -> None:
     """把后端固定排版的答案拆成更易读的直接回答、说明和理解层级。"""
@@ -123,75 +141,6 @@ def _render_answer_section(title: str, body: str, *, muted: bool = False) -> Non
     )
     _render_scientific_text(body)
 
-
-def _render_scientific_text(text: str) -> None:
-    r"""统一渲染普通文字和 KaTeX 科学公式。
-
-    Streamlit Markdown 原生支持 ``$...$``/``$$...$$``。后端有时使用 LaTeX
-    的 ``\(...\)``/``\[...\]`` 写法，这里只标准化定界符，不改动公式内容。
-    未加定界符的复杂度表达式 ``O(N^2)`` 也会被包成行内公式。
-    """
-    st.markdown(_normalize_scientific_text(text))
-
-
-def _normalize_scientific_text(text: str) -> str:
-    """把常见 LaTeX 定界符转换为 Streamlit Markdown/KaTeX 可识别形式。"""
-    normalized = text or ""
-    normalized = re.sub(r"\\\((.*?)\\\)", r"$\1$", normalized, flags=re.DOTALL)
-    normalized = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", normalized, flags=re.DOTALL)
-    # 只处理没有处在 $ 定界符中的常见复杂度表达式，避免重复包裹已有公式。
-    normalized = re.sub(
-        r"(?<![$\\])\bO\([^\n)]{1,80}\)",
-        lambda match: f"${match.group(0)}$",
-        normalized,
-    )
-    return normalized
-
-
-def _split_answer_sections(answer: str) -> dict[str, str]:
-    """识别现有后端答案中的小标题；无标题的降级答案保持完整显示。"""
-    sections = {"direct": "", "explanation": "", "interpretation": "", "coverage": ""}
-    # 兼容历史答案把下一个 ``###`` 标题拼在同一行的情况；先把它规范到新行，
-    # 这样前端不会把 Markdown 标记原样暴露给用户。
-    normalized_answer = re.sub(r"[ \t]+###\s+", "\n### ", answer.strip())
-    matches = list(re.finditer(r"(?m)^###\s+(.+?)\s*$", normalized_answer))
-    if not matches:
-        sections["direct"] = normalized_answer
-        return sections
-
-    heading_map = {
-        "直接回答": "direct",
-        "论文中的依据与推导": "explanation",
-        "如何理解": "interpretation",
-        "证据覆盖说明": "coverage",
-        "direct answer": "direct",
-        "evidence explanation": "explanation",
-        "reading interpretation": "interpretation",
-        "coverage note": "coverage",
-    }
-    unknown_parts: list[str] = []
-    for index, match in enumerate(matches):
-        heading = match.group(1).strip()
-        body_start = match.end()
-        body_end = (
-            matches[index + 1].start()
-            if index + 1 < len(matches)
-            else len(normalized_answer)
-        )
-        body = normalized_answer[body_start:body_end].strip()
-        section_key = heading_map.get(heading.casefold(), heading_map.get(heading))
-        if section_key is None:
-            unknown_parts.append(f"{heading}\n{body}" if body else heading)
-        elif body:
-            sections[section_key] = (
-                f"{sections[section_key]}\n\n{body}" if sections[section_key] else body
-            )
-    if unknown_parts:
-        unknown_text = "\n\n".join(unknown_parts)
-        sections["direct"] = (
-            f"{sections['direct']}\n\n{unknown_text}" if sections["direct"] else unknown_text
-        )
-    return sections
 
 
 def _render_answer_status(
@@ -248,7 +197,7 @@ def _render_evidence(
                 )
                 state_key = _evidence_state_key(conversation_id, turn_id, item.evidence_id)
                 expanded = bool(st.session_state.get(state_key, False))
-                preview, truncated = _truncate_evidence(item.text)
+                preview, truncated = build_evidence_preview(item.text)
                 _render_scientific_text(item.text if expanded else preview)
                 if truncated:
                     # Streamlit 按钮触发 rerun；状态 key 同时包含会话、回合和 Evidence ID，
@@ -268,23 +217,6 @@ def _evidence_state_key(conversation_id: str, turn_id: str, evidence_id: str) ->
     """生成每条证据独立的展开状态 key，避免跨会话/跨回合串状态。"""
     return f"kb_evidence_expanded::{conversation_id}::{turn_id}::{evidence_id}"
 
-
-def _truncate_evidence(text: str, limit: int = 620) -> tuple[str, bool]:
-    """默认预览最多两个完整句子；没有句号时再使用安全字符上限。"""
-    normalized = " ".join((text or "").split())
-    # 中英文论文原文常混用标点；优先保留完整句子，避免在术语中间截断。
-    pieces = [part.strip() for part in re.split(r"(?<=[。！？!?])\s*|(?<=[.!?])\s+", normalized) if part.strip()]
-    if pieces:
-        preview = " ".join(pieces[:2]).strip()
-        if preview and len(pieces) > 2:
-            return f"{preview}…", True
-        if preview and len(normalized) <= limit:
-            return normalized, False
-        if preview and len(preview) <= limit:
-            return f"{preview}…", True
-    if len(normalized) <= limit:
-        return normalized, False
-    return f"{normalized[:limit].rstrip()}…", True
 
 
 def _ensure_active_conversation(
@@ -413,14 +345,13 @@ def _render_context_content(
 ) -> str | None:
     """绘制 Knowledge Base 的会话、论文和新建会话控件。"""
     st.markdown(
-        "<div class='pb-pane-kicker'>当前工作区</div>"
+        "<div class='pb-kb-context-heading'><div class='pb-pane-kicker'>当前工作区</div>"
         "<div class='pb-pane-title'>知识库</div>"
-        "<div class='pb-pane-subtitle'>跨论文检索与问答</div>",
+        "<div class='pb-pane-subtitle'>跨论文检索与问答</div></div>",
         unsafe_allow_html=True,
     )
     st.markdown(
-        f"<div class='pb-context-stat'><span>▤</span>"
-        f"{len(papers)} 篇论文</div>",
+        f"<div class='pb-context-stat'>已入库论文 · {len(papers)} 篇</div>",
         unsafe_allow_html=True,
     )
     with st.container(key="kb-new-chat"):
@@ -439,7 +370,7 @@ def _render_context_content(
                 st.rerun()
 
     st.markdown(
-        "<div class='pb-panel-divider'></div><div class='pb-context-section-title'>会话</div>",
+        "<div class='pb-panel-divider'></div><div class='pb-context-section-title'>会话列表</div>",
         unsafe_allow_html=True,
     )
     with st.container(key="kb-conversation-list"):
@@ -457,17 +388,20 @@ def _render_context_content(
         else:
             st.caption("还没有会话。点击上方按钮开始。")
 
-    with st.expander(f"已入库论文（{len(papers)}）", expanded=False):
-        if papers:
-            for paper in papers:
-                st.markdown(
-                    f"<div class='pb-paper-item'><div class='pb-paper-item-title'>"
-                    f"{escape(paper.display_title)}</div><div class='pb-paper-item-meta'>"
-                    f"{paper.total_chunk_count} 个分块</div></div>",
-                    unsafe_allow_html=True,
-                )
-        else:
-            st.info("正式知识库中还没有论文。")
+    # 已入库论文属于知识库上下文而非主聊天内容；保留折叠交互，避免在会话
+    # 较多时抢占第二栏的可用高度。
+    with st.container(key="kb-paper-library"):
+        with st.expander(f"已入库论文（{len(papers)}）", expanded=True):
+            if papers:
+                for paper in papers:
+                    st.markdown(
+                        f"<div class='pb-paper-item'><div class='pb-paper-item-title'>"
+                        f"{escape(paper.display_title)}</div><div class='pb-paper-item-meta'>"
+                        f"{paper.total_chunk_count} 个分块</div></div>",
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.info("正式知识库中还没有论文。")
     return active_conversation_id
 
 
@@ -506,18 +440,17 @@ def _render_chat_panel(
         "<div class='pb-chat-topline'><div><div class='pb-chat-title'>"
         f"{title}</div><div class='pb-chat-subtitle'>"
         "Knowledge Base · 跨论文检索、比较并追问</div></div>"
-        "<div class='pb-chat-status'>◷&nbsp; 历史自动恢复</div></div>",
+        "<div class='pb-chat-status'>历史自动恢复</div></div>",
         unsafe_allow_html=True,
     )
     st.markdown("<div class='pb-chat-divider'></div>", unsafe_allow_html=True)
     # 只保留 Streamlit 原生 height container 作为唯一的消息滚动层。
-    with st.container(border=False, key="kb-message-scroll"):
+    with st.container(height=640, border=False, key="kb-message-scroll"):
         if conversation_id:
             _render_conversation(service, conversation_id)
         else:
             st.markdown(
-                "<div class='pb-empty-chat'><div class='pb-empty-icon'>✦</div>"
-                "<div class='pb-empty-title'>从一个新会话开始</div>"
+                "<div class='pb-empty-chat'><div class='pb-empty-title'>从一个新会话开始</div>"
                 "<div class='pb-empty-copy'>在左侧创建会话，然后向知识库提问。</div></div>",
                 unsafe_allow_html=True,
             )
@@ -530,7 +463,7 @@ def _render_chat_panel(
         with input_column:
             query = st.text_input(
                 "向知识库提问",
-                placeholder="📎  向知识库提问，例如：ESDTW 和 DTW 有什么区别？",
+                placeholder="向知识库提问，例如：ESDTW 和 DTW 有什么区别？",
                 label_visibility="collapsed",
                 disabled=conversation_id is None,
             )

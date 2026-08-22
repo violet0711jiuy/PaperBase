@@ -308,6 +308,32 @@ class ConversationStore:
             ).fetchall()
         return tuple(_turn_from_row(row) for row in reversed(rows))
 
+    def update_turn_evidence(self, turn_id: str, evidence_json: str | None) -> ConversationTurn:
+        """为已经追加的回合补写可展示 Evidence 快照。
+
+        Ask This Paper 的现有后端会先追加带 ``audit_path`` 的 turn，再落盘完整
+        ask_paper 工件；UI 适配层可以随后把最小 Evidence snapshot 写入同一行，
+        从而让历史页面不必重新读取或重新检索。其它 turn 字段保持不变。
+        """
+        normalized_evidence = _optional_json_text(evidence_json, field_name="evidence_json")
+        self.initialize()
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE conversation_turns SET evidence_json = ? WHERE turn_id = ?",
+                (normalized_evidence, turn_id),
+            )
+            row = connection.execute(
+                """
+                SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
+                       resolved_query, resolution_status, audit_path, evidence_json, created_at
+                FROM conversation_turns WHERE turn_id = ?
+                """,
+                (turn_id,),
+            ).fetchone()
+        if row is None:
+            raise ConversationStoreError(f"Conversation turn does not exist: {turn_id}")
+        return _turn_from_row(row)
+
     def get_turns(self, conversation_id: str) -> tuple[ConversationTurn, ...]:
         """按完整会话顺序返回全部历史回合，供聊天历史恢复使用。"""
         # 即使当前没有 turn，也先校验会话存在，避免无效 ID 被误当成空历史。

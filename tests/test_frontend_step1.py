@@ -8,7 +8,12 @@ from app.services.paperbase_service import (
     FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
     PaperBaseService,
 )
-from app.state import activate_workspace, initialize_session_state, set_workspace_conversation
+from app.state import (
+    activate_workspace,
+    clear_deleted_workspace,
+    initialize_session_state,
+    set_workspace_conversation,
+)
 from paperbase.config import load_settings
 
 
@@ -63,6 +68,30 @@ def test_workspace_state_restores_only_the_matching_workspace_conversation() -> 
     )
     activate_workspace(state, "staging_one")
     assert state["paper_conversation_id"] == "conversation_one"
+
+
+def test_deleting_workspace_only_clears_its_own_ui_state() -> None:
+    """删除当前 staging 论文不能误清理另一篇论文的会话选择。"""
+    state: dict[str, object] = {}
+    initialize_session_state(state)
+    activate_workspace(state, "staging_one")
+    set_workspace_conversation(
+        state, workspace_id="staging_one", conversation_id="conversation_one"
+    )
+    set_workspace_conversation(
+        state, workspace_id="staging_two", conversation_id="conversation_two"
+    )
+    state["workspace_delete_confirmation_id"] = "staging_one"
+
+    clear_deleted_workspace(state, "staging_one")
+
+    assert state["active_workspace_id"] is None
+    assert state["paper_conversation_id"] is None
+    assert state["selected_section_id"] is None
+    assert state["workspace_delete_confirmation_id"] is None
+    assert state["paper_conversation_ids_by_workspace"] == {
+        "staging_two": "conversation_two"
+    }
 
 
 def _temporary_settings(tmp_path):

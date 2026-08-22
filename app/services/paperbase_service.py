@@ -3,7 +3,7 @@
 这里把后端对象转换成适合页面展示的视图模型，避免页面直接接触 SQLite 行、
 FAISS 对象或 staging JSON。Knowledge Base 页面通过这里创建/切换会话、调用正式
 问答链路并恢复 Evidence；Paper Workspace 的 Overview、Explain Section 和 Ask
-This Paper 业务仍不在本轮接入。
+This Paper 都通过这里适配现有后端流程。
 """
 
 # 延迟解析类型标注。
@@ -11,15 +11,22 @@ from __future__ import annotations
 
 # ``dataclass`` 用来定义页面需要的不可变视图模型。
 from dataclasses import dataclass
+# ``hashlib`` 用于定位后端 Explain artifact 的稳定文件名。
+import hashlib
 # ``json`` 用来读取受控的 workspace manifest 和解析标题文件。
 import json
 # ``Path`` 用来安全地拼接、校验和读取项目内路径。
 from pathlib import Path
 # 这里的 SQLite 连接只用于正式库论文元数据展示，不加载 FAISS 或检索器。
 import sqlite3
+# ``TemporaryDirectory`` 用于保存网页上传的短生命周期副本；真正的 staging
+# workspace 仍然只由后端写入配置指定的 storage/staging。
+from tempfile import TemporaryDirectory
 
 # AppSettings 是后端统一配置模型，load_settings 读取项目 config.yaml。
 from paperbase.config import AppSettings, load_settings
+# 直接复用 staging 论文问答服务，不在前端复制检索或答案生成逻辑。
+from paperbase.ask_paper import AskThisPaperResult, create_ask_this_paper_service
 # ConversationStore 负责持久化 conversation，ConversationRecord 是轻量元数据对象。
 from paperbase.conversations import (
     FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
@@ -30,6 +37,26 @@ from paperbase.conversations import (
 from paperbase.generation import AnswerServiceResult, create_answer_service
 # MetadataDatabase 复用后端已有的数据库初始化和单论文读取能力。
 from paperbase.database import MetadataDatabase
+from paperbase.overview.service import (
+    PaperOverview,
+    PaperOverviewError,
+    run_paper_overview_stage,
+)
+from paperbase.explain_section.service import (
+    ExplainSection,
+    ExplainSectionError,
+    run_explain_section_stage,
+)
+# Promotion 负责把 staging 中已经完成的论文工件安全增量加入正式知识库。
+from paperbase.promotion.service import PromotionError, PromotionResult, promote_workspace
+# 复用后端现有 Section Tree / chunk 只读仓库，不自行解析标题编号。
+from paperbase.staging.sections import WorkspaceSectionRepository
+# 复用完整 staging pipeline，不在前端重复 Parser、Chunker 或临时索引流程。
+from paperbase.staging.service import (
+    TemporaryWorkspaceError,
+    delete_temporary_workspace,
+    run_temporary_workspace_stage,
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +82,16 @@ class KnowledgeBasePaper:
 @dataclass(frozen=True)
 class KnowledgeBaseConversation:
     """Knowledge Base 会话列表中的轻量摘要，不把完整历史放进页面状态。"""
+
+    conversation_id: str
+    title: str
+    turn_count: int
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class PaperConversation:
+    """当前 staging workspace 下的独立会话摘要。"""
 
     conversation_id: str
     title: str
@@ -111,6 +148,69 @@ class WorkspaceSummary:
         return self.title or self.source_filename
 
 
+@dataclass(frozen=True)
+class PaperOverviewSource:
+    """论文概览字段对应的可读来源，不向页面暴露 chunk 内部 ID。"""
+
+    section: str | None
+    page_start: int | None
+    page_end: int | None
+    text: str
+
+
+class PaperOverviewArtifactError(RuntimeError):
+    """概览工件缺失以外的读取错误，供页面显示可读的恢复提示。"""
+
+
+class PaperUploadError(RuntimeError):
+    """网页上传无法创建 staging workspace 时的用户可读错误。"""
+
+
+class WorkspaceActionError(RuntimeError):
+    """加入知识库或删除临时论文失败时的用户可读错误。"""
+
+
+@dataclass(frozen=True)
+class SectionSummary:
+    """Section Tree 中供 UI 使用的最小章节模型。"""
+
+    section_id: str
+    title: str
+    level: int
+    parent_section_id: str | None
+    page_start: int | None
+    page_end: int | None
+    has_children: bool
+    has_content: bool
+
+
+@dataclass(frozen=True)
+class SectionExplanationView:
+    """Explain Section 结构化结果的 UI 视图，不暴露 context/debug 字段。"""
+
+    section_id: str
+    section_title: str
+    mode: str
+    explanation: str
+    key_points: tuple[str, ...]
+    source_chunk_ids: tuple[str, ...]
+    insufficient_evidence: bool
+
+
+@dataclass(frozen=True)
+class SectionExplanationSource:
+    """Explain 来源的用户可读字段。"""
+
+    section: str | None
+    page_start: int | None
+    page_end: int | None
+    text: str
+
+
+class SectionExplanationArtifactError(RuntimeError):
+    """Explain artifact 缺失以外的读取错误。"""
+
+
 class PaperBaseService:
     """把 Streamlit 页面与 PaperBase 后端实现隔离开的窄适配层。"""
 
@@ -143,6 +243,9 @@ class PaperBaseService:
         # KB 回答的证据快照由 Service 持久化，供 rerun 后恢复历史 Evidence。
         # 目录位于 storage 下的独立区域，不与 staging workspace 混用。
         self._answer_artifact_dir = self._settings.storage.papers_dir.parent / "knowledge_base_answers"
+        # Ask This Paper 服务按 workspace 延迟装配并缓存；浏览 Overview/Explain 时不加载
+        # embedding、BM25、reranker 或模型，真正提交问题时才初始化对应论文链路。
+        self._paper_ask_services: dict[str, object] = {}
 
     def list_knowledge_base_papers(self) -> tuple[KnowledgeBasePaper, ...]:
         """返回正式 Knowledge Base 的论文元数据，不访问向量或检索链路。"""
@@ -202,6 +305,44 @@ class PaperBaseService:
         # 按 workspace ID 倒序返回，通常可以让较新的 UUID 工作区排在前面。
         return tuple(sorted(workspaces, key=lambda item: item.workspace_id, reverse=True))
 
+    def create_workspace_from_pdf_upload(
+        self, *, filename: str, content: bytes
+    ) -> WorkspaceSummary:
+        """把上传的单个 PDF 交给既有 staging pipeline，并返回新 workspace 摘要。
+
+        Streamlit 的 UploadedFile 只在本次请求内存在。这里先在系统临时目录保存一
+        份受控副本，再调用 ``paperbase.staging`` 已有入口；页面不会自行创建
+        staging 目录、解析 PDF 或写入向量/FAISS 产物。
+        """
+        safe_filename = _safe_pdf_filename(filename)
+        if not content:
+            raise PaperUploadError("上传的 PDF 文件为空，请重新选择文件。")
+        # PDF 规范允许文件头前存在少量字节；在前 1 KiB 内检查签名只是快速
+        # 输入校验，最终能否解析仍完全由后端 parser 决定。
+        if b"%PDF-" not in content[:1024]:
+            raise PaperUploadError("文件看起来不是有效的 PDF，请重新选择文件。")
+
+        try:
+            with TemporaryDirectory(prefix="paperbase-upload-") as temporary_root:
+                source_pdf = Path(temporary_root) / safe_filename
+                source_pdf.write_bytes(content)
+                workspace = run_temporary_workspace_stage(
+                    settings=self._settings, source_pdf=source_pdf
+                )
+        except TemporaryWorkspaceError as error:
+            raise PaperUploadError(str(error)) from error
+        except OSError as error:
+            raise PaperUploadError("上传文件暂时无法保存或读取，请稍后重试。") from error
+        except Exception as error:  # noqa: BLE001 - 不把 parser/model traceback 直接交给 UI。
+            raise PaperUploadError("论文解析或索引创建失败，请检查后端模型配置后重试。") from error
+
+        summary = self.get_workspace(workspace.workspace_id)
+        if summary is None:
+            # staging stage 成功时按契约一定会发布 workspace.json；这里作为服务层
+            # 边界校验，避免页面进入一个无法恢复的半完成 workspace。
+            raise PaperUploadError("论文工作区创建后无法读取，请重新上传。")
+        return summary
+
     def get_workspace(self, workspace_id: str) -> WorkspaceSummary | None:
         """读取一个 workspace，并拒绝越出 staging 根目录的路径。"""
         # 先检查 ID 的格式，阻止绝对路径和路径穿越字符串进入拼接流程。
@@ -214,6 +355,211 @@ class PaperBaseService:
             return None
         # 复用统一的 manifest 读取逻辑，保证单个读取和列表读取行为一致。
         return self._read_workspace(root)
+
+    def add_workspace_to_knowledge_base(self, workspace_id: str) -> PromotionResult:
+        """复用后端 Promotion，将一个 staging workspace 加入正式知识库。
+
+        页面只提供当前 workspace ID；SQLite、正式 PDF、FAISS 和 embedding
+        artifact 的原子发布仍完全由 ``paperbase.promotion`` 处理。
+        """
+        try:
+            self._require_workspace(workspace_id)
+            return promote_workspace(settings=self._settings, workspace_id=workspace_id)
+        except (ValueError, PromotionError) as error:
+            raise WorkspaceActionError(str(error)) from error
+        except Exception as error:  # noqa: BLE001 - 不把发布链路 traceback 交给 UI。
+            raise WorkspaceActionError("加入知识库失败，请检查论文工件和后端配置后重试。") from error
+
+    def delete_workspace(self, workspace_id: str) -> None:
+        """删除一个 staging 工作区，不影响已经存在的正式知识库论文。"""
+        try:
+            self._require_workspace(workspace_id)
+            delete_temporary_workspace(
+                staging_dir=self._settings.storage.staging_dir,
+                workspace_id=workspace_id,
+            )
+        except (ValueError, TemporaryWorkspaceError) as error:
+            raise WorkspaceActionError(str(error)) from error
+        except OSError as error:
+            raise WorkspaceActionError("临时论文工作区删除失败，请稍后重试。") from error
+        # 清理当前 Streamlit 进程中按 workspace 缓存的 Ask 服务；真正的数据删除
+        # 仍由 staging 后端入口完成，页面不直接触碰工作区文件。
+        self._paper_ask_services.pop(workspace_id, None)
+
+    def get_paper_overview(self, workspace_id: str) -> PaperOverview | None:
+        """读取已经落盘的 Paper Overview；没有工件时返回 ``None``。
+
+        这个方法只读 ``overview/overview.json``，不会因为页面刷新自动调用
+        LLM。工件存在但格式损坏时抛出专用异常，由页面提供“重新生成”入口。
+        """
+        root = self._workspace_root(workspace_id)
+        if root is None:
+            return None
+        overview_path = root / "overview" / "overview.json"
+        if not overview_path.is_file():
+            return None
+        try:
+            payload = json.loads(overview_path.read_text(encoding="utf-8"))
+            return PaperOverview.model_validate(payload)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise PaperOverviewArtifactError(
+                "论文概览文件无法读取，请重新生成。"
+            ) from error
+
+    def generate_paper_overview(self, workspace_id: str) -> PaperOverview:
+        """按需调用后端 Overview stage，并返回新生成的结构化结果。
+
+        解析、分块和 LLM 调用全部由 ``paperbase.overview`` 负责；Service
+        只做 workspace 校验和适配，不复制后端的筛选或提示词逻辑。
+        """
+        root = self._workspace_root(workspace_id)
+        if root is None:
+            raise PaperOverviewError("论文工作区不存在或已失效。")
+        try:
+            outcome = run_paper_overview_stage(
+                settings=self._settings,
+                workspace_id=workspace_id,
+            )
+        except PaperOverviewError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 页面统一处理后端失败。
+            raise PaperOverviewError("论文概览生成失败，请稍后重试。") from error
+        return outcome.overview
+
+    def get_paper_overview_sources(
+        self, workspace_id: str, source_chunk_ids: tuple[str, ...] | list[str]
+    ) -> tuple[PaperOverviewSource, ...]:
+        """根据 Overview 保存的来源 ID恢复章节、页码和原文。
+
+        chunks JSONL 由 Service 读取并转换成最小展示模型，页面不直接打开
+        staging 文件，也不会把 chunk_id、vector_id 或检索分数传到 UI。
+        """
+        root = self._workspace_root(workspace_id)
+        if root is None:
+            return ()
+        requested_ids = tuple(
+            item.strip() for item in source_chunk_ids if isinstance(item, str) and item.strip()
+        )
+        if not requested_ids:
+            return ()
+        records_by_id: dict[str, dict[str, object]] = {}
+        chunks_path = root / "chunks" / "chunks.jsonl"
+        try:
+            for line in chunks_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    continue
+                chunk_id = record.get("chunk_id")
+                if isinstance(chunk_id, str) and chunk_id in requested_ids:
+                    records_by_id[chunk_id] = record
+        except (OSError, json.JSONDecodeError):
+            return ()
+
+        sources: list[PaperOverviewSource] = []
+        for chunk_id in requested_ids:
+            record = records_by_id.get(chunk_id)
+            if record is None:
+                continue
+            raw_text = _optional_text(record.get("raw_text"))
+            if not raw_text:
+                continue
+            sources.append(
+                PaperOverviewSource(
+                    section=_optional_text(record.get("section")),
+                    page_start=_optional_page(record.get("page_start")),
+                    page_end=_optional_page(record.get("page_end")),
+                    text=raw_text,
+                )
+            )
+        return tuple(sources)
+
+    def get_section_tree(self, workspace_id: str) -> tuple[SectionSummary, ...]:
+        """从 ParsedPaper 的真实 Section Tree 返回可展示章节，不猜层级。"""
+        snapshot = self._section_repository().load(workspace_id)
+        return tuple(
+            SectionSummary(
+                section_id=section.section_id,
+                title=section.section_title,
+                level=section.section_level,
+                parent_section_id=section.parent_section_id,
+                page_start=section.page_start,
+                page_end=section.page_end,
+                has_children=bool(snapshot.get_children(section.section_id)),
+                has_content=bool(snapshot.get_subtree_chunks(section.section_id)),
+            )
+            for section in snapshot.get_section_tree()
+        )
+
+    def get_section_explanation(
+        self, workspace_id: str, section_id: str
+    ) -> SectionExplanationView | None:
+        """读取已有 Explain artifact；没有生成结果时返回 ``None``。"""
+        snapshot = self._section_repository().load(workspace_id)
+        # 先校验 section_id，避免失效 ID 被误认为“尚未生成”。
+        snapshot.get_section(section_id)
+        artifact_path = self._section_explanation_path(snapshot.root_dir, section_id)
+        if not artifact_path.is_file():
+            return None
+        try:
+            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+            explanation = ExplainSection.model_validate(payload)
+            if explanation.section_id != section_id:
+                raise ValueError("Explain artifact section_id does not match requested section.")
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
+            raise SectionExplanationArtifactError(
+                "章节解释文件损坏或无法读取，请重新生成。"
+            ) from error
+        return _section_explanation_view(explanation)
+
+    def generate_section_explanation(
+        self, workspace_id: str, section_id: str
+    ) -> SectionExplanationView:
+        """调用既有 Explain Section workflow，不在前端拼接 Prompt。"""
+        snapshot = self._section_repository().load(workspace_id)
+        snapshot.get_section(section_id)
+        try:
+            outcome = run_explain_section_stage(
+                settings=self._settings,
+                workspace_id=workspace_id,
+                section_id=section_id,
+            )
+        except ExplainSectionError:
+            raise
+        except Exception as error:  # noqa: BLE001 - 页面统一显示友好错误。
+            raise ExplainSectionError("章节解释生成失败，请稍后重试。") from error
+        return _section_explanation_view(outcome.explanation)
+
+    def get_section_explanation_sources(
+        self, workspace_id: str, source_chunk_ids: tuple[str, ...] | list[str]
+    ) -> tuple[SectionExplanationSource, ...]:
+        """按 Explain 返回的真实 chunk ID恢复 Section、页码和原文。"""
+        snapshot = self._section_repository().load(workspace_id)
+        requested_ids = tuple(
+            item.strip() for item in source_chunk_ids if isinstance(item, str) and item.strip()
+        )
+        if not requested_ids:
+            return ()
+        chunks_by_id = {chunk.chunk_id: chunk for chunk in snapshot.chunks}
+        sections_by_id = {section.section_id: section for section in snapshot.sections}
+        sources: list[SectionExplanationSource] = []
+        for chunk_id in requested_ids:
+            chunk = chunks_by_id.get(chunk_id)
+            if chunk is None or not chunk.raw_text.strip():
+                continue
+            section_title = chunk.section
+            if not section_title and chunk.section_id in sections_by_id:
+                section_title = sections_by_id[chunk.section_id].section_title
+            sources.append(
+                SectionExplanationSource(
+                    section=section_title,
+                    page_start=chunk.page_start,
+                    page_end=chunk.page_end,
+                    text=chunk.raw_text,
+                )
+            )
+        return tuple(sources)
 
     def create_kb_conversation(self) -> ConversationRecord:
         """在稳定的正式 KB scope 下创建一个全新的独立 conversation。"""
@@ -323,6 +669,106 @@ class PaperBaseService:
         # workspace 会话的 scope_id 就是精确的 workspace ID。
         return self._conversations.create_conversation("workspace", workspace_id)
 
+    def list_paper_conversations(self, workspace_id: str) -> tuple[PaperConversation, ...]:
+        """列出指定 staging workspace 的 Ask This Paper 会话。"""
+        self._require_workspace(workspace_id)
+        records = self._conversations.list_conversations("workspace", workspace_id)
+        summaries: list[PaperConversation] = []
+        for record in records:
+            turns = self._conversations.get_turns(record.conversation_id)
+            first_query = turns[0].user_query if turns else None
+            summaries.append(
+                PaperConversation(
+                    conversation_id=record.conversation_id,
+                    title=_conversation_title(first_query),
+                    turn_count=len(turns),
+                    updated_at=record.updated_at,
+                )
+            )
+        return tuple(summaries)
+
+    def create_paper_conversation(self, workspace_id: str) -> ConversationRecord:
+        """仅为当前 staging workspace 创建新会话，不自动切换到正式 KB。"""
+        return self.create_workspace_conversation(workspace_id)
+
+    def get_paper_conversation_turns(
+        self, conversation_id: str, *, workspace_id: str | None = None
+    ) -> tuple[ConversationTurn, ...]:
+        """读取 Paper 会话历史，并校验它属于 workspace scope。"""
+        record = self._conversations.get_conversation(
+            conversation_id,
+            expected_scope_type="workspace",
+            expected_scope_id=workspace_id,
+        )
+        if workspace_id is not None and record.scope_id != workspace_id:
+            # expected_scope_id 已经会抛出 scope error；这里保留显式分支让契约清晰。
+            raise ValueError("Paper conversation does not belong to the current workspace.")
+        return self._conversations.get_turns(conversation_id)
+
+    def ask_this_paper(
+        self, workspace_id: str, conversation_id: str, query: str
+    ) -> AskThisPaperResult:
+        """把问题交给现有 AskThisPaperService，并把用户可见 Evidence 快照补入 turn。"""
+        self._require_workspace(workspace_id)
+        self._conversations.get_conversation(
+            conversation_id,
+            expected_scope_type="workspace",
+            expected_scope_id=workspace_id,
+        )
+        normalized_query = " ".join(query.split())
+        if not normalized_query:
+            raise ValueError("问题不能为空。")
+        result = self._get_paper_ask_service(workspace_id).ask(
+            normalized_query,
+            conversation_id=conversation_id,
+        )
+        # AskThisPaperService 已完成检索、回答和 turn 追加；这里仅把最终 Evidence
+        # 的最小 snapshot 写进同一 turn，历史读取不需要重新检索。
+        if result.conversation_id:
+            turns = self._conversations.get_turns(result.conversation_id)
+            if turns:
+                self._conversations.update_turn_evidence(
+                    turns[-1].turn_id,
+                    _evidence_snapshot_json(
+                        result.expansion.evidence,
+                        result.answer.citations,
+                        answer_status=result.answer.status,
+                    ),
+                )
+        return result
+
+    def get_paper_conversation_turn_evidence(
+        self, turn: ConversationTurn
+    ) -> tuple[KnowledgeBaseEvidence, ...]:
+        """恢复 Paper turn 的 Evidence snapshot，旧 turn 回退到 ask_paper 工件。"""
+        database_evidence = _evidence_from_json_text(turn.evidence_json)
+        if database_evidence is not None:
+            return database_evidence
+        payload = self._read_paper_answer_artifact(turn)
+        if payload is None or not isinstance(payload.get("evidence"), list):
+            return ()
+        return tuple(
+            evidence
+            for item in payload["evidence"]
+            if isinstance(item, dict)
+            for evidence in (_evidence_from_payload(item),)
+            if evidence is not None
+        )
+
+    def get_paper_conversation_turn_metadata(
+        self, turn: ConversationTurn
+    ) -> KnowledgeBaseTurnMetadata | None:
+        """恢复 Ask This Paper 的降级/覆盖提示，不暴露工件中的检索字段。"""
+        payload = self._read_paper_answer_artifact(turn)
+        if payload is None:
+            return None
+        return KnowledgeBaseTurnMetadata(
+            answer_status=_optional_text(payload.get("answer_status")) or "unknown",
+            insufficient_evidence=payload.get("insufficient_evidence") is True,
+            partial_answer=payload.get("partial_answer") is True,
+            coverage_note=_optional_text(payload.get("coverage_note")),
+        )
+
     def get_conversation(self, conversation_id: str) -> ConversationRecord:
         """读取一个持久化 conversation；调用页面负责验证它属于哪个 scope。"""
         # Store 负责检查 ID 是否存在并返回轻量的会话元数据。
@@ -336,6 +782,40 @@ class PaperBaseService:
                 conversation_scope_id=FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
             )
         return self._answer_service
+
+    def _get_paper_ask_service(self, workspace_id: str) -> object:
+        """按 workspace 延迟装配并复用现有 Ask This Paper 后端服务。"""
+        service = self._paper_ask_services.get(workspace_id)
+        if service is None:
+            service = create_ask_this_paper_service(
+                workspace_id=workspace_id,
+                config_path=self._settings.config_path,
+            )
+            self._paper_ask_services[workspace_id] = service
+        return service
+
+    def _require_workspace(self, workspace_id: str) -> WorkspaceSummary:
+        """确认 workspace 存在，避免创建或问答指向失效 staging 目录。"""
+        workspace = self.get_workspace(workspace_id)
+        if workspace is None:
+            raise ValueError("当前 staging workspace 不存在或已失效。")
+        return workspace
+
+    def _read_paper_answer_artifact(
+        self, turn: ConversationTurn
+    ) -> dict[str, object] | None:
+        """安全读取 Ask This Paper 已写入的结果工件，仅用于恢复用户可见字段。"""
+        if not turn.audit_path:
+            return None
+        try:
+            path = Path(turn.audit_path).resolve()
+            staging_root = self._settings.storage.staging_dir.resolve()
+            if not path.is_relative_to(staging_root) or not path.is_file():
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _persist_answer_artifact(self, result: AnswerServiceResult) -> None:
         """保存本轮答案和真实 Evidence，写入失败不影响已经完成的回答。"""
@@ -387,6 +867,22 @@ class PaperBaseService:
         if payload.get("turn_index") != turn.turn_index:
             return None
         return payload
+
+    def _section_repository(self) -> WorkspaceSectionRepository:
+        """创建后端 Section Tree 只读仓库，统一以 staging 根目录为边界。"""
+        return WorkspaceSectionRepository(self._settings.storage.staging_dir)
+
+    @staticmethod
+    def _section_explanation_path(root: Path, section_id: str) -> Path:
+        """复用 Explain backend 的稳定 section artifact 命名规则。"""
+        artifact_stem = hashlib.sha256(section_id.encode("utf-8")).hexdigest()[:16]
+        return root / "explain_sections" / f"{artifact_stem}.json"
+
+    def _workspace_root(self, workspace_id: str) -> Path | None:
+        """返回通过边界校验的 workspace 路径，页面不需要处理真实路径。"""
+        if self.get_workspace(workspace_id) is None:
+            return None
+        return (self._settings.storage.staging_dir / workspace_id).resolve()
 
     def _read_workspace(self, root: Path) -> WorkspaceSummary | None:
         """读取单个 workspace manifest，并转换成页面摘要模型。"""
@@ -489,6 +985,16 @@ def _optional_text(value: object) -> str | None:
     return normalized or None
 
 
+def _safe_pdf_filename(value: str) -> str:
+    """保留上传文件名的显示价值，同时拒绝路径片段和非 PDF 扩展名。"""
+    # ``Path.name`` 去除本机路径片段；额外替换反斜杠，兼容网页客户端可能上传
+    # 的 Windows 风格文件名，避免它在 POSIX 环境中被当作普通字符保留下来。
+    filename = Path(str(value).replace("\\", "/")).name.strip()
+    if not filename or filename in {".", ".."} or Path(filename).suffix.casefold() != ".pdf":
+        raise PaperUploadError("请上传一个 PDF 文件。")
+    return filename
+
+
 def _conversation_title(first_query: str | None) -> str:
     """用第一条问题生成不调用 LLM 的会话标题。"""
     if not first_query:
@@ -523,6 +1029,31 @@ def _evidence_payload(item: object) -> dict[str, object]:
         "page_end": view.page_end,
         "text": view.text,
     }
+
+
+def _evidence_snapshot_json(
+    evidence: object,
+    citations: object = (),
+    *,
+    answer_status: str | None = None,
+) -> str | None:
+    """序列化 Ask This Paper 本轮最终可展示的 Evidence。"""
+    if answer_status in {"needs_clarification", "insufficient_evidence"}:
+        return None
+    citation_set = {
+        str(item).strip()
+        for item in (citations if isinstance(citations, (tuple, list, set)) else ())
+        if str(item).strip()
+    }
+    items = tuple(evidence) if isinstance(evidence, (tuple, list)) else ()
+    selected = (
+        tuple(item for item in items if str(getattr(item, "evidence_id", "")) in citation_set)
+        if citation_set
+        else items
+    )
+    return json.dumps(
+        [_evidence_payload(item) for item in selected], ensure_ascii=False
+    )
 
 
 def _evidence_from_payload(payload: dict[str, object]) -> KnowledgeBaseEvidence | None:
@@ -560,6 +1091,19 @@ def _evidence_from_json_text(value: str | None) -> tuple[KnowledgeBaseEvidence, 
         if item_evidence is not None
     )
     return evidence
+
+
+def _section_explanation_view(explanation: ExplainSection) -> SectionExplanationView:
+    """将后端 Explain 模型转换成页面需要的稳定字段。"""
+    return SectionExplanationView(
+        section_id=explanation.section_id,
+        section_title=explanation.section_title,
+        mode=explanation.mode,
+        explanation=explanation.explanation,
+        key_points=tuple(explanation.key_points),
+        source_chunk_ids=tuple(explanation.source_chunk_ids),
+        insufficient_evidence=explanation.insufficient_evidence,
+    )
 
 
 def _optional_page(value: object) -> int | None:

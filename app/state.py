@@ -32,6 +32,10 @@ _DEFAULTS: dict[str, object] = {
     "upload_panel_expanded": False,
     # 按 workspace scope 保存各自的 paper conversation ID，防止切换论文时串会话。
     "paper_conversation_ids_by_workspace": {},
+    # 当前等待用户确认删除的 staging workspace；未确认前不执行删除。
+    "workspace_delete_confirmation_id": None,
+    # 跨一次 rerun 显示的工作区操作结果，不保存业务数据。
+    "workspace_action_notice": None,
 }
 
 
@@ -88,3 +92,16 @@ def set_workspace_conversation(
     if state.get("active_workspace_id") == workspace_id:
         # 页面读取的是这个短字段，因此需要立即更新它。
         state["paper_conversation_id"] = conversation_id
+
+
+def clear_deleted_workspace(state: MutableMapping[str, object], workspace_id: str) -> None:
+    """删除 staging workspace 后清理其 UI 选择，不影响其他论文的会话映射。"""
+    conversations = state.get("paper_conversation_ids_by_workspace")
+    if isinstance(conversations, dict):
+        conversations.pop(workspace_id, None)
+    if state.get("active_workspace_id") == workspace_id:
+        state["active_workspace_id"] = None
+        state["paper_conversation_id"] = None
+        state["selected_section_id"] = None
+    if state.get("workspace_delete_confirmation_id") == workspace_id:
+        state["workspace_delete_confirmation_id"] = None
