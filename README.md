@@ -42,12 +42,12 @@
 
 <!--
 如需展示 UI，可将截图放入 docs/assets/ 后取消下面注释。
-
+-->
 <p align="center">
   <img src="docs/assets/knowledge_base.png" width="48%" alt="Knowledge Base QA"/>
   <img src="docs/assets/paper_workspace.png" width="48%" alt="Paper Workspace"/>
 </p>
--->
+
 
 ---
 
