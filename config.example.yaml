@@ -32,7 +32,7 @@ parsing:
   # Docling 解析器专用配置。
   docling:
     # 已下载的 Docling 本地模型目录。
-    artifacts_path: D:/AI_Workspace/AI_Models/docling_models
+    artifacts_path: models/docling
     # 模型推理设备；cuda 表示使用 NVIDIA GPU。
     device: cuda
     # 是否对扫描版或无文本层 PDF 启用 OCR。
@@ -71,7 +71,7 @@ chunking:
   # 为标题、章节等嵌入元数据预留的 token 数。
   embedding_metadata_reserve_tokens: 64
   # 用于 token 计数的本地 tokenizer 路径，不会在此步骤加载完整 embedding 模型。
-  tokenizer_path: D:/AI_Workspace/AI_Models/hf_models/Qwen3-Embedding-0.6B
+  tokenizer_path: models/Qwen3-Embedding-0.6B
   # 供人工检查的分块 JSONL 与报告输出目录。
   inspection_output_dir: storage/parsed/chunks/qwen3_embedding_0_6b
   # 跨页表格分块时是否在后续块中重复表头。
@@ -99,8 +99,8 @@ embedding:
   backend: qwen_sentence_transformers
   # 模型的 Hugging Face 标识，用于记录模型来源与版本语义。
   model_id: Qwen/Qwen3-Embedding-0.6B
-  # 已下载的本地 embedding 模型目录。
-  model_path: D:/AI_Workspace/AI_Models/hf_models/Qwen3-Embedding-0.6B
+  # 本地 embedding 模型目录，修改为自己本地的embedding路径
+  model_path: models/Qwen3-Embedding-0.6B
   # 生成向量时使用的推理设备。
   device: cuda
   # 单批次送入 embedding 模型的文本数量；可按显存情况调整。
@@ -128,7 +128,7 @@ reranking:
   # 模型的 Hugging Face 标识，用于记录模型来源与版本语义。
   model_id: BAAI/bge-reranker-v2-m3
   # 已下载的本地重排序模型目录。
-  model_path: D:/AI_Workspace/AI_Models/hf_models/bge-reranker-v2-m3
+  model_path: models/bge-reranker-v2-m3
   # 重排序推理设备；cuda 表示使用 NVIDIA GPU。
   device: cuda
   # 单批次输入模型的“问题 + 正文 chunk”配对数量；可按显存情况调整。

@@ -1,16 +1,44 @@
 # Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
 
 # Virtual environment
 .venv/
 
 # Environment
 .env
+.env.*
+!.env.example
+
+# Machine-specific runtime configuration（提交 config.example.yaml）
+config.yaml
+
+# Locally downloaded parsing / embedding / reranking models
+models/
 
 # IDE
 .vscode/
 .idea/
+
+# Streamlit local secrets（公共 UI 配置 .streamlit/config.toml 仍保留）
+.streamlit/secrets.toml
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
 
 # Local storage
 storage/papers/*
@@ -24,13 +52,17 @@ storage/*.db
 storage/*.sqlite3
 storage/*.sqlite3.*.bak
 
-# Keep folders
-!storage/papers/.gitkeep
-!storage/parsed/.gitkeep
-!storage/staging/.gitkeep
-
 # Evaluation outputs
 eval/results/
 
+# Disposable local workspaces and retry artifacts
+tmp/
+
 # Logs
 *.log
+
+# Editor / process leftovers
+*.tmp
+*.swp
+*.swo
+*~
