@@ -1,6 +1,6 @@
 <div align="center">
 
-# 📚 PaperBase
+# 📚 PaperBase V1.0
 
 ### 面向学术论文的 RAG 知识库与 AI 阅读辅助系统
 
