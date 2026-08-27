@@ -105,6 +105,51 @@ class _BibliographyRewriter:
         )
 
 
+class _EmptyKeywordBibliographyRewriter:
+    """模拟 LLM 成功生成英文语义问句、但合法返回空关键词的真实运行情况。"""
+
+    def plan(
+        self,
+        query: str,
+        *,
+        trusted_scope: object = None,
+        conversation_context: list[str] | None = None,
+    ) -> QueryRewritePlan:
+        _ = query, trusted_scope, conversation_context
+        return QueryRewritePlan(
+            original_query="original citation question",
+            resolved_query="original citation question",
+            semantic_query_en=(
+                "What are the titles, journals, and publication years of the Itakura 1975 "
+                "speech recognition paper and the original shapeDTW paper referenced in the literature?"
+            ),
+            lexical_keywords_en=(),
+            rewrite_status="success",
+            search_bibliography=True,
+        )
+
+
+class _NoLexicalClueBibliographyRewriter:
+    """模拟改写降级且中文原问题中没有英文实体或数字的安全停止场景。"""
+
+    def plan(
+        self,
+        query: str,
+        *,
+        trusted_scope: object = None,
+        conversation_context: list[str] | None = None,
+    ) -> QueryRewritePlan:
+        _ = query, trusted_scope, conversation_context
+        return QueryRewritePlan(
+            original_query="参考文献中哪篇研究讨论了空气污染？",
+            resolved_query="参考文献中哪篇研究讨论了空气污染？",
+            semantic_query_en=None,
+            lexical_keywords_en=(),
+            rewrite_status="degraded",
+            search_bibliography=True,
+        )
+
+
 class _FakeReranker:
     """不加载真实模型的重排序替身；分数故意与 RRF 顺序不同以验证重排生效。"""
 
@@ -280,6 +325,67 @@ class HybridRetrieverTests(unittest.TestCase):
         self.assertEqual(result.chunks[-1].chunk_id, "reference_1")
         self.assertEqual(bibliography_chunk.fused_score, 0.0)
         self.assertEqual(bibliography_source.effective_weight, 0.0)
+
+    def test_bibliography_empty_keywords_use_deterministic_fts_fallback(self) -> None:
+        """空关键词必须从英文语义问句提取检索词，不能再把完整问句作为精确短语。"""
+        settings = RetrievalSettings(
+            backend="hybrid_rrf",
+            dense_top_k_per_query=2,
+            bm25_keywords_top_k=20,
+            fused_top_k=4,
+            rrf_k=10,
+            dense_resolved_weight=1.0,
+            dense_semantic_weight=1.0,
+            bm25_keywords_weight=1.0,
+            query_instruction="Retrieve academic passages relevant to this question.",
+        )
+        database = _BibliographyFakeDatabase()
+        retriever = HybridRetriever(
+            database=database,  # type: ignore[arg-type]
+            query_embedder=_FakeEmbedder(),  # type: ignore[arg-type]
+            index_store=_FakeIndexStore(),  # type: ignore[arg-type]
+            settings=settings,
+            query_planner=_EmptyKeywordBibliographyRewriter(),
+        )
+
+        result = retriever.retrieve("参考文献中 Itakura 和 shapeDTW 分别是哪两篇？")
+
+        expected_terms = ("shapeDTW", "1975", "Itakura", "speech recognition")
+        self.assertEqual(database.bibliography_calls, [(expected_terms, "paper_target", 5)])
+        bibliography_chunk = next(
+            chunk for chunk in result.chunks if chunk.chunk_id == "reference_1"
+        )
+        self.assertEqual(
+            bibliography_chunk.source_matches[0].query,
+            "shapeDTW OR 1975 OR Itakura OR speech recognition",
+        )
+
+    def test_bibliography_without_lexical_clues_does_not_restore_full_phrase_query(self) -> None:
+        """没有可用词法线索时应安全停止，不能再次调用完整问句精确短语检索。"""
+        settings = RetrievalSettings(
+            backend="hybrid_rrf",
+            dense_top_k_per_query=2,
+            bm25_keywords_top_k=20,
+            fused_top_k=4,
+            rrf_k=10,
+            dense_resolved_weight=1.0,
+            dense_semantic_weight=1.0,
+            bm25_keywords_weight=1.0,
+            query_instruction="Retrieve academic passages relevant to this question.",
+        )
+        database = _BibliographyFakeDatabase()
+        retriever = HybridRetriever(
+            database=database,  # type: ignore[arg-type]
+            query_embedder=_FakeEmbedder(),  # type: ignore[arg-type]
+            index_store=_FakeIndexStore(),  # type: ignore[arg-type]
+            settings=settings,
+            query_planner=_NoLexicalClueBibliographyRewriter(),
+        )
+
+        result = retriever.retrieve("参考文献中哪篇研究讨论了空气污染？")
+
+        self.assertEqual(database.bibliography_calls, [])
+        self.assertTrue(all(chunk.section_type == "content" for chunk in result.chunks))
 
     def test_reranker_reorders_only_content_and_preserves_pre_rerank_evidence(self) -> None:
         settings = RetrievalSettings(

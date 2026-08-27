@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 
+from pydantic import ValidationError
+
 from paperbase.config import QueryRewriteSettings
 from paperbase.llm.client import LLMRequestError
 from paperbase.retrieval.query_rewriter import (
@@ -140,9 +142,148 @@ class QueryPlanningTests(unittest.TestCase):
         plan = planner.plan("D2STGNN的整体框架是什么？")
 
         self.assertEqual(plan.resolution_status, "resolved")
-        self.assertEqual(plan.rewrite_status, "degraded")
+        self.assertEqual(plan.rewrite_status, "partial")
+        self.assertEqual(plan.semantic_status, "unavailable")
+        self.assertEqual(plan.lexical_status, "valid_fallback")
         self.assertIsNone(plan.semantic_query_en)
         self.assertEqual(plan.lexical_keywords_en, ("D2STGNN",))
+
+    def test_missing_lexical_field_uses_deterministic_fallback(self) -> None:
+        """字段缺失必须触发 Schema 失败，但不能连带丢掉原问题中的确定性实体。"""
+        client = _FakeClient(['{"semantic_query_en":"How does ESDTW differ from DTW?"}'])
+        planner = LLMQueryPlanner(settings=QueryRewriteSettings(), client=client)
+
+        plan = planner.plan("How does ESDTW differ from DTW?")
+
+        self.assertEqual(plan.semantic_status, "unavailable")
+        self.assertEqual(plan.lexical_status, "valid_fallback")
+        self.assertEqual(plan.rewrite_status, "partial")
+        self.assertEqual(plan.lexical_keywords_en, ("ESDTW", "DTW"))
+        self.assertTrue(any(item.startswith("rewrite_error:ValidationError") for item in plan.validation_diagnostics))
+
+    def test_explicit_empty_lexical_field_is_legal_and_uses_fallback(self) -> None:
+        """显式空数组是合法 LLM 输出，随后由确定性实体补足 BM25 通道。"""
+        client = _FakeClient([_rewrite_response("How does ESDTW differ from DTW?", "[]")])
+        planner = LLMQueryPlanner(settings=QueryRewriteSettings(), client=client)
+
+        plan = planner.plan("How does ESDTW differ from DTW?")
+
+        self.assertEqual(plan.semantic_status, "valid")
+        self.assertEqual(plan.lexical_status, "valid_fallback")
+        self.assertEqual(plan.rewrite_status, "success")
+        self.assertEqual(plan.lexical_keywords_en, ("ESDTW", "DTW"))
+
+    def test_llm_and_deterministic_terms_merge_without_duplicates(self) -> None:
+        """合并时保护原问题实体、过滤问句词、去重并严格限制为五条。"""
+        client = _FakeClient(
+            [_rewrite_response(
+                "How does ESDTW differ from DTW variants?",
+                '["How", "ESDTW", "shape descriptors", "DTW"]',
+            )]
+        )
+        planner = LLMQueryPlanner(settings=QueryRewriteSettings(), client=client)
+
+        plan = planner.plan(
+            "How does ESDTW differ from DTW, LEDTW, shapeDTW, and DDTW?"
+        )
+
+        self.assertEqual(plan.lexical_status, "valid_merged")
+        self.assertLessEqual(len(plan.lexical_keywords_en), 5)
+        self.assertNotIn("How", plan.lexical_keywords_en)
+        self.assertEqual(len(plan.lexical_keywords_en), len(set(plan.lexical_keywords_en)))
+        self.assertTrue({"ESDTW", "DTW", "LEDTW", "shapeDTW"}.issubset(plan.lexical_keywords_en))
+
+    def test_cjk_contamination_invalidates_only_semantic_channel(self) -> None:
+        """明显中文污染不能进入 Dense，但 lexical fallback 与 Original Dense 仍可继续。"""
+        client = _FakeClient(
+            [_rewrite_response(
+                "What are the complexities of ESDTW and DTW?的眼动实验数据集？",
+                '["ESDTW", "DTW"]',
+            )]
+        )
+        planner = LLMQueryPlanner(settings=QueryRewriteSettings(), client=client)
+
+        plan = planner.plan("ESDTW和DTW的复杂度分别是什么？")
+
+        self.assertIsNone(plan.semantic_query_en)
+        self.assertEqual(plan.semantic_status, "invalid")
+        self.assertEqual(plan.lexical_status, "valid_fallback")
+        self.assertEqual(plan.rewrite_status, "partial")
+        self.assertIn("semantic_contains_cjk", plan.validation_diagnostics)
+
+    def test_new_ablation_marker_invalidates_semantic_channel(self) -> None:
+        """LLM 不得把主模型名擅自改成带 †/‡ 的特定消融变体。"""
+        client = _FakeClient(
+            [_rewrite_response(
+                "How does the estimation gate in D²STGNN† use time slots?",
+                '["D²STGNN†", "estimation gate"]',
+            )]
+        )
+        planner = LLMQueryPlanner(settings=QueryRewriteSettings(), client=client)
+
+        plan = planner.plan("D2STGNN中的估计门如何利用时间槽？")
+
+        self.assertIsNone(plan.semantic_query_en)
+        self.assertEqual(plan.semantic_status, "invalid")
+        self.assertEqual(plan.rewrite_status, "partial")
+        self.assertIn("semantic_entity_variant_marker_added", plan.validation_diagnostics)
+        self.assertNotIn("D²STGNN†", plan.lexical_keywords_en)
+        self.assertTrue(
+            any(
+                item.startswith("llm_lexical_variant_marker_removed:")
+                for item in plan.validation_diagnostics
+            )
+        )
+        self.assertEqual(plan.lexical_status, "valid_fallback")
+
+    def test_unanchored_llm_lexical_noise_is_removed(self) -> None:
+        """原问题和合法 semantic 中都不存在的 PM2.5 不得进入最终 BM25 关键词。"""
+        client = _FakeClient(
+            [_rewrite_response(
+                "How do D²STGNN† and D²STGNN‡ compare?",
+                '["D²STGNN†", "D²STGNN‡", "PM2.5"]',
+            )]
+        )
+        planner = LLMQueryPlanner(settings=QueryRewriteSettings(), client=client)
+
+        plan = planner.plan("D²STGNN†与D²STGNN‡相比表现如何？")
+
+        self.assertNotIn("PM2.5", plan.lexical_keywords_en)
+        self.assertIn("llm_lexical_unanchored_removed:PM2.5", plan.validation_diagnostics)
+
+    def test_missing_paired_season_invalidates_semantic_channel(self) -> None:
+        """“春夏季”不能被改写成仅 summer，否则问题范围被无声缩小。"""
+        client = _FakeClient(
+            [_rewrite_response(
+                "What parameters change when applying CMAQ during summer?",
+                '["CMAQ", "summer"]',
+            )]
+        )
+        planner = LLMQueryPlanner(settings=QueryRewriteSettings(), client=client)
+
+        plan = planner.plan("CMAQ用于成都春夏季时需要修改哪些参数？")
+
+        self.assertIsNone(plan.semantic_query_en)
+        self.assertEqual(plan.semantic_status, "invalid")
+        self.assertIn("semantic_season_constraint_missing:spring", plan.validation_diagnostics)
+
+    def test_single_paper_scope_cannot_be_pluralized(self) -> None:
+        """单篇目标论文不能被改写成 papers，从而无声扩大检索范围。"""
+        client = _FakeClient(
+            [_rewrite_response(
+                "How do papers pair observations with model forecasts?",
+                '["model forecasts"]',
+            )]
+        )
+        planner = LLMQueryPlanner(settings=QueryRewriteSettings(), client=client)
+
+        plan = planner.plan("论文如何把观测值与模型预报配对？")
+
+        self.assertIsNone(plan.semantic_query_en)
+        self.assertEqual(plan.semantic_status, "invalid")
+        self.assertEqual(plan.lexical_status, "empty")
+        self.assertEqual(plan.rewrite_status, "degraded")
+        self.assertIn("semantic_single_paper_scope_pluralized", plan.validation_diagnostics)
 
     def test_bibliography_router_is_program_owned(self) -> None:
         self.assertTrue(resolve_bibliography_search_rule("引用了哪些论文？"))
@@ -158,9 +299,29 @@ class QueryPlanningTests(unittest.TestCase):
 
         self.assertEqual(set(resolution_schema["required"]), {"resolution_status", "resolved_query"})
         self.assertEqual(
-            set(rewrite_schema["required"]), {"semantic_query_en"}
+            set(rewrite_schema["required"]), {"semantic_query_en", "lexical_keywords_en"}
         )
+        self.assertEqual(rewrite_schema["properties"]["lexical_keywords_en"]["maxItems"], 5)
+        self.assertNotIn("minItems", rewrite_schema["properties"]["lexical_keywords_en"])
         self.assertNotIn("search_bibliography", rewrite_schema["properties"])
+
+    def test_retrieval_rewrite_schema_accepts_empty_but_rejects_missing_or_six_terms(self) -> None:
+        """Schema 区分显式空数组、字段缺失和超过上限三种情况。"""
+        parsed = RetrievalRewriteResult.model_validate_json(
+            '{"semantic_query_en":"What is ESDTW?","lexical_keywords_en":[]}'
+        )
+        self.assertEqual(parsed.lexical_keywords_en, [])
+        with self.assertRaises(ValidationError):
+            RetrievalRewriteResult.model_validate_json(
+                '{"semantic_query_en":"What is ESDTW?"}'
+            )
+        with self.assertRaises(ValidationError):
+            RetrievalRewriteResult.model_validate(
+                {
+                    "semantic_query_en": "What is ESDTW?",
+                    "lexical_keywords_en": ["a", "b", "c", "d", "e", "f"],
+                }
+            )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from paperbase.embedding.base import QueryEmbedder
 from paperbase.indexing import FaissIndexStore
 from paperbase.reranking import Reranker
 
+from .lexical_terms import extract_lexical_terms
 from .query_rewriter import QueryPlanner, QueryRewritePlan, TrustedPaperScope
 
 
@@ -337,20 +338,18 @@ class HybridRetriever:
         """返回目标论文内按 BM25 排序的参考文献候选，不把它们加入正文 RRF。"""
         if target_paper_id is None:
             return ()
-        # 与正文 Rewritten BM25 一致：关键词组合为一条 OR 查询，并如实写入调试来源字段。
-        rendered_query = " OR ".join(keywords) if keywords else query
-        rows = (
-            self._database.search_bibliography_keyword_group(
-                keywords,
-                paper_id=target_paper_id,
-                top_k=self._settings.query_rewrite.bibliography_top_k,
-            )
-            if keywords
-            else self._database.search_bibliography(
-                query,
-                paper_id=target_paper_id,
-                top_k=self._settings.query_rewrite.bibliography_top_k,
-            )
+        # LLM 允许合法返回空关键词；此时不能把完整英文问句当成一个 FTS5 精确短语，
+        # 否则 References 几乎不可能逐字包含整句。fallback 只提取问题中已有的英文词、
+        # 模型名和数字，再复用现有安全 OR 查询，不翻译也不补充任何外部知识。
+        effective_keywords = keywords or extract_lexical_terms(query, max_terms=5)
+        if not effective_keywords:
+            # 没有可追溯的词法线索时安全返回空集，禁止恢复为已知无效的完整问句短语查询。
+            return ()
+        rendered_query = " OR ".join(effective_keywords)
+        rows = self._database.search_bibliography_keyword_group(
+            effective_keywords,
+            paper_id=target_paper_id,
+            top_k=self._settings.query_rewrite.bibliography_top_k,
         )
         return tuple(
             _Candidate(

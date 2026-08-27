@@ -98,7 +98,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             "semantic_query_en": result.rewrite_plan.semantic_query_en,
             # 英文关键词组：共同构成一条 Rewritten BM25 Top-20 的 OR 查询。
             "lexical_keywords_en": list(result.rewrite_plan.lexical_keywords_en),
-            # Retrieval Rewrite 状态：success / degraded / not_run。
+            # 两个通道分开标记，便于判断完整成功、单通道可用或完全降级。
+            "semantic_status": result.rewrite_plan.semantic_status,
+            "lexical_status": result.rewrite_plan.lexical_status,
+            "validation_diagnostics": list(result.rewrite_plan.validation_diagnostics),
+            # Retrieval Rewrite 状态：success / partial / degraded / not_run。
             "rewrite_status": result.rewrite_plan.rewrite_status,
             # 仅明确 citation/reference intent 时为 true，才会额外查询 bibliography FTS5。
             "search_bibliography": result.rewrite_plan.search_bibliography,

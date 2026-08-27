@@ -81,6 +81,11 @@ def _result_to_json(result: AnswerServiceResult) -> dict[str, object]:
             "resolved_query": result.retrieval.rewrite_plan.resolved_query,
             "semantic_query_en": result.retrieval.rewrite_plan.semantic_query_en,
             "lexical_keywords_en": list(result.retrieval.rewrite_plan.lexical_keywords_en),
+            "semantic_status": result.retrieval.rewrite_plan.semantic_status,
+            "lexical_status": result.retrieval.rewrite_plan.lexical_status,
+            "validation_diagnostics": list(
+                result.retrieval.rewrite_plan.validation_diagnostics
+            ),
             "rewrite_status": result.retrieval.rewrite_plan.rewrite_status,
             "search_bibliography": result.retrieval.rewrite_plan.search_bibliography,
         },

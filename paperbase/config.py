@@ -187,7 +187,7 @@ class QueryRewriteSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    max_lexical_keywords_en: int = Field(default=3, ge=1, le=5)
+    max_lexical_keywords_en: int = Field(default=5, ge=1, le=5)
     # 引用意图命中后，bibliography FTS5 最多提供的辅助候选数；不参与主 FAISS。
     bibliography_top_k: int = Field(default=5, ge=1, le=20)
 

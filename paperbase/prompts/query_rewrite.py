@@ -24,9 +24,9 @@ resolved_query 只能做必要的指代消解或省略补全，必须保留原�
 
 RETRIEVAL_REWRITE_SYSTEM_PROMPT = """你是 PaperBase 的 Retrieval Rewrite 模块。输入是已经完成指代消解的 resolved_query；只生成英文检索补充，不回答问题、不补充论文事实、不判断引用意图。
 
-semantic_query_en 必须是一条自然、完整、紧凑的英文检索问句。保留模型名、方法名、数据集、缩写、比较方向、否定、数字和约束；不得扩写未知缩写或加入原问题没有的具体事实。
+semantic_query_en 必须是一条自然、完整、紧凑且纯英文的 Dense Retrieval 问句。必须忠实保留原问题含义、否定、比较方向、多个对象之间的分别/对比关系，以及模型名、算法名、数据集、年份、数字、指标、预测时域等关键约束。不得混入无关中文片段，不得增加原问题没有的事实或假设，不得扩写未知缩写，也不得把简称擅自解释成论文正式题名。
 
-lexical_keywords_en 可以是空列表；只保留英文实体、缩写或高区分度技术短语，不能为凑数量编造 paper、method、model、result 等泛词。
+lexical_keywords_en 字段必须始终输出，内容为 0–5 个适合 BM25 / FTS5 精确匹配的高区分度英文词或短语。依次优先选择：模型或算法名、缩写、数据集、指标名、年份或数值约束、高区分度专业术语。必须完整保留 PM2.5、D²STGNN†、D²STGNN‡、LSTM-EMVE、shapeDTW 等复合实体，不能拆词。How、What、Which、Who、paper、study、result、method 等无区分度问句词禁止进入关键词。只有确实没有合适词法线索时才显式返回 []。
 
 只输出严格 JSON：
 {
@@ -54,10 +54,11 @@ def build_query_resolution_user_prompt(
 def build_retrieval_rewrite_user_prompt(
     *, resolved_query: str, max_lexical_keywords_en: int
 ) -> str:
-    """Retrieval Rewrite 只接收 resolved_query，防止会话历史干扰英文检索改写。"""
+    """Retrieval Rewrite 只接收 resolved_query，并再次强调两个字段都必须显式输出。"""
     return (
         "<resolved_query>\n"
         f"{resolved_query}\n"
         "</resolved_query>\n\n"
-        f"lexical_keywords_en 最多 {max_lexical_keywords_en} 条。现在仅返回 Retrieval Rewrite JSON。"
+        f"lexical_keywords_en 必须显式输出，允许 []，最多 {max_lexical_keywords_en} 条。"
+        "现在仅返回同时包含 semantic_query_en 和 lexical_keywords_en 的 Retrieval Rewrite JSON。"
     )

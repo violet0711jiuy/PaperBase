@@ -22,6 +22,11 @@ from paperbase.prompts.query_rewrite import (
     build_query_resolution_user_prompt,
     build_retrieval_rewrite_user_prompt,
 )
+from paperbase.retrieval.lexical_terms import (
+    extract_lexical_terms,
+    merge_lexical_terms,
+    normalize_lexical_terms,
+)
 
 
 @dataclass(frozen=True)
@@ -60,7 +65,8 @@ class RetrievalRewriteResult(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     semantic_query_en: str = Field(min_length=1)
-    lexical_keywords_en: list[str] = Field(default_factory=list)
+    # 字段必须由模型显式返回；空数组合法，但字段缺失必须触发 Schema Validation Error。
+    lexical_keywords_en: list[str] = Field(max_length=5)
 
 
 @dataclass(frozen=True)
@@ -72,8 +78,14 @@ class QueryRewritePlan:
     resolution_status: Literal["resolved", "unresolved"] = "resolved"
     semantic_query_en: str | None = None
     lexical_keywords_en: tuple[str, ...] = ()
-    # success 表示 Retrieval Rewrite LLM 成功；degraded 不影响 resolved_query 的 Dense 检索。
-    rewrite_status: Literal["success", "degraded", "not_run"] = "not_run"
+    # 三层状态分别描述语义通道、词法通道与整体计划，避免空 lexical 被误报为完整成功。
+    semantic_status: Literal["valid", "invalid", "unavailable"] = "unavailable"
+    lexical_status: Literal[
+        "valid_llm", "valid_merged", "valid_fallback", "empty", "invalid"
+    ] = "empty"
+    rewrite_status: Literal["success", "partial", "degraded", "not_run"] = "not_run"
+    # 只记录高置信度程序诊断；不引入第二次 LLM Judge。
+    validation_diagnostics: tuple[str, ...] = ()
     # 仅由 resolve_bibliography_search_rule 程序规则产生，绝不信任 LLM。
     search_bibliography: bool = False
     clarification_message: str | None = None
@@ -110,14 +122,18 @@ class NoopQueryPlanner:
         if resolution is None:
             # 离线状态不能用不可信历史猜“它”，必须明确请求用户补充对象。
             return _unresolved_plan(normalized_query)
+        lexical_terms = extract_lexical_terms(
+            resolution, max_terms=self._settings.max_lexical_keywords_en
+        )
         return QueryRewritePlan(
             original_query=normalized_query,
             resolved_query=resolution,
             semantic_query_en=None,
-            lexical_keywords_en=_safe_existing_english_entities(
-                resolution, max_keywords=self._settings.max_lexical_keywords_en
-            ),
-            rewrite_status="degraded",
+            lexical_keywords_en=lexical_terms,
+            semantic_status="unavailable",
+            lexical_status="valid_fallback" if lexical_terms else "empty",
+            rewrite_status="partial" if lexical_terms else "degraded",
+            validation_diagnostics=("rewrite_disabled",),
             search_bibliography=resolve_bibliography_search_rule(normalized_query),
         )
 
@@ -188,6 +204,8 @@ class LLMQueryPlanner:
     ) -> QueryRewritePlan:
         """Resolution 成功后才调用 Retrieval Rewrite；其失败不得阻断第一条 Dense。"""
         bibliography_intent = resolve_bibliography_search_rule(original_query)
+        diagnostic_entities = extract_lexical_terms(resolved_query, max_terms=20)
+        deterministic_terms = diagnostic_entities[: self._settings.max_lexical_keywords_en]
         try:
             raw_response = self._client.complete_json(
                 system_prompt=RETRIEVAL_REWRITE_SYSTEM_PROMPT,
@@ -200,30 +218,73 @@ class LLMQueryPlanner:
             )
             result = RetrievalRewriteResult.model_validate_json(raw_response)
             semantic_query = _optional_normalized(result.semantic_query_en)
-            if semantic_query is None:
-                raise ValueError("semantic_query_en must not be blank.")
+            semantic_status, semantic_diagnostics = _validate_semantic_query(
+                semantic_query,
+                original_query=resolved_query,
+            )
+            if semantic_status != "valid":
+                # 明显污染的语义问句不能进入 Dense；原问题 Dense 仍按原链路保留。
+                semantic_query = None
+            llm_terms = normalize_lexical_terms(
+                result.lexical_keywords_en,
+                max_terms=self._settings.max_lexical_keywords_en,
+            )
+            llm_terms, lexical_diagnostics = _filter_llm_lexical_terms(
+                llm_terms,
+                original_query=resolved_query,
+                semantic_query=semantic_query,
+                semantic_status=semantic_status,
+            )
+            lexical_terms = merge_lexical_terms(
+                llm_terms,
+                deterministic_terms,
+                max_terms=self._settings.max_lexical_keywords_en,
+            )
+            lexical_status = _resolve_lexical_status(
+                llm_terms=llm_terms,
+                deterministic_terms=deterministic_terms,
+                final_terms=lexical_terms,
+            )
+            diagnostics = list(semantic_diagnostics)
+            diagnostics.extend(lexical_diagnostics)
+            if not result.lexical_keywords_en:
+                diagnostics.append("llm_lexical_explicitly_empty")
+            diagnostics.extend(
+                _entity_preservation_diagnostics(
+                    diagnostic_entities,
+                    semantic_query=semantic_query,
+                    lexical_terms=lexical_terms,
+                )
+            )
             return QueryRewritePlan(
                 original_query=original_query,
                 resolved_query=resolved_query,
                 semantic_query_en=semantic_query,
-                lexical_keywords_en=_normalize_keywords(
-                    result.lexical_keywords_en,
-                    max_keywords=self._settings.max_lexical_keywords_en,
+                lexical_keywords_en=lexical_terms,
+                semantic_status=semantic_status,
+                lexical_status=lexical_status,
+                rewrite_status=_resolve_rewrite_status(
+                    semantic_status=semantic_status,
+                    lexical_status=lexical_status,
                 ),
-                rewrite_status="success",
+                validation_diagnostics=tuple(diagnostics),
                 search_bibliography=bibliography_intent,
             )
-        except (LLMRequestError, ValidationError, ValueError, TypeError):
-            # 不做术语表翻译或英文句式拼接；只留下原问题中可直接观察到的英文实体。
+        except (LLMRequestError, ValidationError, ValueError, TypeError) as error:
+            # LLM 或 Schema 失败时仍保留统一确定性 lexical；Original Dense 也不受影响。
+            lexical_status = "valid_fallback" if deterministic_terms else "empty"
             return QueryRewritePlan(
                 original_query=original_query,
                 resolved_query=resolved_query,
                 semantic_query_en=None,
-                lexical_keywords_en=_safe_existing_english_entities(
-                    resolved_query,
-                    max_keywords=self._settings.max_lexical_keywords_en,
+                lexical_keywords_en=deterministic_terms,
+                semantic_status="unavailable",
+                lexical_status=lexical_status,
+                rewrite_status=_resolve_rewrite_status(
+                    semantic_status="unavailable",
+                    lexical_status=lexical_status,
                 ),
-                rewrite_status="degraded",
+                validation_diagnostics=(f"rewrite_error:{type(error).__name__}",),
                 search_bibliography=bibliography_intent,
             )
 
@@ -346,29 +407,114 @@ def _normalize_conversation_context(
     return cleaned
 
 
-def _normalize_keywords(values: Sequence[str], *, max_keywords: int) -> tuple[str, ...]:
-    """清理模型输出；关键词允许为空，避免为满足数量制造泛词。"""
-    cleaned: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        normalized = " ".join(value.split())
-        key = normalized.casefold()
-        if not normalized or key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(normalized)
-        if len(cleaned) == max_keywords:
-            break
-    return tuple(cleaned)
-
-
-def _safe_existing_english_entities(query: str, *, max_keywords: int) -> tuple[str, ...]:
-    """降级时只提取原句可见的英文实体/缩写，不翻译中文概念或补写英文问句。"""
-    candidates = re.findall(
-        r"(?:[A-Z][A-Za-z0-9:-]*(?:\s+[A-Z][A-Za-z0-9:-]*){0,5})",
-        query,
+def _validate_semantic_query(
+    semantic_query: str | None,
+    *,
+    original_query: str,
+) -> tuple[Literal["valid", "invalid"], tuple[str, ...]]:
+    """执行高置信度语义防护，拦截空值、中文污染和凭空新增的消融标记。"""
+    if semantic_query is None:
+        return "invalid", ("semantic_blank",)
+    if re.search(r"[\u3400-\u9fff]", semantic_query):
+        return "invalid", ("semantic_contains_cjk",)
+    original_markers = {marker for marker in ("†", "‡") if marker in original_query}
+    semantic_markers = {marker for marker in ("†", "‡") if marker in semantic_query}
+    if not semantic_markers.issubset(original_markers):
+        return "invalid", ("semantic_entity_variant_marker_added",)
+    # “春夏季”等并列季节是明确检索约束；只翻译其中一个会直接缩小问题范围。
+    season_constraints = (
+        ("春", "spring"),
+        ("夏", "summer"),
+        ("秋", "autumn"),
+        ("冬", "winter"),
     )
-    return _normalize_keywords(candidates, max_keywords=max_keywords)
+    semantic_folded = semantic_query.casefold()
+    missing_seasons = [
+        english
+        for chinese, english in season_constraints
+        if chinese in original_query and english not in semantic_folded
+    ]
+    if missing_seasons:
+        return "invalid", tuple(
+            f"semantic_season_constraint_missing:{season}"
+            for season in missing_seasons
+        )
+    # 单论文问法“论文如何/是否……”不能被改成 papers，否则会把检索范围扩大到多论文。
+    if re.match(r"^论文(?:如何|是否|中|给出|报告|采用|使用)", original_query) and re.search(
+        r"\bpapers\b", semantic_folded
+    ):
+        return "invalid", ("semantic_single_paper_scope_pluralized",)
+    return "valid", ()
+
+
+def _resolve_lexical_status(
+    *,
+    llm_terms: tuple[str, ...],
+    deterministic_terms: tuple[str, ...],
+    final_terms: tuple[str, ...],
+) -> Literal["valid_llm", "valid_merged", "valid_fallback", "empty"]:
+    """根据最终关键词的来源返回可审计的 lexical 状态。"""
+    if not final_terms:
+        return "empty"
+    if llm_terms and deterministic_terms:
+        return "valid_merged"
+    if llm_terms:
+        return "valid_llm"
+    return "valid_fallback"
+
+
+def _filter_llm_lexical_terms(
+    terms: tuple[str, ...],
+    *,
+    original_query: str,
+    semantic_query: str | None,
+    semantic_status: Literal["valid", "invalid"],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """只保留能锚定到原问题或合法 semantic 的 LLM 词，避免污染 BM25。"""
+    allowed_markers = {marker for marker in ("†", "‡") if marker in original_query}
+    searchable_source = f"{original_query} {semantic_query or ''}".casefold()
+    kept: list[str] = []
+    diagnostics: list[str] = []
+    for term in terms:
+        term_markers = {marker for marker in ("†", "‡") if marker in term}
+        if not term_markers.issubset(allowed_markers):
+            diagnostics.append(f"llm_lexical_variant_marker_removed:{term}")
+            continue
+        if semantic_status != "valid":
+            diagnostics.append(f"llm_lexical_discarded_with_invalid_semantic:{term}")
+            continue
+        if term.casefold() not in searchable_source:
+            diagnostics.append(f"llm_lexical_unanchored_removed:{term}")
+            continue
+        kept.append(term)
+    return tuple(kept), tuple(diagnostics)
+
+
+def _resolve_rewrite_status(
+    *,
+    semantic_status: Literal["valid", "invalid", "unavailable"],
+    lexical_status: str,
+) -> Literal["success", "partial", "degraded"]:
+    """按两个通道是否可用计算整体状态，不把单通道可用误报为完整成功。"""
+    semantic_usable = semantic_status == "valid"
+    lexical_usable = lexical_status.startswith("valid_")
+    if semantic_usable and lexical_usable:
+        return "success"
+    if semantic_usable or lexical_usable:
+        return "partial"
+    return "degraded"
+
+
+def _entity_preservation_diagnostics(
+    entities: Sequence[str],
+    *,
+    semantic_query: str | None,
+    lexical_terms: Sequence[str],
+) -> tuple[str, ...]:
+    """记录原问题关键实体在两个补充通道中均未出现的警告，但不据此判语义无效。"""
+    searchable = " ".join((semantic_query or "", *lexical_terms)).casefold()
+    missing = [entity for entity in entities if entity.casefold() not in searchable]
+    return tuple(f"entity_not_preserved:{entity}" for entity in missing)
 
 
 def resolve_bibliography_search_rule(query: str) -> bool:
