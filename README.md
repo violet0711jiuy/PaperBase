@@ -23,6 +23,7 @@
 [系统架构](#-系统架构) ·
 [评测结果](#-评测结果) ·
 [快速开始](#-快速开始) ·
+[运行检查](#-运行检查) ·
 [项目结构](#-项目结构) ·
 [开发文档](docs/index.md) ·
 [Roadmap](#-roadmap)
@@ -190,8 +191,12 @@ Evidence Expansion 将整体 Evidence Recall 从 **85.94% → 93.23%**。
 eval/
 ├── candidates/
 ├── datasets/
-└── results/
+├── scripts/
+└── results/       # 本地生成，不提交到 Git
 ```
+
+评测代码与数据说明见 [`eval/README.md`](eval/README.md)。论文 PDF、SQLite、FAISS、
+模型权重和逐次运行结果均属于本地工件，不随仓库发布。
 
 ---
 
@@ -242,30 +247,82 @@ post_expansion_incomplete
 
 ## 🚀 快速开始
 
-### 1. Clone
+### 0. 环境要求
+
+当前主开发与回归环境为 **Windows + PowerShell + Python 3.10 + NVIDIA CUDA**。
+CPU 也可以运行，但 PDF 解析、Embedding 与 Reranker 会明显更慢。
+
+开始前请准备：
+
+- Git 与 Python 3.10
+- 可用的 OpenAI-compatible LLM API
+- 约数 GB 本地磁盘空间用于 Docling、Embedding 与 Reranker 模型
+- 可选：NVIDIA GPU 与匹配的 CUDA 版 PyTorch
+
+> 仓库不包含模型权重、论文 PDF、API Key、SQLite 数据库或 FAISS 索引。
+
+### 1. Clone 仓库
 
 ```bash
-git clone <YOUR_REPOSITORY_URL>
+git clone https://github.com/violet0711jiuy/PaperBase.git
 cd PaperBase
 ```
 
-### 2. 创建虚拟环境
+### 2. 创建虚拟环境并安装 PyTorch
 
 Windows / PowerShell：
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+python -m pip install --upgrade pip
 ```
 
-推荐环境：
+PyTorch 与机器的 CPU / CUDA 环境相关，因此没有固定写入 `requirements.txt`。
+请先使用 [PyTorch 官方安装选择器](https://pytorch.org/get-started/locally/) 获取匹配命令。
+仅使用 CPU 时可以先执行：
+
+```powershell
+python -m pip install torch
+```
+
+安装后确认 PyTorch 可用：
+
+```powershell
+python -c "import torch; print(torch.__version__); print('CUDA:', torch.cuda.is_available())"
+```
+
+### 3. 安装项目依赖
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+当前已回归验证的核心版本为：
 
 ```text
-Python 3.10+
+Python 3.10.4
+Docling 2.119.0
+FAISS 1.15.0
+Sentence Transformers 5.7.0
+Streamlit 1.61.1
 ```
 
-### 3. 配置环境变量
+### 4. 下载本地模型
+
+项目以离线方式加载模型，不会在查询时自动下载。下面的目录与
+`config.example.yaml` 默认值一致：
+
+```powershell
+hf download Qwen/Qwen3-Embedding-0.6B --local-dir models/Qwen3-Embedding-0.6B
+hf download BAAI/bge-reranker-v2-m3 --local-dir models/bge-reranker-v2-m3
+docling-tools models download --output-dir models/docling
+```
+
+如果 Hugging Face 模型需要鉴权，可先执行 `hf auth login`。`models/` 已加入
+`.gitignore`，不会被提交。
+
+### 5. 创建本地配置
 
 复制环境变量与运行配置模板：
 
@@ -274,22 +331,109 @@ Copy-Item .env.example .env
 Copy-Item config.example.yaml config.yaml
 ```
 
-根据 `.env.example` 配置 LLM API，并在本地 `config.yaml` 中填写 Docling、Embedding
-与 Reranker 的实际模型目录。`.env` 和 `config.yaml` 均不会提交到 Git。
+在 `.env` 中填写 LLM 服务：
 
-Embedding、Reranker、Retrieval Top-K 等参数可在：
-
-```text
-config.yaml
+```dotenv
+LLM_API_KEY=你的密钥
+LLM_BASE_URL=OpenAI-compatible API 地址
+LLM_MODEL=模型名称
 ```
 
-中配置。
+模板默认使用 ModelScope 的 OpenAI-compatible 接口，也可以替换为其他兼容服务。
+不要把真实密钥写入 `.env.example`、YAML、测试或文档。
 
-### 4. 启动应用
+`config.example.yaml` 中的三个模型目录已经对应上一步的下载位置。如果使用其他目录，
+请在本地 `config.yaml` 中修改：
+
+```text
+parsing.docling.artifacts_path
+chunking.tokenizer_path
+embedding.model_path
+reranking.model_path
+```
+
+没有 CUDA 时，还需要把以下设备配置改为 `cpu`：
+
+```text
+parsing.docling.device
+embedding.device
+reranking.device
+```
+
+`.env` 和 `config.yaml` 均不会提交到 Git。完整字段说明见
+[`docs/configuration.md`](docs/configuration.md)。
+
+### 6. 检查配置与 LLM
+
+```powershell
+python -c "from paperbase.config import load_settings; print(load_settings())"
+python -m paperbase.llm.healthcheck --config .\config.yaml
+```
+
+第二条命令会发送一次最小 LLM 请求；失败时应先检查 API Key、Base URL、模型名和网络，
+再启动完整问答流程。
+
+### 7. 建立知识库
+
+推荐通过 UI 增量加入论文：
+
+1. 先按下一节启动 Streamlit；
+2. 进入 **Paper Workspace**，上传单个 PDF；
+3. 解析完成后可先使用 Overview / Explain Section / Ask This Paper；
+4. 点击 **加入知识库**，将该论文安全写入正式 SQLite 与 FAISS。
+
+如果已经把一批 PDF 放入 `storage/papers/`，也可以执行一次 clean rebuild：
+
+```powershell
+python -m paperbase.rebuild --config .\config.yaml
+python -m paperbase.indexing --config .\config.yaml --verify
+```
+
+Clean rebuild 会重新解析 `storage/papers/` 中的全部 PDF，并原子发布新的 SQLite、
+Embedding 工件与 FAISS；不要用它替代日常单篇增量入库。
+
+### 8. 启动应用
 
 ```powershell
 streamlit run app/app.py
 ```
+
+浏览器打开 Streamlit 提示的本地地址后：
+
+- **Knowledge Base**：对已经加入正式知识库的论文提问；
+- **Paper Workspace**：上传和阅读单篇临时论文，并决定是否加入正式库。
+
+---
+
+## ✅ 运行检查
+
+### 单元与回归测试
+
+```powershell
+python -m pytest -q
+```
+
+测试不需要真实 LLM 请求或下载论文，但完整套件需要先安装 `requirements.txt` 中的依赖。
+
+### 正式索引一致性
+
+```powershell
+python -m paperbase.indexing --config .\config.yaml --verify
+```
+
+### Retrieval Evaluation
+
+仓库公开当前 40-case Golden Dataset 与确定性评测脚本。运行前必须先准备与
+[`eval/README.md`](eval/README.md) 清单一致的论文，并建立对应的正式知识库：
+
+```powershell
+python eval\scripts\validate_golden_dataset.py
+python eval\scripts\run_retrieval_eval.py
+python eval\scripts\build_retrieval_diagnostic.py
+python eval\scripts\build_query_planner_audit.py
+```
+
+报告会写入已忽略的 `eval/results/`，不会改写 Golden Dataset 或正式检索链路。
 
 ---
 
@@ -329,7 +473,7 @@ PaperBase/
 ├── eval/
 │   ├── candidates/          # Candidate Golden + 人工审核
 │   ├── datasets/            # Reviewed Golden Dataset
-│   ├── results/             # Evaluation Results
+│   ├── results/             # 本地 Evaluation Results（Git ignored）
 │   └── scripts/             # Evaluation Scripts
 │
 ├── docs/
@@ -420,6 +564,7 @@ References 中包含大量论文题名、作者和专业术语。如果直接参
 - Synthesis Query 往往需要跨 Section 组合多个 Evidence
 - 当前 Golden Dataset 规模较小，主要服务于工程回归与组件比较
 - Query Planner 对复杂 multi-facet Query 仍有进一步优化空间
+- 当前公开基线依赖 4 篇外部论文；仓库不重新分发其 PDF
 
 ---
 
@@ -454,6 +599,13 @@ Evaluation
 ```
 
 核心关注点不是单纯调用 LLM，而是围绕 **检索质量、证据完整性、失败归因和可评测性** 构建完整的论文 RAG 系统。
+
+---
+
+## 📄 许可说明
+
+当前仓库尚未附带开源许可证。公开可见不等同于自动授予复制、修改或再分发权；如果计划
+将 PaperBase 作为正式开源项目发布，需要由项目所有者明确选择并加入 LICENSE。
 
 ---
 

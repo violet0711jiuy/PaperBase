@@ -7,6 +7,8 @@ numpy>=2.0,<3.0
 pydantic>=2.0,<3.0
 # Step 4 直接依赖其 SentenceTransformer 封装加载本地 Qwen3-Embedding 模型。
 sentence-transformers>=5.7,<6.0
+# README 使用 hf CLI 将模型下载到 config.example.yaml 约定的本地目录。
+huggingface-hub>=1.0,<2.0
 # Step 5 使用 CPU 版 FAISS 建立 MVP 的全局 IndexIDMap2(IndexFlatIP)；对当前小型知识库
 # CPU 已足够，未来数据量需要时可单独评估 GPU 索引实现。
 faiss-cpu>=1.15,<2.0
