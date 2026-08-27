@@ -1,4 +1,17 @@
-# PaperBase v1.1 后续优化计划：多论文检索、比较与归纳
+# PaperBase 多论文检索、比较与归纳 Roadmap
+
+> 状态：`PLANNED`
+> 当前正式 Evaluation 仍限定为单论文、Context-free Retrieval Benchmark。
+
+## 实施状态
+
+| Phase | 状态 | 说明 |
+|---|---|---|
+| Phase 0：多论文验收集 | `NOT STARTED` | 当前 Golden v1.2 只评单论文。 |
+| Phase 0.5：首页元数据与标题 | `COMPLETED` | 已有结构一致性标题解析和回归测试。 |
+| Phase 1：论文实体与别名 | `PLANNED` | 尚无完整论文别名索引。 |
+| Phase 2：结构化 Query Planner | `PARTIAL` | 已完成 Resolution/Rewrite 可靠性修复，但未实现多论文计划契约。 |
+| Phase 3–7 | `PLANNED` | 尚未进入实现。 |
 
 ## 1. 定位与边界
 

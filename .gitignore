@@ -58,6 +58,9 @@ eval/results/
 # Disposable local workspaces and retry artifacts
 tmp/
 
+# Local historical notes retained outside the public documentation set
+docs/_local/
+
 # Logs
 *.log
 

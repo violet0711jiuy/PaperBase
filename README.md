@@ -24,6 +24,7 @@
 [评测结果](#-评测结果) ·
 [快速开始](#-快速开始) ·
 [项目结构](#-项目结构) ·
+[开发文档](docs/index.md) ·
 [Roadmap](#-roadmap)
 
 </div>
@@ -332,9 +333,11 @@ PaperBase/
 │   └── scripts/             # Evaluation Scripts
 │
 ├── docs/
-│   ├── evaluation_design.md
-│   ├── problems.md
-│   └── log/
+│   ├── index.md             # 文档索引与维护规则
+│   ├── configuration.md
+│   ├── pipeline/            # 当前解析、存储、检索与生成设计
+│   ├── evaluation/          # Evaluation Design 与当前 Baseline
+│   └── roadmap/             # 明确标记为未实现的后续规划
 │
 ├── storage/                 # Local Index / Runtime Data
 ├── tests/                   # Unit & Regression Tests
