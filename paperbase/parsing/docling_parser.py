@@ -29,6 +29,7 @@ from .base import (
     ParsedPaper,
     SectionRecord,
 )
+from .section_semantics import is_back_matter_root_heading, is_bibliography_heading
 
 
 # 标题 resolver 只识别“出版栏模式”，绝不维护具体期刊名白名单。键已去除大小写、
@@ -499,6 +500,9 @@ class _SectionHeadingCandidate:
     text: str
     native_level: int
     section_number: str | None
+    # Docling 可能按字体样式把论文后置标题误判为 Conclusion 的深层子标题；
+    # 受控语义命中后，统一章节树必须把它提升为独立根节点。
+    force_root: bool = False
 
 
 class DoclingParser(PaperParser):
@@ -1712,7 +1716,7 @@ def _build_section_records(
             continue
         if text_key == title_key or _NON_SECTION_HEADER.match(text):
             continue
-        if _is_bibliography_heading(text):
+        if is_bibliography_heading(text):
             # References / Bibliography 是既有 section_type 的专用语义，不混入正文树。
             continue
         candidates.append(
@@ -1722,6 +1726,7 @@ def _build_section_records(
                 text=text,
                 native_level=_native_heading_level(item),
                 section_number=_section_number(text),
+                force_root=is_back_matter_root_heading(text),
             )
         )
 
@@ -1738,10 +1743,16 @@ def _build_section_records(
     parent_stack: list[SectionRecord] = []
 
     for section_index, candidate in enumerate(body_candidates):
-        section_level = _normalized_section_level(
-            native_level=candidate.native_level,
-            native_root_level=native_root_level,
-            section_number=candidate.section_number,
+        # CRediT、利益声明、致谢和数据可用性等后置标题具有独立出版语义，
+        # 即使 Docling 把它们标成 level 3，也不能继承最近的 Conclusion。
+        section_level = (
+            1
+            if candidate.force_root
+            else _normalized_section_level(
+                native_level=candidate.native_level,
+                native_root_level=native_root_level,
+                section_number=candidate.section_number,
+            )
         )
         # 栈顶始终是阅读顺序中最近、且层级更浅的真实 Section，因此就是直属父节点。
         while parent_stack and parent_stack[-1].section_level >= section_level:
@@ -1879,12 +1890,6 @@ def _section_number(text: str) -> str | None:
 def _section_number_depth(section_number: str) -> int:
     """编号 ``3.1.2`` 的深度是 3，用于原生 level 缺失时的局部兜底。"""
     return len(section_number.split("."))
-
-
-def _is_bibliography_heading(text: str) -> bool:
-    """与 Chunker 的 bibliography 语义保持一致，只过滤受控的末级标题。"""
-    leaf = re.sub(r"^\d+(?:\.\d+)*(?:\.)?\s+", "", text).casefold().rstrip(": ")
-    return leaf in {"references", "bibliography", "works cited", "literature cited"}
 
 
 def _paper_id(source: Path) -> str:

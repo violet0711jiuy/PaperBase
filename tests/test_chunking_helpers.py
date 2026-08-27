@@ -12,7 +12,7 @@ from paperbase.chunking.docling_hybrid_chunker import (
     _section_from_headings,
     _section_type_from_headings,
 )
-from paperbase.parsing.base import FrontMatterBlock
+from paperbase.parsing.base import FrontMatterBlock, SectionRecord
 
 
 class ChunkingHelperTests(unittest.TestCase):
@@ -34,10 +34,38 @@ class ChunkingHelperTests(unittest.TestCase):
         self.assertIsNone(_section_from_headings(None))
 
     def test_only_controlled_reference_headings_are_bibliography(self) -> None:
+        """只有末级受控标题才能触发 bibliography，普通相关工作仍属于正文。"""
         self.assertEqual(_section_type_from_headings(["2. Related Work"]), "content")
         self.assertEqual(_section_type_from_headings(["7. References"]), "bibliography")
         self.assertEqual(_section_type_from_headings(["Works Cited"]), "bibliography")
         self.assertEqual(_section_type_from_headings(["Literature Cited"]), "bibliography")
+
+    def test_back_matter_leaf_does_not_inherit_conclusion_in_display_path(self) -> None:
+        """后置标题即使被 Docling 挂在 Conclusion 下，展示路径也只保留真实末级标题。"""
+        conclusion = SectionRecord(
+            section_id="paper_fixture_section_0000",
+            paper_id="paper_fixture",
+            section_title="7. Conclusion",
+            section_number="7",
+            section_level=1,
+            parent_section_id=None,
+            section_index=0,
+            page_start=19,
+            page_end=19,
+        )
+
+        self.assertEqual(
+            _section_from_headings(
+                ["7. Conclusion", "References"], sections=(conclusion,)
+            ),
+            "References",
+        )
+        self.assertEqual(
+            _section_from_headings(
+                ["7. Conclusion", "Data availability"], sections=(conclusion,)
+            ),
+            "Data availability",
+        )
 
     def test_embedding_text_adds_context_without_changing_raw_text(self) -> None:
         """检索文本应显式带标题与章节，正文内容完整保留。"""

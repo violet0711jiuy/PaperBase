@@ -17,6 +17,10 @@ from paperbase.parsing.base import (
     ParsedPaper,
     SectionRecord,
 )
+from paperbase.parsing.section_semantics import (
+    is_back_matter_root_heading,
+    is_bibliography_heading,
+)
 
 from .base import ChunkingResult, PaperChunk, PaperChunker
 
@@ -78,6 +82,9 @@ class DoclingHybridPaperChunker(PaperChunker):
                 # 空对象对向量检索没有意义，也不能提供有效证据，因此不建立空 chunk。
                 continue
             page_start, page_end = _page_range(docling_chunk)
+            # section_type 先于展示路径计算，确保 References 即使继承了错误的
+            # Docling 祖先标题，也能走 bibliography 的专用防御分支。
+            section_type = _section_type_from_headings(docling_chunk.meta.headings)
             front_matter_heading = _front_matter_heading_for_chunk(
                 headings=docling_chunk.meta.headings,
                 page_start=page_start,
@@ -116,12 +123,9 @@ class DoclingHybridPaperChunker(PaperChunker):
                     front_matter_blocks=parsed_paper.front_matter,
                 )
             )
-            # 基于 Docling 已恢复的标题层级分类，而非在段落正文中搜索 “references”。
-            # 因此 “Related Work” 即使讨论引用，也仍然是正文 content。
-            section_type = _section_type_from_headings(docling_chunk.meta.headings)
             section_id = (
                 None
-                if front_matter_type is not None
+                if front_matter_type is not None or section_type == "bibliography"
                 else _section_id_from_headings(
                     headings=docling_chunk.meta.headings,
                     sections=parsed_paper.sections,
@@ -269,10 +273,14 @@ def _section_from_headings(
     *,
     sections: tuple[SectionRecord, ...] = (),
 ) -> str | None:
-    """将 Docling 标题链转为展示路径，并从正文路径剔除非正文祖先。"""
+    """生成 chunk 展示路径，并阻止受控后置标题继承错误的 Conclusion。"""
     normalized_headings = [
         _normalize_whitespace(heading) for heading in (headings or []) if heading.strip()
     ]
+    if normalized_headings and is_back_matter_root_heading(normalized_headings[-1]):
+        # 后置标题的末级语义比 Docling 的字体层级推断更可靠。这里只返回真实末级
+        # heading 文本，不凭正文内容创造或改写标题。
+        return normalized_headings[-1]
     if sections:
         body_heading_keys = {
             _normalized_heading_key(section.section_title) for section in sections
@@ -295,8 +303,12 @@ def _section_id_from_headings(
     sections: tuple[SectionRecord, ...],
     page_start: int | None,
 ) -> str | None:
-    """将 HybridChunker 标题链映射到最近的真实 Section，算法标签可回退到父章节。"""
+    """映射最近的真实正文 Section，并禁止 bibliography 回退到正文祖先。"""
     if not headings or not sections:
+        return None
+    if is_bibliography_heading(headings[-1]):
+        # References 不属于正文 Section Tree；即使原始标题链中带 Conclusion，
+        # 也不能把 bibliography chunk 绑定到 Conclusion 的 section_id。
         return None
     # 通常第一个命中就是末级 heading。若末级是 Algorithm/Input/Output 这类非 Section
     # 标签，则沿 Docling 原生 ancestor chain 向上回退到最近的真实父 Section。
@@ -364,16 +376,7 @@ def _section_type_from_headings(headings: list[str] | None) -> str:
     """
     if not headings:
         return "content"
-    heading = _normalize_whitespace(headings[-1])
-    # 删除章节编号、罗马数字或括号编号，保留真正的标题语义。
-    leaf = re.sub(
-        r"^(?:\d+(?:\.\d+)*(?:[.)]|\s+)|[IVXLC]+(?:[.)]|\s+))",
-        "",
-        heading,
-        flags=re.IGNORECASE,
-    )
-    normalized = _normalize_whitespace(leaf).casefold().rstrip(":")
-    if normalized in {"references", "bibliography", "works cited", "literature cited"}:
+    if is_bibliography_heading(headings[-1]):
         return "bibliography"
     return "content"
 

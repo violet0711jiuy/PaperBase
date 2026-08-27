@@ -93,6 +93,51 @@ class SectionHierarchyTests(unittest.TestCase):
         self.assertIsNone(missing)
         self.assertEqual(algorithm, "paper_fixture_section_0005")
 
+    def test_nested_bibliography_never_falls_back_to_conclusion_section(self) -> None:
+        """References 即使带有错误的 Conclusion 祖先，也不能绑定正文 section_id。"""
+        conclusion = _section(
+            "paper_fixture_section_0000", "7. Conclusion", 19, 0
+        )
+
+        mapped = _section_id_from_headings(
+            headings=["7. Conclusion", "References"],
+            sections=(conclusion,),
+            page_start=20,
+        )
+
+        self.assertIsNone(mapped)
+
+    def test_back_matter_headers_are_independent_roots_despite_docling_level(self) -> None:
+        """受控后置标题即使被 Docling 标为三级，也应成为独立根章节。"""
+        document = _document(
+            _heading("7. Conclusion", level=1, page=19),
+            _heading("CRediT authorship contribution statement", level=3, page=19),
+            _heading("Declaration of competing interest", level=3, page=19),
+            _heading("Acknowledgment", level=3, page=20),
+            _heading("Data availability", level=3, page=20),
+            _heading("References", level=3, page=20),
+        )
+
+        sections = _build_section_records(
+            document=document,
+            paper_id="paper_fixture",
+            paper_title="Fixture paper",
+            front_matter=(),
+        )
+
+        self.assertEqual(
+            [section.section_title for section in sections],
+            [
+                "7. Conclusion",
+                "CRediT authorship contribution statement",
+                "Declaration of competing interest",
+                "Acknowledgment",
+                "Data availability",
+            ],
+        )
+        self.assertTrue(all(section.section_level == 1 for section in sections))
+        self.assertTrue(all(section.parent_section_id is None for section in sections))
+
     def test_late_reading_order_front_matter_parent_and_children_stay_out_of_body_tree(self) -> None:
         """双栏侧栏可在 Introduction 后出现，但其自身 provenance 仍优先于阅读顺序。"""
         document = _document(
