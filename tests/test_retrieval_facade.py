@@ -29,6 +29,24 @@ class _RecordingAdapter:
         return {"adapter": self.label, "paper_id": search.paper_id}
 
 
+class _HeterogeneousAdapter(_RecordingAdapter):
+    def search(
+        self,
+        search: PaperSearchSpec,
+        *,
+        query_origin: QueryOrigin,
+        result_limit: int | None = None,
+    ) -> dict[str, str]:
+        self.calls.append((search, query_origin, result_limit))
+        if search.paper_id == "paper-broken":
+            raise RuntimeError("simulated isolated failure")
+        return {
+            "adapter": self.label,
+            "paper_id": search.paper_id,
+            "query": search.query,
+        }
+
+
 class RetrievalContractsTests(unittest.TestCase):
     def test_search_spec_normalizes_and_deduplicates_text_fields(self) -> None:
         spec = PaperSearchSpec(
@@ -60,6 +78,66 @@ class RetrievalContractsTests(unittest.TestCase):
 
 
 class RetrievalServiceTests(unittest.TestCase):
+    def test_heterogeneous_batch_uses_each_query_and_per_paper_limit(self) -> None:
+        adapter = _HeterogeneousAdapter("formal")
+        service = RetrievalService(formal_adapter=adapter)
+        request = SearchPapersRequest(
+            query_origin=QueryOrigin.AGENT_SUPPLIED,
+            searches=(
+                PaperSearchSpec(
+                    paper_id="paper-a",
+                    query="A encoder mechanism",
+                    lexical_terms=("A-Encoder",),
+                ),
+                PaperSearchSpec(
+                    paper_id="paper-b",
+                    query="B temporal decoder",
+                    lexical_terms=("B-Decoder",),
+                ),
+            ),
+            top_k_per_paper=3,
+        )
+
+        executions = service.search_papers(
+            request,
+            source=RetrievalSource.FORMAL_KNOWLEDGE_BASE,
+        )
+
+        self.assertEqual(
+            [call[0].query for call in adapter.calls],
+            ["A encoder mechanism", "B temporal decoder"],
+        )
+        self.assertEqual([call[2] for call in adapter.calls], [3, 3])
+        self.assertEqual(
+            [execution.result["query"] for execution in executions],  # type: ignore[index]
+            ["A encoder mechanism", "B temporal decoder"],
+        )
+        self.assertTrue(all(execution.succeeded for execution in executions))
+
+    def test_batch_preserves_successes_when_one_paper_fails(self) -> None:
+        adapter = _HeterogeneousAdapter("formal")
+        service = RetrievalService(formal_adapter=adapter)
+        request = SearchPapersRequest(
+            query_origin=QueryOrigin.AGENT_SUPPLIED,
+            searches=(
+                PaperSearchSpec(paper_id="paper-a", query="A method"),
+                PaperSearchSpec(paper_id="paper-broken", query="Broken method"),
+                PaperSearchSpec(paper_id="paper-c", query="C method"),
+            ),
+        )
+
+        executions = service.search_papers(
+            request,
+            source=RetrievalSource.FORMAL_KNOWLEDGE_BASE,
+        )
+
+        self.assertEqual(len(adapter.calls), 3)
+        self.assertTrue(executions[0].succeeded)
+        self.assertFalse(executions[1].succeeded)
+        self.assertEqual(executions[1].error_code, "RuntimeError")
+        self.assertTrue(executions[2].succeeded)
+        self.assertEqual(executions[2].result["paper_id"], "paper-c")  # type: ignore[index]
+
     def test_explicit_source_dispatch_keeps_formal_and_workspace_separate(self) -> None:
         formal = _RecordingAdapter("formal")
         workspace = _RecordingAdapter("workspace")

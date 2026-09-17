@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Protocol, TypeVar
+from dataclasses import dataclass
+from typing import Mapping, Protocol, TypeVar
 
-from .contracts import PaperSearchSpec, QueryOrigin, RetrievalSource
+from .contracts import (
+    PaperSearchSpec,
+    QueryOrigin,
+    RetrievalSource,
+    SearchPapersRequest,
+)
 
 
 SearchResultT = TypeVar("SearchResultT", covariant=True)
@@ -21,6 +27,22 @@ class RetrievalAdapter(Protocol[SearchResultT]):
         result_limit: int | None = None,
     ) -> SearchResultT:
         """在适配器自己的数据边界内执行一次论文检索。"""
+
+
+@dataclass(frozen=True)
+class PaperBatchExecution:
+    """Batch 内一篇论文的隔离执行结果；状态语义在 Tool 层统一映射。"""
+
+    paper_id: str
+    query: str
+    lexical_terms: tuple[str, ...]
+    result: object | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error_code is None
 
 
 class RetrievalService:
@@ -58,6 +80,50 @@ class RetrievalService:
             query_origin=QueryOrigin(query_origin),
             result_limit=result_limit,
         )
+
+    def search_papers(
+        self,
+        request: SearchPapersRequest,
+        *,
+        source: RetrievalSource,
+        workspace_ids_by_paper: Mapping[str, str] | None = None,
+    ) -> tuple[PaperBatchExecution, ...]:
+        """逐篇执行异构 Query；一篇失败不得丢弃其他论文结果。"""
+        executions: list[PaperBatchExecution] = []
+        for search in request.searches:
+            workspace_id = (
+                workspace_ids_by_paper.get(search.paper_id)
+                if workspace_ids_by_paper is not None
+                else None
+            )
+            try:
+                result = self.search_paper(
+                    search,
+                    query_origin=request.query_origin,
+                    source=source,
+                    workspace_id=workspace_id,
+                    result_limit=request.top_k_per_paper,
+                )
+            except Exception as error:
+                executions.append(
+                    PaperBatchExecution(
+                        paper_id=search.paper_id,
+                        query=search.query,
+                        lexical_terms=search.lexical_terms,
+                        error_code=type(error).__name__,
+                        error_message=str(error),
+                    )
+                )
+                continue
+            executions.append(
+                PaperBatchExecution(
+                    paper_id=search.paper_id,
+                    query=search.query,
+                    lexical_terms=search.lexical_terms,
+                    result=result,
+                )
+            )
+        return tuple(executions)
 
     def _resolve_adapter(
         self, *, source: RetrievalSource, workspace_id: str | None

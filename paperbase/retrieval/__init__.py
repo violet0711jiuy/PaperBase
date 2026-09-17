@@ -6,7 +6,7 @@ from .adapters import (
     WorkspacePaperAdapter,
 )
 from .contracts import PaperSearchSpec, QueryOrigin, RetrievalSource, SearchPapersRequest
-from .facade import RetrievalAdapter, RetrievalService
+from .facade import PaperBatchExecution, RetrievalAdapter, RetrievalService
 from .hybrid_retriever import HybridRetriever, RetrievedChunk, RetrievalResult
 from .query_rewriter import (
     LLMQueryPlanner,
@@ -21,6 +21,7 @@ __all__ = [
     "LLMQueryPlanner",
     "PaperSearchSpec",
     "PaperRetrievalSnapshot",
+    "PaperBatchExecution",
     "QueryOrigin",
     "QueryRewritePlan",
     "RetrievedChunk",
