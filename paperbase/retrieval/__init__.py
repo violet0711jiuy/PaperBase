@@ -5,8 +5,22 @@ from .adapters import (
     PaperRetrievalSnapshot,
     WorkspacePaperAdapter,
 )
-from .contracts import PaperSearchSpec, QueryOrigin, RetrievalSource, SearchPapersRequest
-from .facade import PaperBatchExecution, RetrievalAdapter, RetrievalService
+from .contracts import (
+    EvidenceSourceType,
+    PaperBatchExecution,
+    PaperSearchOutcome,
+    PaperSearchSpec,
+    PaperSearchStatus,
+    QueryOrigin,
+    RetrievedEvidence,
+    RetrievalSource,
+    SearchPapersPayload,
+    SearchPapersRequest,
+    ToolName,
+    ToolResult,
+    ToolStatus,
+)
+from .facade import RetrievalAdapter, RetrievalService
 from .hybrid_retriever import HybridRetriever, RetrievedChunk, RetrievalResult
 from .query_rewriter import (
     LLMQueryPlanner,
@@ -17,19 +31,27 @@ from .query_rewriter import (
 
 __all__ = [
     "FormalKnowledgeBaseAdapter",
+    "EvidenceSourceType",
     "HybridRetriever",
     "LLMQueryPlanner",
     "PaperSearchSpec",
+    "PaperSearchOutcome",
+    "PaperSearchStatus",
     "PaperRetrievalSnapshot",
     "PaperBatchExecution",
     "QueryOrigin",
     "QueryRewritePlan",
+    "RetrievedEvidence",
     "RetrievedChunk",
     "RetrievalAdapter",
     "RetrievalResult",
     "RetrievalService",
     "RetrievalSource",
     "SearchPapersRequest",
+    "SearchPapersPayload",
+    "ToolName",
+    "ToolResult",
+    "ToolStatus",
     "TrustedPaperScope",
     "WorkspacePaperAdapter",
     "create_query_planner",

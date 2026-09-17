@@ -25,6 +25,7 @@ class EvidenceUnit:
     chunk_ids: tuple[str, ...]
     text: str
     token_count: int
+    section_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class _CandidateGroup:
     paper_id: str
     paper_title: str
     section: str
+    section_id: str | None
     rows: tuple[Any, ...]
     seed_chunk_ids: tuple[str, ...]
     priority: float
@@ -95,30 +97,41 @@ class SectionAwareNeighborExpander:
             return ()
         grouped_seeds: dict[tuple[str, str], list[RetrievedChunk]] = {}
         for seed in seeds:
-            # 空 section 不做邻居扩展：没有可靠的章节边界时，保留命中块本身最安全。
-            section = seed.section.strip()
-            if not section:
-                key = (seed.paper_id, f"__chunk__{seed.chunk_id}")
+            # 新数据优先使用稳定 section_id；旧库才退回展示用 section 文本。
+            if seed.section_id:
+                key = (seed.paper_id, f"id:{seed.section_id}")
             else:
-                key = (seed.paper_id, section)
+                section = seed.section.strip()
+                key = (
+                    (seed.paper_id, f"label:{section}")
+                    if section
+                    else (seed.paper_id, f"chunk:{seed.chunk_id}")
+                )
             grouped_seeds.setdefault(key, []).append(seed)
 
         groups: list[_CandidateGroup] = []
-        for (paper_id, section_key), section_seeds in grouped_seeds.items():
-            section = "" if section_key.startswith("__chunk__") else section_key
-            rows = (
-                self._database.list_content_chunks_in_section(
+        for (paper_id, boundary_key), section_seeds in grouped_seeds.items():
+            first_seed = section_seeds[0]
+            section_id = first_seed.section_id
+            section = first_seed.section.strip()
+            if boundary_key.startswith("id:"):
+                rows = self._database.list_content_chunks_in_section_id(
+                    paper_id=paper_id,
+                    section_id=section_id,
+                )
+            elif boundary_key.startswith("label:"):
+                rows = self._database.list_content_chunks_in_section(
                     paper_id=paper_id,
                     section=section,
                 )
-                if section
-                else ()
-            )
+            else:
+                rows = ()
             groups.extend(
                 _expand_section_seed_windows(
                     seeds=tuple(section_seeds),
                     rows=rows,
                     settings=self._settings,
+                    section_id=section_id,
                 )
             )
         # 先以最强 seed 的 rerank 分数排序；分数相同时保留检索结果中更靠前的组。
@@ -160,6 +173,7 @@ class SectionAwareNeighborExpander:
                     chunk_ids=tuple(str(row["chunk_id"]) for row in group.rows),
                     text=_join_rows(group.rows),
                     token_count=token_count,
+                    section_id=group.section_id,
                 )
             )
         return tuple(evidence)
@@ -170,6 +184,7 @@ def _expand_section_seed_windows(
     seeds: tuple[RetrievedChunk, ...],
     rows: Iterable[Any],
     settings: ContextExpansionSettings,
+    section_id: str | None = None,
 ) -> tuple[_CandidateGroup, ...]:
     """在一个章节内构造连续窗口，并只合并实际重叠的窗口。"""
     row_by_id = {str(row["chunk_id"]): row for row in rows}
@@ -233,6 +248,7 @@ def _expand_section_seed_windows(
                 paper_id=best_seed.paper_id,
                 paper_title=best_seed.paper_title,
                 section=best_seed.section,
+                section_id=section_id,
                 rows=selected_rows,
                 seed_chunk_ids=tuple(
                     seed.chunk_id
@@ -288,6 +304,7 @@ def _bibliography_to_evidence(chunk: RetrievedChunk, *, index: int) -> EvidenceU
         chunk_ids=(chunk.chunk_id,),
         text=chunk.raw_text,
         token_count=max(1, len(chunk.raw_text.split())),
+        section_id=chunk.section_id,
     )
 
 

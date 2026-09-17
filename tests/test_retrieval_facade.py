@@ -98,7 +98,7 @@ class RetrievalServiceTests(unittest.TestCase):
             top_k_per_paper=3,
         )
 
-        executions = service.search_papers(
+        executions = service.execute_papers(
             request,
             source=RetrievalSource.FORMAL_KNOWLEDGE_BASE,
         )
@@ -126,7 +126,7 @@ class RetrievalServiceTests(unittest.TestCase):
             ),
         )
 
-        executions = service.search_papers(
+        executions = service.execute_papers(
             request,
             source=RetrievalSource.FORMAL_KNOWLEDGE_BASE,
         )

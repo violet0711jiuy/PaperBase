@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Mapping, Protocol, TypeVar
 
 from .contracts import (
+    PaperBatchExecution,
     PaperSearchSpec,
     QueryOrigin,
     RetrievalSource,
     SearchPapersRequest,
+    ToolResult,
 )
+from .tool_results import build_search_papers_tool_result
 
 
 SearchResultT = TypeVar("SearchResultT", covariant=True)
@@ -27,22 +29,6 @@ class RetrievalAdapter(Protocol[SearchResultT]):
         result_limit: int | None = None,
     ) -> SearchResultT:
         """在适配器自己的数据边界内执行一次论文检索。"""
-
-
-@dataclass(frozen=True)
-class PaperBatchExecution:
-    """Batch 内一篇论文的隔离执行结果；状态语义在 Tool 层统一映射。"""
-
-    paper_id: str
-    query: str
-    lexical_terms: tuple[str, ...]
-    result: object | None = None
-    error_code: str | None = None
-    error_message: str | None = None
-
-    @property
-    def succeeded(self) -> bool:
-        return self.error_code is None
 
 
 class RetrievalService:
@@ -87,8 +73,26 @@ class RetrievalService:
         *,
         source: RetrievalSource,
         workspace_ids_by_paper: Mapping[str, str] | None = None,
+    ) -> ToolResult:
+        """执行异构 Batch 并返回带逐论文状态的类型化 ToolResult。"""
+        executions = self.execute_papers(
+            request,
+            source=source,
+            workspace_ids_by_paper=workspace_ids_by_paper,
+        )
+        return build_search_papers_tool_result(
+            executions,
+            query_origin=request.query_origin,
+        )
+
+    def execute_papers(
+        self,
+        request: SearchPapersRequest,
+        *,
+        source: RetrievalSource,
+        workspace_ids_by_paper: Mapping[str, str] | None = None,
     ) -> tuple[PaperBatchExecution, ...]:
-        """逐篇执行异构 Query；一篇失败不得丢弃其他论文结果。"""
+        """逐篇隔离执行；供 Tool 转换和底层契约测试使用。"""
         executions: list[PaperBatchExecution] = []
         for search in request.searches:
             workspace_id = (

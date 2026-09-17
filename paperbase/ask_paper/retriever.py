@@ -388,6 +388,7 @@ class WorkspaceHybridRetriever:
             rerank_score=candidate.rerank_score if is_content else None,
             fused_score=candidate.score,
             source_matches=tuple(candidate.sources),
+            section_id=chunk.section_id,
         )
 
     @property

@@ -647,6 +647,33 @@ class MetadataDatabase:
                 ).fetchall()
             )
 
+    def list_content_chunks_in_section_id(
+        self,
+        *,
+        paper_id: str,
+        section_id: str | None,
+    ) -> tuple[sqlite3.Row, ...]:
+        """按稳定直属 ``section_id`` 返回正文块，不依赖章节展示文本。"""
+        normalized_section_id = " ".join((section_id or "").split())
+        if not normalized_section_id:
+            raise MetadataDatabaseError("section_id must not be empty.")
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    """
+                    SELECT chunks.*, documents.paper_title
+                    FROM chunks
+                    INNER JOIN documents ON documents.paper_id = chunks.paper_id
+                    WHERE chunks.paper_id = ?
+                      AND chunks.section_id = ?
+                      AND chunks.section_type = 'content'
+                    ORDER BY chunks.chunk_index
+                    """,
+                    (paper_id, normalized_section_id),
+                ).fetchall()
+            )
+
     def list_embedding_inputs(self) -> tuple[sqlite3.Row, ...]:
         """按稳定顺序返回 Step 4 所需的文档 embedding 输入快照。
 

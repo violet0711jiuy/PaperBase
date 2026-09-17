@@ -48,6 +48,7 @@ class WorkspaceSectionEvidenceExpander:
                 page_start=_minimum_page(group.chunks), page_end=_maximum_page(group.chunks),
                 seed_chunk_ids=group.seed_chunk_ids, chunk_ids=tuple(chunk.chunk_id for chunk in group.chunks),
                 text="\n\n".join(chunk.raw_text.strip() for chunk in group.chunks).strip(), token_count=tokens,
+                section_id=first.section_id,
             ))
         references = tuple(
             EvidenceUnit(
@@ -56,6 +57,7 @@ class WorkspaceSectionEvidenceExpander:
                 page_start=chunk.page_start, page_end=chunk.page_end, seed_chunk_ids=(chunk.chunk_id,),
                 chunk_ids=(chunk.chunk_id,), text=chunk.raw_text,
                 token_count=self._snapshot_chunk_token_count(chunk.chunk_id),
+                section_id=chunk.section_id,
             )
             for index, chunk in enumerate(bibliography, start=1)
         )

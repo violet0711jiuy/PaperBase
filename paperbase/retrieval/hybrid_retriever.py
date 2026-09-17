@@ -52,6 +52,8 @@ class RetrievedChunk:
     rerank_score: float | None
     fused_score: float
     source_matches: tuple[RetrievalSourceMatch, ...]
+    # 直属 Section 的稳定 ID；旧库或 front matter 允许为 None。
+    section_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -465,6 +467,11 @@ def _to_retrieved_chunk(
         rerank_score=rerank_score,
         fused_score=candidate.score,
         source_matches=tuple(candidate.sources),
+        section_id=(
+            str(row["section_id"])
+            if "section_id" in row.keys() and row["section_id"] is not None
+            else None
+        ),
     )
 
 
