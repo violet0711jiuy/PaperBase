@@ -109,8 +109,10 @@ class HybridRetriever:
         trusted_scope: TrustedPaperScope | None = None,
         conversation_context: Sequence[str] | None = None,
         result_limit: int | None = None,
+        paper_ids: Sequence[str] | None = None,
     ) -> RetrievalResult:
         """运行 resolved Dense、英文语义 Dense 与英文关键词 BM25 三路召回。"""
+        normalized_paper_ids = _normalize_paper_ids(paper_ids)
         # trusted_scope 是程序状态；conversation_context 只作为 Resolution 的普通待处理数据。
         plan = self._query_planner.plan(
             query,
@@ -134,23 +136,30 @@ class HybridRetriever:
             route="dense_resolved",
             queries=(resolved_query,),
             group_weight=self._settings.dense_resolved_weight,
+            paper_ids=normalized_paper_ids,
         )
         self._add_dense_matches(
             candidates=candidates,
             route="dense_semantic",
             queries=(plan.semantic_query_en,) if plan.semantic_query_en is not None else (),
             group_weight=self._settings.dense_semantic_weight,
+            paper_ids=normalized_paper_ids,
         )
         self._add_rewritten_bm25_matches(
             candidates=candidates,
             keywords=plan.lexical_keywords_en,
             weight=self._settings.bm25_keywords_weight,
+            paper_ids=normalized_paper_ids,
         )
         bibliography_candidates: tuple[_Candidate, ...] = ()
         if plan.search_bibliography:
             # 先从正文混合召回中定位“这篇论文”的最强候选，再把参考文献检索限制在该论文内。
             # 无法定位目标论文时宁可不查 bibliography，也不能退化为全库宽泛主题词匹配。
-            target_paper_id = _select_bibliography_target_paper_id(candidates)
+            target_paper_id = (
+                normalized_paper_ids[0]
+                if normalized_paper_ids is not None and len(normalized_paper_ids) == 1
+                else _select_bibliography_target_paper_id(candidates)
+            )
             bibliography_candidates = self._collect_bibliography_candidates(
                 query=(plan.semantic_query_en or resolved_query),
                 keywords=plan.lexical_keywords_en,
@@ -251,6 +260,7 @@ class HybridRetriever:
         route: str,
         queries: tuple[str, ...],
         group_weight: float,
+        paper_ids: tuple[str, ...] | None,
     ) -> None:
         """批量编码原始问题或单条语义改写问题；每一路只对应一条 Dense 查询。"""
         if not queries:
@@ -263,26 +273,38 @@ class HybridRetriever:
         )
         if vectors.ndim != 2 or vectors.shape[0] != len(queries):
             raise RuntimeError("Query embedder returned a matrix inconsistent with query count.")
-        scores, vector_ids = self._index.search(vectors, self._settings.dense_top_k_per_query)
+        search_limit = (
+            int(self._index.ntotal)
+            if paper_ids is not None
+            else self._settings.dense_top_k_per_query
+        )
+        scores, vector_ids = self._index.search(vectors, search_limit)
         all_ids = [int(vector_id) for vector_id in vector_ids.reshape(-1) if int(vector_id) > 0]
-        rows_by_vector_id = {
-            int(row["vector_id"]): row
-            for row in self._database.chunks_by_vector_ids(all_ids)
-        }
+        if paper_ids is None:
+            scoped_rows = self._database.chunks_by_vector_ids(all_ids)
+        else:
+            scoped_rows = self._database.chunks_by_vector_ids(
+                all_ids, paper_ids=paper_ids
+            )
+        rows_by_vector_id = {int(row["vector_id"]): row for row in scoped_rows}
         for query_index, current_query in enumerate(queries):
+            scoped_rank = 0
             for result_index, vector_id in enumerate(vector_ids[query_index]):
                 vector_id = int(vector_id)
                 if vector_id < 1 or vector_id not in rows_by_vector_id:
                     continue
+                scoped_rank += 1
                 self._add_candidate(
                     candidates=candidates,
                     row=rows_by_vector_id[vector_id],
                     route=route,
                     query=current_query,
-                    rank=result_index + 1,
+                    rank=scoped_rank,
                     raw_score=float(scores[query_index][result_index]),
                     effective_weight=group_weight,
                 )
+                if scoped_rank >= self._settings.dense_top_k_per_query:
+                    break
 
     def _add_rewritten_bm25_matches(
         self,
@@ -290,13 +312,21 @@ class HybridRetriever:
         candidates: dict[str, _Candidate],
         keywords: tuple[str, ...],
         weight: float,
+        paper_ids: tuple[str, ...] | None,
     ) -> None:
         """将英文关键词组作为一条 Rewritten BM25 Top-20 路径，而非三条独立查询。"""
         if not keywords:
             return
-        rows = self._database.search_bm25_keyword_group(
-            keywords, top_k=self._settings.bm25_keywords_top_k
-        )
+        if paper_ids is None:
+            rows = self._database.search_bm25_keyword_group(
+                keywords, top_k=self._settings.bm25_keywords_top_k
+            )
+        else:
+            rows = self._database.search_bm25_keyword_group(
+                keywords,
+                top_k=self._settings.bm25_keywords_top_k,
+                paper_ids=paper_ids,
+            )
         # 对外证据使用可读的 OR 文本；SQLite 内部会对每个关键词安全转义并编译为 FTS5 表达式。
         rendered_query = " OR ".join(keywords)
         self._add_bm25_rows(
@@ -475,3 +505,14 @@ def _select_bibliography_target_paper_id(candidates: dict[str, _Candidate]) -> s
         return None
     # 多个正文 chunk 共同支持同一篇论文时，累积证据强度，而不是只看某一条 chunk 的最高分。
     return min(scores_by_paper_id, key=lambda paper_id: (-scores_by_paper_id[paper_id], paper_id))
+
+
+def _normalize_paper_ids(paper_ids: Sequence[str] | None) -> tuple[str, ...] | None:
+    if paper_ids is None:
+        return None
+    normalized = tuple(
+        dict.fromkeys(" ".join(paper_id.split()) for paper_id in paper_ids if paper_id.strip())
+    )
+    if not normalized:
+        raise ValueError("paper_ids must not be empty when provided.")
+    return normalized

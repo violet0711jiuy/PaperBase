@@ -15,6 +15,39 @@ from paperbase.parsing.base import FrontMatterBlock, ParsedPaper, SectionRecord
 
 
 class MetadataDatabaseTests(unittest.TestCase):
+    def test_bm25_paper_scope_is_applied_inside_sql_query(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            first_root = root / "first"
+            second_root = root / "second"
+            first_root.mkdir()
+            second_root.mkdir()
+            first = _sample_result(first_root, first_chunk_text="Shared scoped method alpha.")
+            second = _sample_result(second_root, first_chunk_text="Shared scoped method beta.")
+            database = MetadataDatabase(root / "paperbase.sqlite3")
+            database.import_chunking_result(first)
+            database.import_chunking_result(second)
+
+            phrase_rows = database.search_bm25(
+                "Shared scoped method",
+                top_k=5,
+                paper_ids=(second.chunks[0].paper_id,),
+            )
+            keyword_rows = database.search_bm25_keyword_group(
+                ("Shared", "method"),
+                top_k=5,
+                paper_ids=(first.chunks[0].paper_id,),
+            )
+
+            self.assertEqual(
+                {row["paper_id"] for row in phrase_rows},
+                {second.chunks[0].paper_id},
+            )
+            self.assertEqual(
+                {row["paper_id"] for row in keyword_rows},
+                {first.chunks[0].paper_id},
+            )
+
     def test_bibliography_is_preserved_but_excluded_from_main_fts_and_embedding_inputs(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

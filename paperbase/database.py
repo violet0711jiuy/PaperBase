@@ -824,7 +824,13 @@ class MetadataDatabase:
             connection.execute("UPDATE chunks SET vector_id = NULL WHERE vector_id IS NOT NULL")
         return int(row["count"])
 
-    def search_bm25(self, query: str, *, top_k: int) -> tuple[sqlite3.Row, ...]:
+    def search_bm25(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        paper_ids: Sequence[str] | None = None,
+    ) -> tuple[sqlite3.Row, ...]:
         """使用 SQLite FTS5 对论文标题、章节和 chunk 原文执行词法召回。
 
         ``query`` 被转成一个字面短语，而非直接拼接到 FTS5 语法中。这样用户问题中的括号、
@@ -836,6 +842,8 @@ class MetadataDatabase:
             raise MetadataDatabaseError("BM25 query must not be empty.")
         if top_k < 1:
             raise MetadataDatabaseError("BM25 top_k must be positive.")
+        normalized_paper_ids = _normalize_paper_ids(paper_ids)
+        scope_sql, scope_parameters = _paper_scope_sql(normalized_paper_ids)
         fts_query = _fts5_literal_phrase(normalized_query)
         self.initialize()
         with self._connect() as connection:
@@ -850,10 +858,11 @@ class MetadataDatabase:
                     JOIN chunks ON chunks.chunk_id = chunks_fts.chunk_id
                     JOIN documents ON documents.paper_id = chunks.paper_id
                     WHERE chunks_fts MATCH ? AND chunks.section_type = 'content'
+                    {scope_sql}
                     ORDER BY bm25_score ASC, chunks.chunk_id ASC
                     LIMIT ?
-                    """,
-                    (fts_query, top_k),
+                    """.format(scope_sql=scope_sql),
+                    (fts_query, *scope_parameters, top_k),
                 ).fetchall()
             )
 
@@ -862,6 +871,7 @@ class MetadataDatabase:
         keywords: Sequence[str],
         *,
         top_k: int,
+        paper_ids: Sequence[str] | None = None,
     ) -> tuple[sqlite3.Row, ...]:
         """用一组英文关键词执行**一条** BM25 查询，并以 OR 保留任一术语的候选。
 
@@ -877,6 +887,8 @@ class MetadataDatabase:
             return ()
         if top_k < 1:
             raise MetadataDatabaseError("BM25 top_k must be positive.")
+        normalized_paper_ids = _normalize_paper_ids(paper_ids)
+        scope_sql, scope_parameters = _paper_scope_sql(normalized_paper_ids)
         fts_query = " OR ".join(_fts5_literal_phrase(keyword) for keyword in normalized_keywords)
         self.initialize()
         with self._connect() as connection:
@@ -891,14 +903,20 @@ class MetadataDatabase:
                     JOIN chunks ON chunks.chunk_id = chunks_fts.chunk_id
                     JOIN documents ON documents.paper_id = chunks.paper_id
                     WHERE chunks_fts MATCH ? AND chunks.section_type = 'content'
+                    {scope_sql}
                     ORDER BY bm25_score ASC, chunks.chunk_id ASC
                     LIMIT ?
-                    """,
-                    (fts_query, top_k),
+                    """.format(scope_sql=scope_sql),
+                    (fts_query, *scope_parameters, top_k),
                 ).fetchall()
             )
 
-    def chunks_by_vector_ids(self, vector_ids: Sequence[int]) -> tuple[sqlite3.Row, ...]:
+    def chunks_by_vector_ids(
+        self,
+        vector_ids: Sequence[int],
+        *,
+        paper_ids: Sequence[str] | None = None,
+    ) -> tuple[sqlite3.Row, ...]:
         """按 FAISS 返回的 vector_id 批量回查完整 chunk 证据，不假设 SQLite 返回顺序。"""
         unique_ids = tuple(dict.fromkeys(vector_ids))
         if not unique_ids:
@@ -906,6 +924,8 @@ class MetadataDatabase:
         if any(vector_id < 1 for vector_id in unique_ids):
             raise MetadataDatabaseError("FAISS vector IDs must be positive integers.")
         placeholders = ", ".join("?" for _ in unique_ids)
+        normalized_paper_ids = _normalize_paper_ids(paper_ids)
+        scope_sql, scope_parameters = _paper_scope_sql(normalized_paper_ids)
         self.initialize()
         with self._connect() as connection:
             return tuple(
@@ -916,8 +936,9 @@ class MetadataDatabase:
                     JOIN documents ON documents.paper_id = chunks.paper_id
                     WHERE chunks.vector_id IN ({placeholders})
                       AND chunks.section_type = 'content'
+                      {scope_sql}
                     """,
-                    unique_ids,
+                    (*unique_ids, *scope_parameters),
                 ).fetchall()
             )
 
@@ -1200,6 +1221,25 @@ def _is_bibliography_section(section: str) -> bool:
 def _fts5_literal_phrase(text: str) -> str:
     """将外部输入转为 FTS5 字面短语，避免用户文本意外触发布尔/列过滤语法。"""
     return '"' + text.replace('"', '""') + '"'
+
+
+def _normalize_paper_ids(paper_ids: Sequence[str] | None) -> tuple[str, ...] | None:
+    """规范化可选论文范围；显式空范围通常是上游规划错误。"""
+    if paper_ids is None:
+        return None
+    normalized = tuple(
+        dict.fromkeys(" ".join(paper_id.split()) for paper_id in paper_ids if paper_id.strip())
+    )
+    if not normalized:
+        raise MetadataDatabaseError("paper_ids must not be empty when provided.")
+    return normalized
+
+
+def _paper_scope_sql(paper_ids: tuple[str, ...] | None) -> tuple[str, tuple[str, ...]]:
+    if paper_ids is None:
+        return "", ()
+    placeholders = ", ".join("?" for _ in paper_ids)
+    return f"AND chunks.paper_id IN ({placeholders})", paper_ids
 
 
 def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
