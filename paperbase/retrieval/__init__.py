@@ -1,6 +1,6 @@
 """Step 6 混合检索模块：经典检索与 Agentic Retrieval Facade。"""
 
-from .adapters import FormalKnowledgeBaseAdapter
+from .adapters import FormalKnowledgeBaseAdapter, WorkspacePaperAdapter
 from .contracts import PaperSearchSpec, QueryOrigin, RetrievalSource, SearchPapersRequest
 from .facade import RetrievalAdapter, RetrievalService
 from .hybrid_retriever import HybridRetriever, RetrievedChunk, RetrievalResult
@@ -25,5 +25,6 @@ __all__ = [
     "RetrievalSource",
     "SearchPapersRequest",
     "TrustedPaperScope",
+    "WorkspacePaperAdapter",
     "create_query_planner",
 ]
