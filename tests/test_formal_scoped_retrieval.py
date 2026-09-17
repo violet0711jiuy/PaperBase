@@ -53,9 +53,15 @@ class _Planner:
         )
 
 
+class _ForbiddenPlanner:
+    def plan(self, query: str, **kwargs: object) -> QueryRewritePlan:
+        raise AssertionError(f"Agent query must bypass planner: {query}, {kwargs}")
+
+
 @dataclass
 class _Database:
     vector_calls: list[tuple[tuple[int, ...], tuple[str, ...] | None]]
+    bm25_calls: list[tuple[tuple[str, ...], tuple[str, ...] | None]]
 
     def get_document(self, paper_id: str) -> object | None:
         return {"paper_id": paper_id} if paper_id == "paper-target" else None
@@ -71,6 +77,17 @@ class _Database:
         }
         allowed = set(paper_ids or ("paper-other", "paper-target"))
         return tuple(rows[item] for item in vector_ids if rows[item]["paper_id"] in allowed)
+
+    def search_bm25_keyword_group(
+        self,
+        keywords: tuple[str, ...],
+        *,
+        top_k: int,
+        paper_ids: tuple[str, ...] | None = None,
+    ) -> tuple[dict[str, object], ...]:
+        _ = top_k
+        self.bm25_calls.append((tuple(keywords), paper_ids))
+        return ()
 
 
 def _row(vector_id: int, paper_id: str, chunk_id: str) -> dict[str, object]:
@@ -91,7 +108,7 @@ def _row(vector_id: int, paper_id: str, chunk_id: str) -> dict[str, object]:
 
 class FormalScopedRetrievalTests(unittest.TestCase):
     def _retriever(self) -> tuple[HybridRetriever, _Database, _IndexStore]:
-        database = _Database(vector_calls=[])
+        database = _Database(vector_calls=[], bm25_calls=[])
         index_store = _IndexStore()
         retriever = HybridRetriever(
             database=database,  # type: ignore[arg-type]
@@ -109,6 +126,27 @@ class FormalScopedRetrievalTests(unittest.TestCase):
             query_planner=_Planner(),  # type: ignore[arg-type]
         )
         return retriever, database, index_store
+
+    def test_agent_supplied_query_never_calls_planner_and_uses_explicit_terms(self) -> None:
+        retriever, database, _ = self._retriever()
+        retriever._query_planner = _ForbiddenPlanner()  # type: ignore[attr-defined]
+        adapter = FormalKnowledgeBaseAdapter(
+            database=database,  # type: ignore[arg-type]
+            retriever=retriever,
+        )
+
+        result = adapter.search(
+            PaperSearchSpec(
+                paper_id="paper-target",
+                query="target architecture details",
+                lexical_terms=("Graph encoder",),
+            ),
+            query_origin=QueryOrigin.AGENT_SUPPLIED,
+        )
+
+        self.assertTrue(result.chunks)
+        self.assertEqual(result.rewrite_plan.lexical_keywords_en, ("Graph encoder",))
+        self.assertEqual(database.bm25_calls, [(("Graph encoder",), ("paper-target",))])
 
     def test_scoped_dense_search_scans_index_then_reranks_inside_paper(self) -> None:
         retriever, database, index_store = self._retriever()

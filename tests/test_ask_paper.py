@@ -22,6 +22,7 @@ from paperbase.conversations import ConversationStore
 from paperbase.generation.answer_generator import GroundedAnswerGenerator
 from paperbase.reranking.base import RerankScore
 from paperbase.retrieval.query_rewriter import QueryRewritePlan
+from paperbase.retrieval.contracts import QueryOrigin
 from paperbase.staging.bm25 import WorkspaceBM25Index, WorkspaceBM25IndexCache
 from paperbase.staging.sections import WorkspaceChunk, WorkspaceSectionSnapshot
 
@@ -94,6 +95,11 @@ class _UnresolvedRewriter:
         )
 
 
+class _ForbiddenRewriter:
+    def plan(self, query: str, **kwargs: object) -> QueryRewritePlan:
+        raise AssertionError(f"Agent query must bypass rewriter: {query}, {kwargs}")
+
+
 class _FakeReranker:
     backend_id = "fake"
     model_id = "fake-model"
@@ -151,6 +157,24 @@ class AskThisPaperTests(unittest.TestCase):
         self.assertIn("dense_resolved", content_routes)
         self.assertIn("dense_semantic", content_routes)
         self.assertNotIn("bm25_original", content_routes)  # 旧 resolved_query BM25 路径已移除。
+
+    def test_agent_supplied_query_bypasses_rewriter_and_uses_lexical_fallback(self) -> None:
+        snapshot = _snapshot(Path("/temporary/staging_agent_query"))
+        retriever = _retriever(snapshot, rewriter=_ForbiddenRewriter())
+
+        result = retriever.retrieve(
+            "How does Graph WaveNet encode traffic?",
+            query_origin=QueryOrigin.AGENT_SUPPLIED,
+            lexical_terms=(),
+        )
+
+        self.assertEqual(result.rewrite_plan.rewrite_status, "not_run")
+        self.assertIn(
+            "agent_supplied_query_bypassed_rewriter",
+            result.rewrite_plan.validation_diagnostics,
+        )
+        self.assertIn("Graph WaveNet", result.rewrite_plan.lexical_keywords_en)
+        self.assertTrue(result.chunks)
 
     def test_evidence_expansion_uses_section_id_and_never_crosses_sibling(self) -> None:
         snapshot = _snapshot(Path("/temporary/staging_ask"))

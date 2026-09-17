@@ -20,6 +20,8 @@ class _WorkspaceRetriever(Protocol):
         trusted_scope: TrustedPaperScope | None = None,
         conversation_context: Sequence[str] | None = None,
         result_limit: int | None = None,
+        query_origin: QueryOrigin = QueryOrigin.INITIAL_UNDERSTANDING,
+        lexical_terms: Sequence[str] = (),
     ) -> RetrievalResult: ...
 
 
@@ -39,14 +41,12 @@ class FormalKnowledgeBaseAdapter:
     ) -> RetrievalResult:
         if self._database.get_document(search.paper_id) is None:
             raise LookupError(f"Unknown formal paper_id: {search.paper_id}")
-        if QueryOrigin(query_origin) is QueryOrigin.AGENT_SUPPLIED:
-            raise NotImplementedError(
-                "agent_supplied query execution is introduced in Phase 1 commit 4."
-            )
         return self._retriever.retrieve(
             search.query,
             paper_ids=(search.paper_id,),
             result_limit=result_limit,
+            query_origin=QueryOrigin(query_origin),
+            lexical_terms=search.lexical_terms,
         )
 
 
@@ -78,10 +78,6 @@ class WorkspacePaperAdapter:
                 "Workspace paper_id mismatch: "
                 f"expected {self._snapshot.paper_id}, got {search.paper_id}."
             )
-        if QueryOrigin(query_origin) is QueryOrigin.AGENT_SUPPLIED:
-            raise NotImplementedError(
-                "agent_supplied query execution is introduced in Phase 1 commit 4."
-            )
         return self._retriever.retrieve(
             search.query,
             trusted_scope=TrustedPaperScope(
@@ -89,4 +85,6 @@ class WorkspacePaperAdapter:
                 paper_title=self._snapshot.paper_title,
             ),
             result_limit=result_limit,
+            query_origin=QueryOrigin(query_origin),
+            lexical_terms=search.lexical_terms,
         )

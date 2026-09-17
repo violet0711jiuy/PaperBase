@@ -12,11 +12,13 @@ import numpy as np
 from paperbase.config import RerankingSettings, RetrievalSettings
 from paperbase.embedding.base import QueryEmbedder
 from paperbase.reranking import Reranker
+from paperbase.retrieval.contracts import QueryOrigin
 from paperbase.retrieval.hybrid_retriever import (
     RetrievedChunk,
     RetrievalResult,
     RetrievalSourceMatch,
 )
+from paperbase.retrieval.query_inputs import build_agent_supplied_plan
 from paperbase.retrieval.query_rewriter import QueryPlanner, TrustedPaperScope
 from paperbase.staging.bm25 import WorkspaceBM25Index, WorkspaceBM25IndexCache
 from paperbase.staging.sections import WorkspaceChunk, WorkspaceSectionSnapshot
@@ -182,15 +184,24 @@ class WorkspaceHybridRetriever:
         trusted_scope: TrustedPaperScope | None = None,
         conversation_context: Sequence[str] | None = None,
         result_limit: int | None = None,
+        query_origin: QueryOrigin = QueryOrigin.INITIAL_UNDERSTANDING,
+        lexical_terms: Sequence[str] = (),
     ) -> RetrievalResult:
         """运行四路正文召回；参考文献只在明确意图时本论文内直接返回。"""
         if result_limit is not None and result_limit < 1:
             raise ValueError("result_limit must be positive when provided.")
-        plan = self._query_planner.plan(
-            query,
-            trusted_scope=trusted_scope,
-            conversation_context=conversation_context,
-        )
+        if QueryOrigin(query_origin) is QueryOrigin.AGENT_SUPPLIED:
+            plan = build_agent_supplied_plan(
+                query,
+                lexical_terms=lexical_terms,
+                max_lexical_terms=self._settings.query_rewrite.max_lexical_keywords_en,
+            )
+        else:
+            plan = self._query_planner.plan(
+                query,
+                trusted_scope=trusted_scope,
+                conversation_context=conversation_context,
+            )
         if plan.resolution_status == "unresolved":
             return RetrievalResult(
                 query=plan.original_query,

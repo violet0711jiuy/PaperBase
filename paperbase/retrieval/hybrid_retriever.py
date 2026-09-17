@@ -13,7 +13,9 @@ from paperbase.embedding.base import QueryEmbedder
 from paperbase.indexing import FaissIndexStore
 from paperbase.reranking import Reranker
 
+from .contracts import QueryOrigin
 from .lexical_terms import extract_lexical_terms
+from .query_inputs import build_agent_supplied_plan
 from .query_rewriter import QueryPlanner, QueryRewritePlan, TrustedPaperScope
 
 
@@ -110,15 +112,24 @@ class HybridRetriever:
         conversation_context: Sequence[str] | None = None,
         result_limit: int | None = None,
         paper_ids: Sequence[str] | None = None,
+        query_origin: QueryOrigin = QueryOrigin.INITIAL_UNDERSTANDING,
+        lexical_terms: Sequence[str] = (),
     ) -> RetrievalResult:
         """运行 resolved Dense、英文语义 Dense 与英文关键词 BM25 三路召回。"""
         normalized_paper_ids = _normalize_paper_ids(paper_ids)
         # trusted_scope 是程序状态；conversation_context 只作为 Resolution 的普通待处理数据。
-        plan = self._query_planner.plan(
-            query,
-            trusted_scope=trusted_scope,
-            conversation_context=conversation_context,
-        )
+        if QueryOrigin(query_origin) is QueryOrigin.AGENT_SUPPLIED:
+            plan = build_agent_supplied_plan(
+                query,
+                lexical_terms=lexical_terms,
+                max_lexical_terms=self._settings.query_rewrite.max_lexical_keywords_en,
+            )
+        else:
+            plan = self._query_planner.plan(
+                query,
+                trusted_scope=trusted_scope,
+                conversation_context=conversation_context,
+            )
         if result_limit is not None and result_limit < 1:
             raise ValueError("result_limit must be positive when provided.")
         if plan.resolution_status == "unresolved":
