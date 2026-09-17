@@ -90,6 +90,15 @@ class _Database:
             if row["paper_id"] == paper_id and row["section"] == section
         )
 
+    def list_content_chunks_in_section_id(
+        self, *, paper_id: str, section_id: str | None
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(
+            row
+            for row in self.rows.values()
+            if row["paper_id"] == paper_id and row["section_id"] == section_id
+        )
+
 
 def _row(vector_id: int, paper_id: str, chunk_index: int) -> dict[str, object]:
     return {
@@ -99,6 +108,7 @@ def _row(vector_id: int, paper_id: str, chunk_index: int) -> dict[str, object]:
         "chunk_id": f"{paper_id}-chunk-{chunk_index}",
         "chunk_index": chunk_index,
         "section": "Method",
+        "section_id": f"{paper_id}-method-section",
         "content_kind": "body",
         "front_matter_type": None,
         "section_type": "content",
@@ -179,6 +189,14 @@ class PerPaperRetrievalPipelineTests(unittest.TestCase):
         self.assertEqual(len(second.expansion.content_evidence), 1)  # type: ignore[union-attr]
         self.assertEqual(first.expansion.content_evidence[0].token_count, 256)  # type: ignore[union-attr]
         self.assertEqual(second.expansion.content_evidence[0].token_count, 256)  # type: ignore[union-attr]
+        self.assertEqual(
+            first.expansion.content_evidence[0].section_id,  # type: ignore[union-attr]
+            "paper-a-method-section",
+        )
+        self.assertEqual(
+            second.expansion.content_evidence[0].section_id,  # type: ignore[union-attr]
+            "paper-b-method-section",
+        )
 
 
 if __name__ == "__main__":
