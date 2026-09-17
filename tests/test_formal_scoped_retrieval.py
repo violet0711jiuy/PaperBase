@@ -144,8 +144,10 @@ class FormalScopedRetrievalTests(unittest.TestCase):
             query_origin=QueryOrigin.AGENT_SUPPLIED,
         )
 
-        self.assertTrue(result.chunks)
-        self.assertEqual(result.rewrite_plan.lexical_keywords_en, ("Graph encoder",))
+        self.assertTrue(result.retrieval.chunks)
+        self.assertEqual(
+            result.retrieval.rewrite_plan.lexical_keywords_en, ("Graph encoder",)
+        )
         self.assertEqual(database.bm25_calls, [(("Graph encoder",), ("paper-target",))])
 
     def test_scoped_dense_search_scans_index_then_reranks_inside_paper(self) -> None:
@@ -170,7 +172,7 @@ class FormalScopedRetrievalTests(unittest.TestCase):
             PaperSearchSpec(paper_id="paper-target", query="method"),
             query_origin=QueryOrigin.INITIAL_UNDERSTANDING,
         )
-        self.assertTrue(result.chunks)
+        self.assertTrue(result.retrieval.chunks)
         with self.assertRaisesRegex(LookupError, "Unknown formal paper_id"):
             adapter.search(
                 PaperSearchSpec(paper_id="missing", query="method"),

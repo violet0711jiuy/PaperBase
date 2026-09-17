@@ -47,7 +47,7 @@ class WorkspaceRetrievalAdapterTests(unittest.TestCase):
             result_limit=4,
         )
 
-        scope = result["scope"]
+        scope = result.retrieval["scope"]
         self.assertEqual(getattr(scope, "paper_id"), "paper-a")
         self.assertEqual(getattr(scope, "paper_title"), "Paper A")
         self.assertEqual(self.retriever.calls[0]["result_limit"], 4)
@@ -71,7 +71,7 @@ class WorkspaceRetrievalAdapterTests(unittest.TestCase):
             workspace_id="workspace-a",
         )
 
-        self.assertEqual(result["query"], "results")
+        self.assertEqual(result.retrieval["query"], "results")
         with self.assertRaisesRegex(LookupError, "Formal knowledge-base adapter"):
             service.search_paper(
                 PaperSearchSpec(paper_id="paper-a", query="results"),

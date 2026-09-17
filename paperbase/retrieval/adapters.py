@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol, Sequence
 
 from paperbase.database import MetadataDatabase
 from paperbase.staging.sections import WorkspaceSectionSnapshot
@@ -10,6 +11,9 @@ from paperbase.staging.sections import WorkspaceSectionSnapshot
 from .contracts import PaperSearchSpec, QueryOrigin
 from .hybrid_retriever import HybridRetriever, RetrievalResult
 from .query_rewriter import TrustedPaperScope
+
+if TYPE_CHECKING:
+    from paperbase.generation.section_expander import ExpansionResult
 
 
 class _WorkspaceRetriever(Protocol):
@@ -25,12 +29,32 @@ class _WorkspaceRetriever(Protocol):
     ) -> RetrievalResult: ...
 
 
+class _EvidenceExpander(Protocol):
+    def expand(self, result: RetrievalResult) -> "ExpansionResult": ...
+
+
+@dataclass(frozen=True)
+class PaperRetrievalSnapshot:
+    """一篇论文独立完成检索、重排和可选扩展后的内部快照。"""
+
+    paper_id: str
+    retrieval: RetrievalResult
+    expansion: "ExpansionResult | None"
+
+
 class FormalKnowledgeBaseAdapter:
     """把正式 HybridRetriever 限定到一个已验证的正式 ``paper_id``。"""
 
-    def __init__(self, *, database: MetadataDatabase, retriever: HybridRetriever) -> None:
+    def __init__(
+        self,
+        *,
+        database: MetadataDatabase,
+        retriever: HybridRetriever,
+        expander: _EvidenceExpander | None = None,
+    ) -> None:
         self._database = database
         self._retriever = retriever
+        self._expander = expander
 
     def search(
         self,
@@ -38,15 +62,20 @@ class FormalKnowledgeBaseAdapter:
         *,
         query_origin: QueryOrigin,
         result_limit: int | None = None,
-    ) -> RetrievalResult:
+    ) -> PaperRetrievalSnapshot:
         if self._database.get_document(search.paper_id) is None:
             raise LookupError(f"Unknown formal paper_id: {search.paper_id}")
-        return self._retriever.retrieve(
+        retrieval = self._retriever.retrieve(
             search.query,
             paper_ids=(search.paper_id,),
             result_limit=result_limit,
             query_origin=QueryOrigin(query_origin),
             lexical_terms=search.lexical_terms,
+        )
+        return PaperRetrievalSnapshot(
+            paper_id=search.paper_id,
+            retrieval=retrieval,
+            expansion=self._expander.expand(retrieval) if self._expander is not None else None,
         )
 
 
@@ -58,9 +87,11 @@ class WorkspacePaperAdapter:
         *,
         snapshot: WorkspaceSectionSnapshot,
         retriever: _WorkspaceRetriever,
+        expander: _EvidenceExpander | None = None,
     ) -> None:
         self._snapshot = snapshot
         self._retriever = retriever
+        self._expander = expander
 
     @property
     def workspace_id(self) -> str:
@@ -72,13 +103,13 @@ class WorkspacePaperAdapter:
         *,
         query_origin: QueryOrigin,
         result_limit: int | None = None,
-    ) -> RetrievalResult:
+    ) -> PaperRetrievalSnapshot:
         if search.paper_id != self._snapshot.paper_id:
             raise LookupError(
                 "Workspace paper_id mismatch: "
                 f"expected {self._snapshot.paper_id}, got {search.paper_id}."
             )
-        return self._retriever.retrieve(
+        retrieval = self._retriever.retrieve(
             search.query,
             trusted_scope=TrustedPaperScope(
                 paper_id=self._snapshot.paper_id,
@@ -87,4 +118,9 @@ class WorkspacePaperAdapter:
             result_limit=result_limit,
             query_origin=QueryOrigin(query_origin),
             lexical_terms=search.lexical_terms,
+        )
+        return PaperRetrievalSnapshot(
+            paper_id=search.paper_id,
+            retrieval=retrieval,
+            expansion=self._expander.expand(retrieval) if self._expander is not None else None,
         )
