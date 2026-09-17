@@ -20,6 +20,7 @@
 
 ## Roadmap
 
+- [Agentic RAG v1 冻结架构](roadmap/agentic-rag-v1.md)：Agentic 编排、多论文动态检索、证据注册、覆盖状态与分阶段实施的冻结方案。
 - [Multi-paper RAG Roadmap](roadmap/multi-paper-rag.md)：多论文比较、发现和全库归纳的后续计划。
 
 ## 文档维护规则

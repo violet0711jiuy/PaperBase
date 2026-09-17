@@ -12,3 +12,14 @@ __all__ = [
     "TrustedPaperScope",
     "create_query_planner",
 ]
+from .contracts import PaperSearchSpec, QueryOrigin, RetrievalSource, SearchPapersRequest
+from .facade import RetrievalAdapter, RetrievalService
+
+__all__ = [
+    "PaperSearchSpec",
+    "QueryOrigin",
+    "RetrievalAdapter",
+    "RetrievalService",
+    "RetrievalSource",
+    "SearchPapersRequest",
+]

@@ -2,6 +2,9 @@
 
 > 状态：`PLANNED`
 > 当前正式 Evaluation 仍限定为单论文、Context-free Retrieval Benchmark。
+>
+> 本文保留为早期演进背景。Agentic RAG v1 的当前实施契约以
+> [`agentic-rag-v1.md`](agentic-rag-v1.md) 为准；两者冲突时以后者为准。
 
 ## 实施状态
 
