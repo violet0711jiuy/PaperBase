@@ -26,6 +26,11 @@ _DEFAULTS: dict[str, object] = {
     "selected_section_id": None,
     # 正式 Knowledge Base 当前正在使用的 conversation ID。
     "kb_conversation_id": None,
+    # KB 支持快速问答与完整 Agentic Research，两种模式共享会话历史。
+    "kb_research_mode": "快速问答",
+    # Agentic 模式默认检索整个正式知识库，也可改为明确的论文子集。
+    "kb_scope_all": True,
+    "kb_selected_paper_ids": [],
     # 当前 Paper Workspace 对应的 conversation ID。
     "paper_conversation_id": None,
     # 是否展开 Paper Workspace 的上传区域；已有 workspace 默认收起。

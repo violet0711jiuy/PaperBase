@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from paperbase.config import load_settings
 from paperbase.database import MetadataDatabase
 from paperbase.generation.section_expander import SectionAwareNeighborExpander
+from paperbase.generation.answer_generator import GroundedAnswerGenerator
 from paperbase.llm.client import (
     ChatCompletionClient,
     OpenAICompatibleChatClient,
@@ -21,6 +22,7 @@ from paperbase.retrieval.service import create_hybrid_retriever
 
 from .decision import LLMDecisionAgent
 from .graph import LangGraphResearchWorkflow
+from .persistence import SQLiteCheckpointStore
 from .planner import ResearchPlanner
 from .query_understanding import QueryUnderstandingService
 from .scope_resolver import ScopeResolver
@@ -69,6 +71,10 @@ def create_agentic_research_service(
         database=active_database,
         llm_client=active_client,
     )
+    answer_client = active_client
+    with_max_tokens = getattr(active_client, "with_max_tokens", None)
+    if callable(with_max_tokens):
+        answer_client = with_max_tokens(settings.answer_generation.max_output_tokens)
 
     expander = SectionAwareNeighborExpander(
         database=active_database,
@@ -90,6 +96,17 @@ def create_agentic_research_service(
             settings.storage.papers_dir.parent / "paper_overviews"
         ),
     )
+    checkpoint_store = None
+    active_checkpointer = checkpointer
+    if active_checkpointer is None:
+        checkpoint_store = SQLiteCheckpointStore.open(
+            settings.agentic_research.checkpoint_path
+        )
+        checkpoint_store.prune_expired_threads(
+            retention_days=settings.agentic_research.checkpoint_retention_days
+        )
+        active_checkpointer = checkpoint_store.saver
+
     workflow = LangGraphResearchWorkflow(
         scope_resolver=ScopeResolver(active_database),
         query_understanding=QueryUnderstandingService(active_client),
@@ -97,6 +114,18 @@ def create_agentic_research_service(
         decision_agent=LLMDecisionAgent(active_client),
         tool_executor=tool_executor,
         settings=settings.agentic_research,
-        checkpointer=checkpointer,
+        answer_generator=(
+            GroundedAnswerGenerator(
+                settings=settings.answer_generation,
+                client=answer_client,
+            )
+            if settings.answer_generation.enabled
+            else None
+        ),
+        checkpointer=active_checkpointer,
     )
-    return AgenticResearchService(workflow=workflow)
+    return AgenticResearchService(
+        workflow=workflow,
+        checkpoint_store=checkpoint_store,
+        max_concurrent_runs=settings.agentic_research.max_concurrent_runs,
+    )

@@ -54,17 +54,23 @@ class BudgetAndGuardTracker:
         self.suppressed_papers = set(snapshot.suppressed_paper_ids)
         self._fingerprints = set(snapshot.executed_action_fingerprints)
 
-    def can_decide(self) -> GuardDecision:
+    def can_decide(self, *, reserved_llm_calls: int = 0) -> GuardDecision:
+        if reserved_llm_calls < 0:
+            raise ValueError("reserved_llm_calls must not be negative.")
         if self.iterations >= self.settings.max_agent_iterations:
             return GuardDecision(False, "IterationBudget", "Agent iteration budget exhausted.", True)
-        if self.llm_calls >= self.settings.max_llm_calls:
+        if self.llm_calls + reserved_llm_calls >= self.settings.max_llm_calls:
             return GuardDecision(False, "LLMBudget", "LLM call budget exhausted.", True)
         return GuardDecision(True, "OK", "")
 
-    def record_decision(self, llm_calls: int) -> GuardDecision:
+    def record_decision(
+        self, llm_calls: int, *, reserved_llm_calls: int = 0
+    ) -> GuardDecision:
+        if reserved_llm_calls < 0:
+            raise ValueError("reserved_llm_calls must not be negative.")
         self.iterations += 1
         self.llm_calls += llm_calls
-        if self.llm_calls > self.settings.max_llm_calls:
+        if self.llm_calls + reserved_llm_calls > self.settings.max_llm_calls:
             return GuardDecision(False, "LLMBudget", "Decision exceeded LLM call budget.", True)
         return GuardDecision(True, "OK", "")
 

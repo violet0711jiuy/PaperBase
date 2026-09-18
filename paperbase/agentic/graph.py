@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Literal, TypedDict
+from dataclasses import dataclass
+from collections.abc import Iterator
+from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -21,10 +22,12 @@ from .contracts import (
     CorpusScopeSnapshot,
     CoverageState,
     EvidenceQualification,
+    EvidenceRecord,
     FinishAction,
     GuardState,
     QueryContext,
     RegistryState,
+    ResearchAnswer,
     ResearchObservation,
     ResearchPlan,
     ResearchRunResult,
@@ -33,10 +36,12 @@ from .contracts import (
     ScopeResolutionStatus,
     StopReason,
 )
+from .answering import AgenticAnswerGenerator, generate_agentic_answer
 from .checkpoint_serde import CheckpointValue, dump_contract, load_contract
 from .coverage import CoverageManager, CoveragePolicy
 from .decision import DecisionAgent, DecisionError, DecisionState
 from .evidence_registry import EvidenceRegistry
+from .events import ResearchProgressEvent, progress_event_for_node
 from .guards import (
     BudgetAndGuardTracker,
     action_fingerprint,
@@ -59,6 +64,7 @@ NextNode = Literal[
     "validate_action",
     "execute_tool",
     "register_and_observe",
+    "generate_answer",
     "finish_run",
 ]
 
@@ -66,6 +72,7 @@ NextNode = Literal[
 class AgentGraphState(TypedDict, total=False):
     """Checkpoint 中只保存领域 DTO；所有服务和连接通过 Runtime Context 注入。"""
 
+    thread_id: str
     original_query: str
     trusted_workspace: CheckpointValue
     selected_paper_ids: list[str]
@@ -87,6 +94,8 @@ class AgentGraphState(TypedDict, total=False):
     stop_reason: str
     clarification: str | None
     error_codes: list[str]
+    selected_evidence: CheckpointValue
+    answer: CheckpointValue
     next_node: NextNode
     result: CheckpointValue
 
@@ -98,6 +107,7 @@ class AgentGraphContext:
     planner: ResearchPlanner
     decision_agent: DecisionAgent
     tool_executor: ToolExecutor
+    answer_generator: AgenticAnswerGenerator | None
     settings: AgenticResearchSettings
 
 
@@ -122,6 +132,7 @@ class LangGraphResearchWorkflow:
         decision_agent: DecisionAgent,
         tool_executor: ToolExecutor,
         settings: AgenticResearchSettings,
+        answer_generator: AgenticAnswerGenerator | None = None,
         checkpointer: BaseCheckpointSaver | None = None,
     ) -> None:
         self._context = AgentGraphContext(
@@ -130,6 +141,7 @@ class LangGraphResearchWorkflow:
             planner=planner,
             decision_agent=decision_agent,
             tool_executor=tool_executor,
+            answer_generator=answer_generator,
             settings=settings,
         )
         self._checkpointer = checkpointer or InMemorySaver()
@@ -172,30 +184,13 @@ class LangGraphResearchWorkflow:
         thread_id: str | None = None,
         interrupt_after: tuple[str, ...] = (),
     ) -> GraphExecution:
-        resolved_thread_id = thread_id or f"research_{uuid4().hex}"
-        config = _thread_config(
-            resolved_thread_id,
-            recursion_limit=_recursion_limit(self._context.settings),
+        resolved_thread_id, config, initial_state = self._prepare_start(
+            query,
+            trusted_workspace=trusted_workspace,
+            selected_paper_ids=selected_paper_ids,
+            knowledge_base_all=knowledge_base_all,
+            thread_id=thread_id,
         )
-        if self._graph.get_state(config).values:
-            raise ValueError(
-                f"Research thread already exists: {resolved_thread_id}. Use resume()."
-            )
-        initial_state: AgentGraphState = {
-            "original_query": query,
-            "trusted_workspace": (
-                dump_contract(trusted_workspace, TrustedWorkspaceScope)
-                if trusted_workspace is not None
-                else None
-            ),
-            "selected_paper_ids": list(selected_paper_ids),
-            "knowledge_base_all": knowledge_base_all,
-            "registry_state": dump_contract(RegistryState(), RegistryState),
-            "guard_state": dump_contract(GuardState(), GuardState),
-            "observations": dump_contract((), tuple[ResearchObservation, ...]),
-            "traces": dump_contract((), tuple[ActionTrace, ...]),
-            "error_codes": [],
-        }
         self._graph.invoke(
             initial_state,
             config=config,
@@ -203,6 +198,74 @@ class LangGraphResearchWorkflow:
             interrupt_after=interrupt_after or None,
         )
         return self.inspect(resolved_thread_id)
+
+    def stream(
+        self,
+        query: str,
+        *,
+        trusted_workspace: TrustedWorkspaceScope | None = None,
+        selected_paper_ids: tuple[str, ...] = (),
+        knowledge_base_all: bool = False,
+        thread_id: str | None = None,
+        interrupt_after: tuple[str, ...] = (),
+    ) -> Iterator[ResearchProgressEvent]:
+        """以稳定业务事件流执行新任务，隐藏 LangGraph 的原始状态更新。"""
+        resolved_thread_id, config, initial_state = self._prepare_start(
+            query,
+            trusted_workspace=trusted_workspace,
+            selected_paper_ids=selected_paper_ids,
+            knowledge_base_all=knowledge_base_all,
+            thread_id=thread_id,
+        )
+        yield ResearchProgressEvent(
+            kind="started",
+            stage="start",
+            message="研究任务已开始",
+            thread_id=resolved_thread_id,
+        )
+        yield from self._stream_graph(
+            initial_state,
+            config=config,
+            thread_id=resolved_thread_id,
+            interrupt_after=interrupt_after,
+        )
+
+    def resume_stream(
+        self,
+        thread_id: str,
+        *,
+        interrupt_after: tuple[str, ...] = (),
+    ) -> Iterator[ResearchProgressEvent]:
+        """从已持久化 checkpoint 继续任务，并继续输出业务进度事件。"""
+        config = _thread_config(
+            thread_id,
+            recursion_limit=_recursion_limit(self._context.settings),
+        )
+        existing = self._graph.get_state(config)
+        if not existing.values:
+            raise LookupError(f"Unknown research thread: {thread_id}")
+        if not existing.next:
+            execution = self.inspect(thread_id)
+            yield ResearchProgressEvent(
+                kind="completed",
+                stage="completed",
+                message="研究任务已经完成",
+                thread_id=thread_id,
+                result=execution.result,
+            )
+            return
+        yield ResearchProgressEvent(
+            kind="started",
+            stage="resume",
+            message="正在恢复研究任务",
+            thread_id=thread_id,
+        )
+        yield from self._stream_graph(
+            None,
+            config=config,
+            thread_id=thread_id,
+            interrupt_after=interrupt_after,
+        )
 
     def resume(
         self,
@@ -243,6 +306,77 @@ class LangGraphResearchWorkflow:
             ),
         )
 
+    def _prepare_start(
+        self,
+        query: str,
+        *,
+        trusted_workspace: TrustedWorkspaceScope | None,
+        selected_paper_ids: tuple[str, ...],
+        knowledge_base_all: bool,
+        thread_id: str | None,
+    ) -> tuple[str, dict[str, object], AgentGraphState]:
+        resolved_thread_id = thread_id or f"research_{uuid4().hex}"
+        config = _thread_config(
+            resolved_thread_id,
+            recursion_limit=_recursion_limit(self._context.settings),
+        )
+        if self._graph.get_state(config).values:
+            raise ValueError(
+                f"Research thread already exists: {resolved_thread_id}. Use resume()."
+            )
+        initial_state: AgentGraphState = {
+            "thread_id": resolved_thread_id,
+            "original_query": query,
+            "trusted_workspace": (
+                dump_contract(trusted_workspace, TrustedWorkspaceScope)
+                if trusted_workspace is not None
+                else None
+            ),
+            "selected_paper_ids": list(selected_paper_ids),
+            "knowledge_base_all": knowledge_base_all,
+            "registry_state": dump_contract(RegistryState(), RegistryState),
+            "guard_state": dump_contract(GuardState(), GuardState),
+            "observations": dump_contract((), tuple[ResearchObservation, ...]),
+            "traces": dump_contract((), tuple[ActionTrace, ...]),
+            "error_codes": [],
+        }
+        return resolved_thread_id, config, initial_state
+
+    def _stream_graph(
+        self,
+        input_state: AgentGraphState | None,
+        *,
+        config: dict[str, object],
+        thread_id: str,
+        interrupt_after: tuple[str, ...],
+    ) -> Iterator[ResearchProgressEvent]:
+        for part in self._graph.stream(
+            input_state,
+            config=config,
+            context=self._context,
+            stream_mode="updates",
+            version="v2",
+            interrupt_after=interrupt_after or None,
+        ):
+            for node in _stream_update_nodes(part):
+                yield progress_event_for_node(node=node, thread_id=thread_id)
+        execution = self.inspect(thread_id)
+        if execution.interrupted:
+            yield ResearchProgressEvent(
+                kind="interrupted",
+                stage="interrupted",
+                message="研究任务已暂停，可从当前检查点继续",
+                thread_id=thread_id,
+            )
+        else:
+            yield ResearchProgressEvent(
+                kind="completed",
+                stage="completed",
+                message="研究任务已完成",
+                thread_id=thread_id,
+                result=execution.result,
+            )
+
 
 def build_agentic_research_graph() -> StateGraph:
     graph = StateGraph(AgentGraphState, context_schema=AgentGraphContext)
@@ -254,23 +388,24 @@ def build_agentic_research_graph() -> StateGraph:
     graph.add_node("validate_action", _validate_action)
     graph.add_node("execute_tool", _execute_tool)
     graph.add_node("register_and_observe", _register_and_observe)
+    graph.add_node("generate_answer", _generate_answer)
     graph.add_node("finish_run", _finish_run)
 
     graph.add_edge(START, "resolve_scope")
     graph.add_conditional_edges(
         "resolve_scope",
         _route,
-        {"understand_query": "understand_query", "finish_run": "finish_run"},
+        {"understand_query": "understand_query", "generate_answer": "generate_answer"},
     )
     graph.add_conditional_edges(
         "understand_query",
         _route,
-        {"build_plan": "build_plan", "finish_run": "finish_run"},
+        {"build_plan": "build_plan", "generate_answer": "generate_answer"},
     )
     graph.add_conditional_edges(
         "build_plan",
         _route,
-        {"decide_action": "decide_action", "finish_run": "finish_run"},
+        {"decide_action": "decide_action", "generate_answer": "generate_answer"},
     )
     graph.add_conditional_edges(
         "decide_action",
@@ -278,7 +413,7 @@ def build_agentic_research_graph() -> StateGraph:
         {
             "decide_action": "decide_action",
             "qualify_and_assess": "qualify_and_assess",
-            "finish_run": "finish_run",
+            "generate_answer": "generate_answer",
         },
     )
     graph.add_conditional_edges(
@@ -287,7 +422,7 @@ def build_agentic_research_graph() -> StateGraph:
         {
             "decide_action": "decide_action",
             "validate_action": "validate_action",
-            "finish_run": "finish_run",
+            "generate_answer": "generate_answer",
         },
     )
     graph.add_conditional_edges(
@@ -296,7 +431,7 @@ def build_agentic_research_graph() -> StateGraph:
         {
             "decide_action": "decide_action",
             "execute_tool": "execute_tool",
-            "finish_run": "finish_run",
+            "generate_answer": "generate_answer",
         },
     )
     graph.add_conditional_edges(
@@ -304,10 +439,11 @@ def build_agentic_research_graph() -> StateGraph:
         _route,
         {
             "register_and_observe": "register_and_observe",
-            "finish_run": "finish_run",
+            "generate_answer": "generate_answer",
         },
     )
     graph.add_edge("register_and_observe", "decide_action")
+    graph.add_edge("generate_answer", "finish_run")
     graph.add_edge("finish_run", END)
     return graph
 
@@ -334,7 +470,7 @@ def _resolve_scope(
             "clarification": resolution.clarification,
             "terminal_status": ResearchRunStatus.NEEDS_CLARIFICATION.value,
             "stop_reason": StopReason.SCOPE_UNRESOLVED.value,
-            "next_node": "finish_run",
+            "next_node": "generate_answer",
         }
     return {
         "scope_resolution": dump_contract(resolution, ScopeResolution),
@@ -389,7 +525,8 @@ def _decide_action(
 ) -> AgentGraphState:
     tracker = _tracker(state, runtime.context.settings)
     registry = _registry(state)
-    capacity = tracker.can_decide()
+    reserved_answer_calls = int(runtime.context.answer_generator is not None)
+    capacity = tracker.can_decide(reserved_llm_calls=reserved_answer_calls)
     if not capacity.accepted:
         return _terminal_update(
             state,
@@ -425,7 +562,10 @@ def _decide_action(
             )
         )
     except DecisionError as error:
-        capacity = tracker.record_decision(error.llm_calls)
+        capacity = tracker.record_decision(
+            error.llm_calls,
+            reserved_llm_calls=reserved_answer_calls,
+        )
         traces = _append_trace(
             state,
             ActionTrace(tracker.iterations, "invalid_decision", False, str(error)),
@@ -459,7 +599,10 @@ def _decide_action(
             "traces": traces,
             "next_node": "decide_action",
         }
-    capacity = tracker.record_decision(decision.llm_calls)
+    capacity = tracker.record_decision(
+        decision.llm_calls,
+        reserved_llm_calls=reserved_answer_calls,
+    )
     if not capacity.accepted:
         traces = _append_trace(
             state,
@@ -748,6 +891,138 @@ def _register_and_observe(
     }
 
 
+def _generate_answer(
+    state: AgentGraphState, runtime: Runtime[AgentGraphContext]
+) -> AgentGraphState:
+    """在 Agent 循环终止后，统一选择证据并生成用户可见回答。"""
+    status = ResearchRunStatus(
+        state.get("terminal_status", ResearchRunStatus.FAILED.value)
+    )
+    registry = _registry(state)
+    coverage: CoverageState | None = None
+    selected: tuple[EvidenceRecord, ...] = ()
+    context: QueryContext | None = None
+    plan: ResearchPlan | None = None
+
+    if state.get("query_context") is not None:
+        context = load_contract(state["query_context"], QueryContext)
+        coverage = _evaluate_coverage(
+            state,
+            settings=runtime.context.settings,
+            context=context,
+            registry=registry,
+        )
+    if state.get("plan") is not None:
+        plan = load_contract(state["plan"], ResearchPlan)
+    if coverage is not None and plan is not None:
+        selected = FinalEvidenceSelector(
+            max_units=runtime.context.settings.final_evidence_max_units,
+            max_per_paper=runtime.context.settings.final_evidence_max_per_paper,
+        ).select(plan=plan, coverage=coverage, evidence=registry.records)
+
+    if status is ResearchRunStatus.NEEDS_CLARIFICATION:
+        answer = ResearchAnswer(
+            status="needs_clarification",
+            answer=state.get("clarification") or "请补充需要检索的论文范围。",
+            insufficient_evidence=True,
+        )
+    elif status is ResearchRunStatus.FAILED:
+        answer = ResearchAnswer(
+            status="failed",
+            answer="研究流程未能完成；请稍后重试，或缩小问题与论文范围。",
+            insufficient_evidence=True,
+        )
+    elif not selected or context is None:
+        answer = ResearchAnswer(
+            status="insufficient_evidence",
+            answer="当前检索到的论文证据不足以回答该问题。",
+            insufficient_evidence=True,
+        )
+    elif runtime.context.answer_generator is None:
+        answer = ResearchAnswer(
+            status="disabled",
+            answer="回答生成功能当前未启用；请查看已检索到的论文证据。",
+            insufficient_evidence=True,
+            coverage_note="系统已完成证据检索，但未配置最终回答生成器。",
+        )
+    else:
+        tracker = _tracker(state, runtime.context.settings)
+        if tracker.llm_calls >= runtime.context.settings.max_llm_calls:
+            return {
+                "coverage": (
+                    dump_contract(coverage, CoverageState)
+                    if coverage is not None
+                    else None
+                ),
+                "selected_evidence": dump_contract(
+                    selected, tuple[EvidenceRecord, ...]
+                ),
+                "answer": dump_contract(
+                    ResearchAnswer(
+                        status="budget_exhausted",
+                        answer="已完成证据检索，但最终回答的 LLM 预算不足；请查看已检索证据。",
+                        insufficient_evidence=True,
+                    ),
+                    ResearchAnswer,
+                ),
+                "error_codes": list(
+                    dict.fromkeys(
+                        (*state.get("error_codes", []), "AnswerGenerationBudget")
+                    )
+                ),
+                "next_node": "finish_run",
+            }
+        tracker.record_preparation_llm_calls(1)
+        try:
+            answer = generate_agentic_answer(
+                generator=runtime.context.answer_generator,
+                query=context.resolved_query,
+                evidence=selected,
+            )
+        except Exception as error:
+            error_codes = list(
+                dict.fromkeys(
+                    (*state.get("error_codes", []), f"AnswerGeneration:{type(error).__name__}")
+                )
+            )
+            return {
+                "coverage": (
+                    dump_contract(coverage, CoverageState)
+                    if coverage is not None
+                    else None
+                ),
+                "selected_evidence": dump_contract(
+                    selected, tuple[EvidenceRecord, ...]
+                ),
+                "answer": dump_contract(
+                    ResearchAnswer(
+                        status="fallback",
+                        answer="回答生成未完成；系统保留了已检索到的论文证据，供你核验或重新提问。",
+                        insufficient_evidence=True,
+                        coverage_note="最终回答生成失败，但检索证据与来源信息仍然可用。",
+                    ),
+                    ResearchAnswer,
+                ),
+                "error_codes": error_codes,
+                "guard_state": dump_contract(tracker.snapshot(), GuardState),
+                "next_node": "finish_run",
+            }
+
+    return {
+        "coverage": (
+            dump_contract(coverage, CoverageState) if coverage is not None else None
+        ),
+        "selected_evidence": dump_contract(selected, tuple[EvidenceRecord, ...]),
+        "answer": dump_contract(answer, ResearchAnswer),
+        "guard_state": (
+            dump_contract(tracker.snapshot(), GuardState)
+            if runtime.context.answer_generator is not None and selected and context
+            else state.get("guard_state")
+        ),
+        "next_node": "finish_run",
+    }
+
+
 def _finish_run(
     state: AgentGraphState, runtime: Runtime[AgentGraphContext]
 ) -> AgentGraphState:
@@ -775,30 +1050,24 @@ def _finish_run(
         traces=_traces(state),
         budget_usage=guard_state.usage,
         coverage=(
-            _evaluate_coverage(
-                state,
-                settings=runtime.context.settings,
-                context=load_contract(state["query_context"], QueryContext),
-                registry=EvidenceRegistry(registry_state),
-            )
-            if state.get("query_context") is not None
+            load_contract(state["coverage"], CoverageState)
+            if state.get("coverage") is not None
             else None
         ),
-        selected_evidence=(),
+        selected_evidence=(
+            load_contract(state["selected_evidence"], tuple[EvidenceRecord, ...])
+            if state.get("selected_evidence") is not None
+            else ()
+        ),
+        answer=(
+            load_contract(state["answer"], ResearchAnswer)
+            if state.get("answer") is not None
+            else None
+        ),
+        thread_id=state.get("thread_id"),
+        error_codes=tuple(state.get("error_codes", [])),
         clarification=state.get("clarification"),
     )
-    if result.coverage is not None and result.plan is not None:
-        result = replace(
-            result,
-            selected_evidence=FinalEvidenceSelector(
-                max_units=runtime.context.settings.final_evidence_max_units,
-                max_per_paper=runtime.context.settings.final_evidence_max_per_paper,
-            ).select(
-                plan=result.plan,
-                coverage=result.coverage,
-                evidence=result.evidence,
-            ),
-        )
     return {"result": dump_contract(result, ResearchRunResult)}
 
 
@@ -840,7 +1109,7 @@ def _terminal_update(
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
         "terminal_status": status.value,
         "stop_reason": reason.value,
-        "next_node": "finish_run",
+        "next_node": "generate_answer",
     }
     if traces is not None:
         update["traces"] = traces
@@ -870,7 +1139,7 @@ def _fatal_update(
         "error_codes": list(
             dict.fromkeys((*state.get("error_codes", []), type(error).__name__))
         ),
-        "next_node": "finish_run",
+        "next_node": "generate_answer",
     }
 
 
@@ -889,6 +1158,16 @@ def _thread_config(
 def _recursion_limit(settings: AgenticResearchSettings) -> int:
     # 每轮最多经过 decide/qualify/validate/execute/register 五个节点，再预留准备与收尾。
     return max(25, settings.max_agent_iterations * 5 + 10)
+
+
+def _stream_update_nodes(part: Any) -> tuple[str, ...]:
+    """兼容 LangGraph v2 StreamPart，并仅提取完成更新的节点名称。"""
+    if not isinstance(part, dict) or part.get("type") != "updates":
+        return ()
+    data = part.get("data")
+    if not isinstance(data, dict):
+        return ()
+    return tuple(str(node) for node in data if isinstance(node, str))
 
 
 def _registry_snapshot(state: AgentGraphState) -> RegistryState:

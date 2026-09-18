@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -16,12 +18,15 @@ from paperbase.agentic.contracts import (
 )
 from paperbase.agentic.decision import DecisionResult, ScriptedDecisionAgent
 from paperbase.agentic.graph import LangGraphResearchWorkflow
+from paperbase.agentic.evaluation import evaluate_research_result
+from paperbase.agentic.persistence import SQLiteCheckpointStore
 from paperbase.agentic.planner import ResearchPlanner
 from paperbase.agentic.query_understanding import QueryUnderstandingService
 from paperbase.agentic.runtime import ResearchRuntime
 from paperbase.agentic.scope_resolver import ScopeResolver
-from paperbase.agentic.service import AgenticResearchService
+from paperbase.agentic.service import AgenticResearchBusyError, AgenticResearchService
 from paperbase.config import AgenticResearchSettings
+from paperbase.generation.answer_generator import AnswerGenerationOutcome
 from paperbase.retrieval.contracts import (
     EvidenceSourceType,
     PaperSearchOutcome,
@@ -143,7 +148,14 @@ def _components():
     return resolver, understanding, planner
 
 
-def _workflow(decision_agent, executor, *, settings=None, checkpointer=None):
+def _workflow(
+    decision_agent,
+    executor,
+    *,
+    settings=None,
+    checkpointer=None,
+    answer_generator=None,
+):
     resolver, understanding, planner = _components()
     return LangGraphResearchWorkflow(
         scope_resolver=resolver,
@@ -152,11 +164,170 @@ def _workflow(decision_agent, executor, *, settings=None, checkpointer=None):
         decision_agent=decision_agent,
         tool_executor=executor,
         settings=settings or AgenticResearchSettings(),
+        answer_generator=answer_generator,
         checkpointer=checkpointer,
     )
 
 
+class _AnswerGenerator:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def generate(self, *, query, evidence, conversation_context=None):
+        self.calls.append((query, tuple(evidence)))
+        citations = tuple(item.evidence_id for item in evidence)
+        return AnswerGenerationOutcome(
+            status="success",
+            answer="A 与 B 的方法不同 [E1][E2]。",
+            citations=citations,
+            insufficient_evidence=False,
+        )
+
+
+class _FailingAnswerGenerator:
+    def generate(self, **kwargs):
+        raise RuntimeError("answer provider unavailable")
+
+
 class AgenticLangGraphTests(unittest.TestCase):
+    def test_final_answer_reuses_selected_evidence_ids(self) -> None:
+        generator = _AnswerGenerator()
+        result = _workflow(
+            _QualifyingDecisionAgent(),
+            _Executor(),
+            answer_generator=generator,
+        ).run(
+            "A 和 B 的方法有什么区别？",
+            selected_paper_ids=("A", "B"),
+            thread_id="answer-node",
+        )
+        self.assertIsNotNone(result.answer)
+        self.assertEqual(result.answer.citations, ("E1", "E2"))
+        self.assertEqual(result.thread_id, "answer-node")
+        self.assertEqual(result.budget_usage.llm_calls, 4)
+        self.assertEqual(
+            [item.evidence_id for item in generator.calls[0][1]], ["E1", "E2"]
+        )
+        evaluation = evaluate_research_result(result)
+        self.assertTrue(evaluation.passed)
+        self.assertEqual(evaluation.evidence_balance, 1.0)
+        self.assertEqual(evaluation.fabricated_citations, ())
+
+    def test_stream_exposes_business_events_and_final_result(self) -> None:
+        events = list(
+            _workflow(_QualifyingDecisionAgent(), _Executor()).stream(
+                "A 和 B 的方法有什么区别？",
+                selected_paper_ids=("A", "B"),
+                thread_id="stream-run",
+            )
+        )
+        self.assertEqual(events[0].kind, "started")
+        self.assertEqual(events[-1].kind, "completed")
+        self.assertIsNotNone(events[-1].result)
+        self.assertIn("retrieval", [event.stage for event in events])
+        self.assertIn("answer", [event.stage for event in events])
+
+    def test_answer_failure_keeps_evidence_and_records_diagnostic_code(self) -> None:
+        result = _workflow(
+            _QualifyingDecisionAgent(),
+            _Executor(),
+            answer_generator=_FailingAnswerGenerator(),
+        ).run(
+            "A 和 B 的方法有什么区别？",
+            selected_paper_ids=("A", "B"),
+            thread_id="answer-fallback",
+        )
+        self.assertEqual(result.answer.status, "fallback")
+        self.assertEqual(len(result.selected_evidence), 2)
+        self.assertIn("AnswerGeneration:RuntimeError", result.error_codes)
+
+    def test_service_rejects_unbounded_concurrent_run(self) -> None:
+        service = AgenticResearchService(
+            workflow=_workflow(_EvidenceAwareDecisionAgent(), _Executor()),
+            max_concurrent_runs=1,
+        )
+        self.assertTrue(service._capacity.acquire(blocking=False))
+        try:
+            with self.assertRaises(AgenticResearchBusyError):
+                service.research("A 方法", selected_paper_ids=("A",))
+        finally:
+            service._capacity.release()
+
+    def test_sqlite_checkpoint_survives_process_style_reopen(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "agentic.sqlite3"
+            first_store = SQLiteCheckpointStore.open(path)
+            first_executor = _Executor()
+            first_workflow = _workflow(
+                _EvidenceAwareDecisionAgent(),
+                first_executor,
+                checkpointer=first_store.saver,
+            )
+            interrupted = first_workflow.start(
+                "A 和 B 的方法有什么区别？",
+                selected_paper_ids=("A", "B"),
+                thread_id="sqlite-resume",
+                interrupt_after=("execute_tool",),
+            )
+            self.assertTrue(interrupted.interrupted)
+            self.assertEqual(len(first_executor.calls), 1)
+            first_store.close()
+
+            second_store = SQLiteCheckpointStore.open(path)
+            resumed_executor = _Executor()
+            resumed_workflow = _workflow(
+                _EvidenceAwareDecisionAgent(),
+                resumed_executor,
+                checkpointer=second_store.saver,
+            )
+            completed = resumed_workflow.resume("sqlite-resume")
+            self.assertFalse(completed.interrupted)
+            self.assertEqual(
+                [action.searches[0].paper_id for action in resumed_executor.calls],
+                ["B"],
+            )
+            second_store.close()
+
+    def test_service_lifecycle_tracking_preserves_interrupted_resume(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "service.sqlite3"
+            first_store = SQLiteCheckpointStore.open(path)
+            first_service = AgenticResearchService(
+                workflow=_workflow(
+                    _EvidenceAwareDecisionAgent(),
+                    _Executor(),
+                    checkpointer=first_store.saver,
+                ),
+                checkpoint_store=first_store,
+            )
+            events = list(
+                first_service.stream_research(
+                    "A 和 B 的方法有什么区别？",
+                    selected_paper_ids=("A", "B"),
+                    thread_id="compacted-resume",
+                    interrupt_after=("execute_tool",),
+                )
+            )
+            self.assertEqual(events[-1].kind, "interrupted")
+            first_service.close()
+
+            second_store = SQLiteCheckpointStore.open(path)
+            executor = _Executor()
+            second_service = AgenticResearchService(
+                workflow=_workflow(
+                    _EvidenceAwareDecisionAgent(),
+                    executor,
+                    checkpointer=second_store.saver,
+                ),
+                checkpoint_store=second_store,
+            )
+            completed = second_service.resume("compacted-resume")
+            self.assertFalse(completed.interrupted)
+            self.assertEqual(
+                [action.searches[0].paper_id for action in executor.calls], ["B"]
+            )
+            second_service.close()
+
     def test_dynamic_a_then_b_runs_through_compiled_graph(self) -> None:
         executor = _Executor()
         result = _workflow(_EvidenceAwareDecisionAgent(), executor).run(

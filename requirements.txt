@@ -17,6 +17,8 @@ openai>=2.0,<3.0
 python-dotenv>=1.0,<2.0
 # Phase 2.5 使用 StateGraph、Runtime Context 与 Checkpointer 执行可恢复的 Agentic workflow。
 langgraph>=1.2,<2.0
+# Phase 4 为本地桌面部署提供跨进程恢复的 SQLite checkpoint。
+langgraph-checkpoint-sqlite>=3.1,<4.0
 # Streamlit frontend (Frontend Step 1/2：骨架、Knowledge Base Chat 与 Evidence UI）。
 streamlit>=1.61,<2.0
 # Test runner for the repository test suite.

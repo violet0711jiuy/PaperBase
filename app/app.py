@@ -49,6 +49,12 @@ from services.paperbase_service import PaperBaseService
 from state import KNOWLEDGE_BASE_PAGE, initialize_session_state
 
 
+@st.cache_resource(show_spinner=False)
+def _get_service() -> PaperBaseService:
+    """跨 Streamlit rerun 复用模型、检索器与 SQLite checkpoint 连接。"""
+    return PaperBaseService()
+
+
 def main() -> None:
     """启动整个 Streamlit 页面，并按当前导航项选择页面。"""
     # 设置浏览器标题、页面图标和宽屏布局。
@@ -56,7 +62,7 @@ def main() -> None:
     # 只补齐缺失状态，不覆盖用户在 rerun 中已经选择的状态。
     initialize_session_state(st.session_state)
     # 创建一个轻量 Service 实例，页面通过它读取论文和会话信息。
-    service = PaperBaseService()
+    service = _get_service()
     # 所有页面都先创建同一套 Global Nav / Context / Main 三栏。
     navigation_column, context_column, main_column = render_app_shell()
     with navigation_column:

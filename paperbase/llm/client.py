@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -105,6 +105,15 @@ class OpenAICompatibleChatClient:
             base_url=settings.base_url,
             timeout=settings.timeout_seconds,
         )
+
+    def with_max_tokens(self, max_tokens: int) -> "OpenAICompatibleChatClient":
+        """复用同一 SDK 连接池，创建只覆盖输出预算的轻量调用视图。"""
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive.")
+        clone = object.__new__(type(self))
+        clone._settings = replace(self._settings, max_tokens=max_tokens)
+        clone._client = self._client
+        return clone
 
     def complete(self, *, system_prompt: str, user_prompt: str) -> str:
         """发起非流式短请求；Query 改写只消费最终 content，不记录问题或响应到磁盘。"""

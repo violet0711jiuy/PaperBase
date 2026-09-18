@@ -396,6 +396,26 @@ class ActionTrace:
 
 
 @dataclass(frozen=True)
+class ResearchAnswer:
+    """Agentic Research 的最终用户可见回答及引用状态。"""
+
+    status: str
+    answer: str
+    citations: tuple[str, ...] = ()
+    insufficient_evidence: bool = False
+    partial_answer: bool = False
+    coverage_note: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", _text(self.status, "status"))
+        if not isinstance(self.answer, str) or not self.answer.strip():
+            raise ValueError("answer must be a non-empty string.")
+        # 回答正文可能包含 Markdown 标题和段落，不能像标识符一样折叠全部空白。
+        object.__setattr__(self, "answer", self.answer.strip())
+        object.__setattr__(self, "citations", _unique_texts(self.citations))
+
+
+@dataclass(frozen=True)
 class PaperAssessment:
     paper_id: str
     status: PaperAssessmentStatus
@@ -488,6 +508,9 @@ class ResearchRunResult:
     budget_usage: BudgetUsage
     coverage: CoverageState | None = None
     selected_evidence: tuple[EvidenceRecord, ...] = ()
+    answer: ResearchAnswer | None = None
+    thread_id: str | None = None
+    error_codes: tuple[str, ...] = ()
     clarification: str | None = None
 
 

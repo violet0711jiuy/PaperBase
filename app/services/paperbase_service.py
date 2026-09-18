@@ -22,6 +22,7 @@ import sqlite3
 # ``TemporaryDirectory`` 用于保存网页上传的短生命周期副本；真正的 staging
 # workspace 仍然只由后端写入配置指定的 storage/staging。
 from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING, Iterator
 
 # AppSettings 是后端统一配置模型，load_settings 读取项目 config.yaml。
 from paperbase.config import AppSettings, load_settings
@@ -57,6 +58,11 @@ from paperbase.staging.service import (
     delete_temporary_workspace,
     run_temporary_workspace_stage,
 )
+
+if TYPE_CHECKING:
+    from paperbase.agentic.contracts import EvidenceRecord, ResearchRunResult
+    from paperbase.agentic.events import ResearchProgressEvent
+    from paperbase.agentic.service import AgenticResearchService
 
 
 @dataclass(frozen=True)
@@ -120,6 +126,8 @@ class KnowledgeBaseTurnMetadata:
     insufficient_evidence: bool
     partial_answer: bool
     coverage_note: str | None
+    mode: str = "quick"
+    thread_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -219,6 +227,7 @@ class PaperBaseService:
         settings: AppSettings | None = None,
         *,
         answer_service: object | None = None,
+        agentic_service: "AgenticResearchService | None" = None,
     ) -> None:
         """初始化配置、正式元数据数据库和独立会话存储。"""
         # 测试可以传入临时 settings；正常运行时从默认 config.yaml 读取。
@@ -240,6 +249,8 @@ class PaperBaseService:
         # 正式问答链按需装配；页面只在用户真正发送问题时加载模型和索引。
         # 测试可注入一个替身，避免初始化真实 embedding/FAISS/LLM。
         self._answer_service = answer_service
+        # Agentic Service 同样按需装配；测试可以注入轻量替身。
+        self._agentic_service = agentic_service
         # KB 回答的证据快照由 Service 持久化，供 rerun 后恢复历史 Evidence。
         # 目录位于 storage 下的独立区域，不与 staging workspace 混用。
         self._answer_artifact_dir = self._settings.storage.papers_dir.parent / "knowledge_base_answers"
@@ -617,6 +628,55 @@ class PaperBaseService:
         self._persist_answer_artifact(result)
         return result
 
+    def ask_knowledge_base_agentic(
+        self,
+        query: str,
+        conversation_id: str,
+        *,
+        selected_paper_ids: tuple[str, ...] = (),
+        knowledge_base_all: bool = True,
+        thread_id: str | None = None,
+    ) -> "ResearchRunResult":
+        """执行完整 Agentic Research，并把最终回答原子追加到现有会话。"""
+        normalized_query = self._validate_kb_agentic_request(query, conversation_id)
+        result = self._get_agentic_service().research(
+            normalized_query,
+            selected_paper_ids=selected_paper_ids,
+            knowledge_base_all=knowledge_base_all,
+            thread_id=thread_id,
+        )
+        self._persist_agentic_turn(
+            conversation_id=conversation_id,
+            query=normalized_query,
+            result=result,
+        )
+        return result
+
+    def stream_knowledge_base_agentic(
+        self,
+        query: str,
+        conversation_id: str,
+        *,
+        selected_paper_ids: tuple[str, ...] = (),
+        knowledge_base_all: bool = True,
+        thread_id: str | None = None,
+    ) -> "Iterator[ResearchProgressEvent]":
+        """流式执行 Agentic Research；完成事件发出前先持久化会话回合。"""
+        normalized_query = self._validate_kb_agentic_request(query, conversation_id)
+        for event in self._get_agentic_service().stream_research(
+            normalized_query,
+            selected_paper_ids=selected_paper_ids,
+            knowledge_base_all=knowledge_base_all,
+            thread_id=thread_id,
+        ):
+            if event.kind == "completed" and event.result is not None:
+                self._persist_agentic_turn(
+                    conversation_id=conversation_id,
+                    query=normalized_query,
+                    result=event.result,
+                )
+            yield event
+
     def get_answer_evidence(self, result: AnswerServiceResult) -> tuple[KnowledgeBaseEvidence, ...]:
         """把本轮后端 Evidence 转成页面视图模型，不暴露内部 chunk 字段。"""
         return tuple(_evidence_view(item) for item in result.expansion.evidence)
@@ -658,6 +718,8 @@ class PaperBaseService:
             insufficient_evidence=payload.get("insufficient_evidence") is True,
             partial_answer=payload.get("partial_answer") is True,
             coverage_note=_optional_text(payload.get("coverage_note")),
+            mode=_optional_text(payload.get("mode")) or "quick",
+            thread_id=_optional_text(payload.get("thread_id")),
         )
 
     def create_workspace_conversation(self, workspace_id: str) -> ConversationRecord:
@@ -782,6 +844,83 @@ class PaperBaseService:
                 conversation_scope_id=FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
             )
         return self._answer_service
+
+    def _get_agentic_service(self) -> "AgenticResearchService":
+        """延迟创建正式 Agentic Service，浏览页面时不加载检索器与 LLM。"""
+        if self._agentic_service is None:
+            from paperbase.agentic.factory import create_agentic_research_service
+
+            self._agentic_service = create_agentic_research_service(
+                config_path=self._settings.config_path
+            )
+        return self._agentic_service
+
+    def _validate_kb_agentic_request(self, query: str, conversation_id: str) -> str:
+        normalized_query = " ".join(query.split())
+        if not normalized_query:
+            raise ValueError("问题不能为空。")
+        self._conversations.get_conversation(
+            conversation_id,
+            expected_scope_type="knowledge_base",
+            expected_scope_id=FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
+        )
+        return normalized_query
+
+    def _persist_agentic_turn(
+        self,
+        *,
+        conversation_id: str,
+        query: str,
+        result: "ResearchRunResult",
+    ) -> None:
+        """把 Agentic 最终答案、引用证据和 thread_id 写入会话审计记录。"""
+        answer = result.answer
+        if answer is None:
+            raise RuntimeError("Agentic Research 未返回最终回答。")
+        selected = result.selected_evidence
+        cited = set(answer.citations)
+        displayed = (
+            tuple(item for item in selected if item.evidence_id in cited)
+            if cited
+            else selected
+        )
+        evidence_json = json.dumps(
+            [_agentic_evidence_payload(item) for item in displayed],
+            ensure_ascii=False,
+        ) if displayed else None
+        turn = self._conversations.append_turn(
+            conversation_id,
+            user_query=query,
+            assistant_answer=answer.answer,
+            resolved_query=(
+                result.query_context.resolved_query if result.query_context else None
+            ),
+            resolution_status=answer.status,
+            evidence_json=evidence_json,
+        )
+        payload = {
+            "conversation_id": conversation_id,
+            "turn_index": turn.turn_index,
+            "mode": "agentic",
+            "thread_id": result.thread_id,
+            "answer_status": answer.status,
+            "answer": answer.answer,
+            "citations": list(answer.citations),
+            "insufficient_evidence": answer.insufficient_evidence,
+            "partial_answer": answer.partial_answer,
+            "coverage_note": answer.coverage_note,
+            "error_codes": list(result.error_codes),
+            "evidence": [_agentic_evidence_payload(item) for item in displayed],
+        }
+        try:
+            path = self._answer_artifact_path(conversation_id, turn.turn_index)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except (OSError, TypeError, ValueError):
+            return
 
     def _get_paper_ask_service(self, workspace_id: str) -> object:
         """按 workspace 延迟装配并复用现有 Ask This Paper 后端服务。"""
@@ -1028,6 +1167,20 @@ def _evidence_payload(item: object) -> dict[str, object]:
         "page_start": view.page_start,
         "page_end": view.page_end,
         "text": view.text,
+    }
+
+
+def _agentic_evidence_payload(item: "EvidenceRecord") -> dict[str, object]:
+    """将 Agentic EvidenceRecord 转成现有聊天 Evidence 的公开快照格式。"""
+    evidence = item.evidence
+    return {
+        "evidence_id": item.evidence_id,
+        "kind": evidence.source_type.value,
+        "paper_title": evidence.paper_title or evidence.paper_id,
+        "section": evidence.section,
+        "page_start": evidence.page_start,
+        "page_end": evidence.page_end,
+        "text": evidence.content,
     }
 
 

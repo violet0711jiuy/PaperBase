@@ -328,6 +328,9 @@ class AgenticResearchSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
+    checkpoint_path: Path = Path("storage/agentic_checkpoints.sqlite3")
+    checkpoint_retention_days: int = Field(default=30, ge=1, le=3650)
+    max_concurrent_runs: int = Field(default=1, ge=1, le=32)
     max_agent_iterations: int = Field(default=8, ge=1, le=50)
     max_tool_calls: int = Field(default=8, ge=1, le=50)
     max_retrieval_queries: int = Field(default=16, ge=1, le=100)
@@ -340,6 +343,12 @@ class AgenticResearchSettings(BaseModel):
     coverage_exhaustive_min_queries_per_paper: int = Field(default=2, ge=1, le=10)
     final_evidence_max_units: int = Field(default=8, ge=1, le=50)
     final_evidence_max_per_paper: int = Field(default=4, ge=1, le=20)
+
+    @field_validator("checkpoint_path", mode="after")
+    @classmethod
+    def resolve_checkpoint_path(cls, value: Path, info: ValidationInfo) -> Path:
+        """将 Agent checkpoint 固定到项目配置目录下的绝对路径。"""
+        return _resolve_path(value, info)
 
 
 class AppSettings(BaseModel):

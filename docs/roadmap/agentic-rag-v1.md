@@ -2,7 +2,7 @@
 
 > 状态：`FROZEN FOR IMPLEMENTATION`  
 > 文档性质：目标架构与实现契约，不代表功能已经全部完成。  
-> 当前实施状态：Phase 1、Phase 2、Phase 2.5 与 Phase 3 已完成；下一步进入 Phase 4 完整回答链路与产品化，尚未接入 UI。
+> 当前实施状态：Phase 1 至 Phase 4 已完成首个可运行闭环；Agentic Answer、SQLite 恢复、业务事件流和 Knowledge Base UI 已接通，PostgreSQL 与更高并发优化保留为部署演进项。
 > 冻结原则：核心边界、数据契约和状态语义冻结；配额、阈值与排序权重保留为配置项。
 
 ## 1. 结论
@@ -652,12 +652,12 @@ Phase 3 的各项能力继续实现为框架无关的领域组件，再作为明
 
 ### Phase 4：LangGraph 产品化与完整链路集成
 
-- 在 Phase 3 已闭环的研究 Graph 后接入 Agentic Answer 节点，并与现有 Grounded Answer Generator 集成。
-- 接入正式 SQLite 或 PostgreSQL Checkpointer，定义 thread/run 身份、恢复、幂等和数据保留策略。
-- 增加 interrupt/resume、Streaming、Trace、可观测性与失败诊断。
-- 完成 UI 模式选择、任务进度展示与需要澄清时的交互。
-- 完成多论文 Evaluation、并发控制与性能优化。
-- 删除生产路径中的手写循环；只保留仍有价值的纯领域单元测试替身。
+- [x] 在 Phase 3 已闭环的研究 Graph 后接入 Agentic Answer 节点，并与现有 Grounded Answer Generator 集成。
+- [x] 接入正式 SQLite Checkpointer，定义 thread 身份、恢复、重复启动拒绝、删除和按活动时间保留策略；PostgreSQL 留给多进程部署。当前 DeltaChannel 不做不安全的中间 checkpoint 压缩。
+- [x] 增加 interrupt/resume、业务化 Streaming、Trace、错误码与回答降级诊断。
+- [x] 完成 UI 的快速问答 / Agentic Research 模式选择、全库 / 指定论文范围和任务进度展示；范围不明确时以稳定回答契约进入会话。
+- [x] 增加多论文引用有效性、正例论文覆盖与 Evidence 平衡度 Evaluation，并提供本地并发硬上限。
+- [x] 删除生产 Service 中的手写循环入口；`ResearchRuntime` 只保留给框架无关的领域回归测试。
 
 LangGraph 在 Phase 2 领域契约稳定后、Phase 3 证据治理前引入。框架负责节点调度、状态持久化、恢复和流式执行；PaperBase 负责 Scope、Plan、Guard、Budget、Evidence 与 Coverage 等业务语义。两层必须保持可独立测试。
 
@@ -717,6 +717,19 @@ LangGraph 在 Phase 2 领域契约稳定后、Phase 3 证据治理前引入。�
 - 正式 Overview 缺失时 Tool 返回 `unavailable`，不能在读取路径隐式调用 LLM 生成。
 - Qualification、Coverage、Registry 和稳定 Evidence ID 在 checkpoint/resume 后保持一致。
 - Phase 3 专项测试和此前全部回归测试同时通过。
+
+### 17.5 Phase 4
+
+- 所有终态先经过 Agentic Answer 节点；澄清、无证据、生成失败和正常回答均返回非空稳定契约。
+- 最终回答只能引用 Final Evidence Selector 选出的 E#/R#，回答正文保留 Markdown 段落格式。
+- SQLite checkpoint 关闭并重新打开后仍能恢复；`execute_tool` 后恢复不能重复已完成 Tool。
+- Streaming 只暴露稳定业务事件，不向 UI 泄漏 Graph State、Prompt、数据库连接或模型对象。
+- 相同 thread ID 不能静默开启新任务，未知 thread 不能恢复，明确删除后不能再读取。
+- 回答生成异常时保留已选 Evidence，并在 `error_codes` 中提供可诊断错误类型。
+- Knowledge Base 的快速问答与 Agentic Research 共用会话历史，Agentic turn 保存 thread ID、回答状态和 Evidence 快照。
+- 多论文 Evaluation 必须检测伪造引用、正例论文漏覆盖和 Evidence 严重失衡。
+- 超过本地并发上限时立即返回明确忙碌错误，不创建半完成任务。
+- Phase 4 专项测试、真实 LLM Answer smoke test 和此前全部回归测试同时通过。
 
 ## 18. 仍可调但不阻塞实施的内容
 

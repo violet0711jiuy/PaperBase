@@ -80,6 +80,35 @@ def test_kb_scope_does_not_accept_default_or_workspace_conversation(tmp_path) ->
             raise AssertionError("cross-scope conversation must be rejected")
 
 
+def test_agentic_stream_persists_answer_thread_and_evidence(tmp_path) -> None:
+    fake = _FakeAgenticService()
+    service = PaperBaseService(
+        _temporary_settings(tmp_path),
+        agentic_service=fake,
+    )
+    conversation = service.create_kb_conversation()
+
+    events = list(
+        service.stream_knowledge_base_agentic(
+            "  比较 A 和 B  ",
+            conversation.conversation_id,
+            selected_paper_ids=("A", "B"),
+            knowledge_base_all=False,
+        )
+    )
+
+    assert [event.kind for event in events] == ["started", "completed"]
+    assert fake.calls == [("比较 A 和 B", ("A", "B"), False)]
+    turn = service.get_conversation_turns(conversation.conversation_id)[0]
+    assert turn.assistant_answer == "A 与 B 的方法不同 [E1]。"
+    evidence = service.get_conversation_turn_evidence(turn)
+    assert evidence[0].paper_title == "Paper A"
+    metadata = service.get_conversation_turn_metadata(turn)
+    assert metadata is not None
+    assert metadata.mode == "agentic"
+    assert metadata.thread_id == "research-test"
+
+
 class _FakeAnswerService:
     """模拟正式 QA 链路，只验证 Service 传递 query + conversation_id。"""
 
@@ -116,6 +145,58 @@ class _FakeAnswerService:
                 coverage_note=None,
             ),
             expansion=SimpleNamespace(evidence=(evidence,)),
+        )
+
+
+class _FakeAgenticService:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def stream_research(
+        self,
+        query,
+        *,
+        selected_paper_ids,
+        knowledge_base_all,
+        thread_id=None,
+    ):
+        self.calls.append((query, selected_paper_ids, knowledge_base_all))
+        yield SimpleNamespace(
+            kind="started",
+            message="研究任务已开始",
+            thread_id="research-test",
+            result=None,
+        )
+        source = SimpleNamespace(
+            source_type=SimpleNamespace(value="content"),
+            paper_id="A",
+            paper_title="Paper A",
+            section="方法",
+            page_start=2,
+            page_end=3,
+            content="Paper A 的方法证据。",
+        )
+        result = SimpleNamespace(
+            answer=SimpleNamespace(
+                status="success",
+                answer="A 与 B 的方法不同 [E1]。",
+                citations=("E1",),
+                insufficient_evidence=False,
+                partial_answer=False,
+                coverage_note=None,
+            ),
+            selected_evidence=(
+                SimpleNamespace(evidence_id="E1", evidence=source),
+            ),
+            query_context=SimpleNamespace(resolved_query=query),
+            thread_id="research-test",
+            error_codes=(),
+        )
+        yield SimpleNamespace(
+            kind="completed",
+            message="研究任务已完成",
+            thread_id="research-test",
+            result=result,
         )
 
 

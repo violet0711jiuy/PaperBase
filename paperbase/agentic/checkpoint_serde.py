@@ -14,11 +14,13 @@ from .contracts import (
     CorpusScopeSnapshot,
     CoverageState,
     EvidenceQualification,
+    EvidenceRecord,
     GuardState,
     QueryContext,
     RegistryState,
     ResearchObservation,
     ResearchPlan,
+    ResearchAnswer,
     ResearchRunResult,
     ScopeResolution,
 )
@@ -35,6 +37,7 @@ _ADAPTERS: dict[object, TypeAdapter[Any]] = {
     CorpusScopeSnapshot: TypeAdapter(CorpusScopeSnapshot),
     CoverageState: TypeAdapter(CoverageState),
     tuple[EvidenceQualification, ...]: TypeAdapter(tuple[EvidenceQualification, ...]),
+    tuple[EvidenceRecord, ...]: TypeAdapter(tuple[EvidenceRecord, ...]),
     QueryContext: TypeAdapter(QueryContext),
     ResearchPlan: TypeAdapter(ResearchPlan),
     AgentAction: TypeAdapter(AgentAction),
@@ -44,6 +47,7 @@ _ADAPTERS: dict[object, TypeAdapter[Any]] = {
     tuple[ResearchObservation, ...]: TypeAdapter(tuple[ResearchObservation, ...]),
     tuple[ActionTrace, ...]: TypeAdapter(tuple[ActionTrace, ...]),
     ResearchRunResult: TypeAdapter(ResearchRunResult),
+    ResearchAnswer: TypeAdapter(ResearchAnswer),
 }
 
 

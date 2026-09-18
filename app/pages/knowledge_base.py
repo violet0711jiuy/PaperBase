@@ -354,6 +354,29 @@ def _render_context_content(
         f"<div class='pb-context-stat'>已入库论文 · {len(papers)} 篇</div>",
         unsafe_allow_html=True,
     )
+    st.radio(
+        "问答模式",
+        ("快速问答", "Agentic Research"),
+        key="kb_research_mode",
+        horizontal=True,
+        help="快速问答执行一次检索；Agentic Research 会动态规划、分步检索并检查论文覆盖度。",
+    )
+    if st.session_state.get("kb_research_mode") == "Agentic Research":
+        st.checkbox("检索整个知识库", key="kb_scope_all")
+        if not st.session_state.get("kb_scope_all", True):
+            st.multiselect(
+                "指定论文",
+                options=[paper.paper_id for paper in papers],
+                format_func=lambda paper_id: next(
+                    (
+                        paper.display_title
+                        for paper in papers
+                        if paper.paper_id == paper_id
+                    ),
+                    paper_id,
+                ),
+                key="kb_selected_paper_ids",
+            )
     with st.container(key="kb-new-chat"):
         if st.button(
             "＋  新建会话",
@@ -436,10 +459,16 @@ def _render_chat_panel(
 ) -> None:
     """渲染第三栏主对话区和固定底部输入框。"""
     title = escape(conversation_title or "知识库对话")
+    mode = st.session_state.get("kb_research_mode", "快速问答")
+    mode_subtitle = (
+        "Agentic Research · 动态规划、逐篇检索与可恢复执行"
+        if mode == "Agentic Research"
+        else "Knowledge Base · 跨论文检索、比较并追问"
+    )
     st.markdown(
         "<div class='pb-chat-topline'><div><div class='pb-chat-title'>"
         f"{title}</div><div class='pb-chat-subtitle'>"
-        "Knowledge Base · 跨论文检索、比较并追问</div></div>"
+        f"{mode_subtitle}</div></div>"
         "<div class='pb-chat-status'>历史自动恢复</div></div>",
         unsafe_allow_html=True,
     )
@@ -476,8 +505,29 @@ def _render_chat_panel(
             )
     if submitted and query.strip() and conversation_id:
         try:
-            with st.spinner("正在检索论文并生成回答…"):
-                service.ask_knowledge_base(query, conversation_id)
+            if mode == "Agentic Research":
+                with st.status("研究任务正在启动…", expanded=True) as progress:
+                    completed = False
+                    for event in service.stream_knowledge_base_agentic(
+                        query,
+                        conversation_id,
+                        selected_paper_ids=tuple(
+                            st.session_state.get("kb_selected_paper_ids", [])
+                        ),
+                        knowledge_base_all=bool(
+                            st.session_state.get("kb_scope_all", True)
+                        ),
+                    ):
+                        progress.update(label=event.message)
+                        if event.kind == "completed":
+                            completed = True
+                    if completed:
+                        progress.update(label="研究任务已完成", state="complete")
+                    else:
+                        progress.update(label="研究任务已暂停", state="error")
+            else:
+                with st.spinner("正在检索论文并生成回答…"):
+                    service.ask_knowledge_base(query, conversation_id)
         except Exception as error:  # noqa: BLE001 - 页面不直接暴露 traceback。
             st.error(_friendly_error(error))
         else:

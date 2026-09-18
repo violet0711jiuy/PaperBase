@@ -18,6 +18,7 @@ from .contracts import (
     QueryScope,
     ResearchGoal,
     ResearchPlan,
+    ResearchAnswer,
     ResearchRunResult,
     ResearchRunStatus,
     ResearchSubtask,
@@ -34,6 +35,8 @@ from .contracts import (
 from .decision import LLMDecisionAgent, ScriptedDecisionAgent
 from .coverage import CoverageManager, CoveragePolicy
 from .evidence_registry import EvidenceRegistry
+from .evaluation import AgenticEvaluationReport, evaluate_research_result
+from .events import ResearchProgressEvent
 from .factory import AgenticResearchConfigurationError, create_agentic_research_service
 from .graph import (
     AgentGraphContext,
@@ -48,7 +51,7 @@ from .qualification import EvidenceQualificationManager
 from .runtime import ResearchRuntime
 from .scope_resolver import ScopeResolver, TrustedWorkspaceScope
 from .selector import FinalEvidenceSelector
-from .service import AgenticResearchService
+from .service import AgenticResearchBusyError, AgenticResearchService
 from .tools import ResearchToolExecutor
 
 __all__ = [
@@ -72,6 +75,7 @@ __all__ = [
     "QueryContext",
     "QueryScope",
     "ResearchGoal",
+    "ResearchAnswer",
     "ResearchPlan",
     "ResearchRunResult",
     "ResearchRunStatus",
@@ -86,6 +90,8 @@ __all__ = [
     "SearchReferencesAction",
     "StopReason",
     "AgenticResearchService",
+    "AgenticResearchBusyError",
+    "AgenticEvaluationReport",
     "AgenticResearchConfigurationError",
     "AgentGraphContext",
     "AgentGraphState",
@@ -102,4 +108,6 @@ __all__ = [
     "TrustedWorkspaceScope",
     "build_agentic_research_graph",
     "create_agentic_research_service",
+    "evaluate_research_result",
+    "ResearchProgressEvent",
 ]
