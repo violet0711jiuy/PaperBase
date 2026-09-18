@@ -2,7 +2,7 @@
 
 > 状态：`FROZEN FOR IMPLEMENTATION`  
 > 文档性质：目标架构与实现契约，不代表功能已经全部完成。  
-> 当前实施入口：Phase 1 — Retrieval Foundation。  
+> 当前实施状态：Phase 1、Phase 2、Phase 2.5 与 Phase 3 已完成；下一步进入 Phase 4 完整回答链路与产品化，尚未接入 UI。
 > 冻结原则：核心边界、数据契约和状态语义冻结；配额、阈值与排序权重保留为配置项。
 
 ## 1. 结论
@@ -559,32 +559,111 @@ Phase 1 明确不实现：Planner、Agent Loop、Coverage、Qualification、Fina
 
 ### Phase 2：Planning 与 Agent Loop
 
-- QueryContext 与 Scope Resolver。
-- Research Planner 与 Subtask。
-- Research Tools 封装。
-- Evidence Registry。
-- Agent Decision Loop、Guard 与预算。
-- 基础 Observation。
+- `[COMPLETED]` QueryContext 与 Scope Resolver。
+- `[COMPLETED]` Research Planner 与 Subtask；非法 LLM 计划确定性降级。
+- `[COMPLETED]` Research Tools 封装；Top-K 等底层上限只由运行时注入。
+- `[COMPLETED]` Evidence Registry；正文使用 `E#`，参考文献使用 `R#`，精确来源去重。
+- `[COMPLETED]` Agent Decision Loop、Scope Guard、重复动作保护与硬预算。
+- `[COMPLETED]` 基础 Observation、逐论文无新增证据抑制与可审计 Action Trace。
+- `[COMPLETED]` 动态多论文流程：允许先检索 A，再依据 Observation 为 B 生成不同 Query。
+
+Phase 2 当前保持以下边界：
+
+- 不做 Evidence Qualification、Coverage Manager 或 Final Evidence Selector。
+- 不生成最终回答，也不改变现有经典 RAG 的回答链路。
+- 正式 Overview Repository 仍属于 Phase 3；读取 Overview 不会隐式触发生成。
+- 不引入 LangGraph、多 Agent、Web 搜索或 UI 自动 Router。
+
+### Phase 2.5：最小 LangGraph 执行骨架
+
+> 实施状态：`COMPLETED`。默认 Graph 实现在 `paperbase/agentic/graph.py`，checkpoint DTO 转换在 `paperbase/agentic/checkpoint_serde.py`；生产装配入口为 `paperbase.agentic.create_agentic_research_service`，手写 `ResearchRuntime` 只保留为迁移期行为基准。
+
+LLM 生产边界已经收口：Query Understanding、Research Planner 与 Decision 使用同一个运行时 `OpenAICompatibleChatClient`；三类提示词分别位于 `paperbase/prompts/agentic_query_understanding.py`、`agentic_planner.py` 与 `agentic_decision.py`。外部响应先受 Provider JSON Schema 约束，再由 `paperbase/agentic/schemas.py` 的严格 Pydantic DTO 本地复验，最后执行可信论文范围、计划覆盖及已知 Section 引用等领域校验。Understanding/Planner 校验失败时确定性降级，Decision 校验失败时进入有界修复重试。
+
+Phase 2.5 在 Phase 3 之前引入 LangGraph，但只替换编排机制，不增加新的研究语义。目标是尽早验证状态模型、循环路由和持久化边界，避免 Phase 3 继续依赖手写循环后再进行大规模迁移。
+
+本阶段实现：
+
+1. 增加 LangGraph 运行依赖，并在安装时使用明确的兼容版本范围。
+2. 定义可序列化的 `AgentState`，至少包含：
+   - Scope Resolution 与可选 Corpus Snapshot；
+   - `QueryContext` 与 `ResearchPlan`；
+   - 下一步 `AgentAction` 与最近一次 `ToolResult`；
+   - Evidence Registry 快照、Observation 与 Action Trace；
+   - Budget Usage、逐论文 Query 计数和无新增证据抑制状态；
+   - 最终运行状态、停止原因、澄清信息与错误摘要。
+3. 将现有业务组件映射为节点：
+   - `resolve_scope`；
+   - `understand_query`；
+   - `build_plan`；
+   - `decide_action`；
+   - `validate_action`；
+   - `execute_tool`；
+   - `register_and_observe`；
+   - `finish_run`。
+4. 使用 conditional edges 表达以下跳转：
+   - Scope 未解析时进入 `needs_clarification`；
+   - `FinishAction` 直接结束；
+   - 非法动作返回 Decision，超过上限后结束；
+   - Tool 执行后经 Registry 与 Observation 返回 Decision；
+   - 预算耗尽、所有目标均被抑制或出现致命错误时结束。
+5. 使用 LangGraph Runtime Context 注入数据库、LLM Client、RetrievalService、Research Tools 和配置；这些运行依赖不得写入可持久化 State。
+6. 开发与测试阶段只使用内存 Checkpointer，验证 State 可以 checkpoint / resume；正式持久化后端留到 Phase 4。
+7. 保留当前 `ResearchRuntime` 作为迁移期行为基准。完成等价性测试后，它只作为测试参考，不再作为默认生产入口。
+8. `AgenticResearchService` 切换为调用编译后的 Graph；现有 Scope、Planner、Guard、Budget、Registry 和 Tool 仍保持框架无关。
+
+实现约束：
+
+- 当前 `EvidenceRegistry` 与 `BudgetAndGuardTracker` 是进程内可变对象，接入前必须拆出可序列化的 `RegistryState`、`BudgetState` 与 `GuardState`。Graph 节点只返回状态增量，不能把这些服务实例直接写入 State。
+- Evidence 编号计数、已执行 Action Fingerprints、逐论文 Query 计数、无新增证据计数和被抑制论文集合都必须进入 checkpoint；否则恢复后可能重复查询或重新分配 `E#` / `R#`。
+- 持久化 State 使用稳定 DTO 或 JSON-compatible projection；数据库 Row、模型响应对象、数据库连接、Retriever、LLM Client 和锁不得进入 State。
+- Tool 节点必须携带稳定的 action fingerprint / invocation key。当前检索 Tool 均为只读操作，允许在崩溃边界安全重试，但 Registry 登记必须保持幂等。
+- Node 不直接决定业务阈值；预算与停止判定继续调用 PaperBase Guard，conditional edge 只消费 Guard 的类型化结果。
+- 不依赖 LangGraph 默认消息历史表示研究状态；论文 Scope、Evidence、Coverage 与 Budget 必须使用独立字段。
+
+Phase 2.5 明确不实现：
+
+- Evidence Qualification、Coverage Manager 与 Candidate Verification；
+- Formal Overview Repository 与 Final Evidence Selector；
+- Grounded Answer 节点；
+- 正式数据库 Checkpointer、跨进程恢复与部署服务；
+- UI Streaming、人工中断审批和多 Agent。
+
+Phase 2.5 的退出条件：
+
+- 手写循环与 LangGraph 对同一脚本化 Decision 序列产生相同的 Evidence IDs、停止状态和预算计数。
+- “先查 A，再根据 Observation 使用不同 Query 查 B”的行为保持不变。
+- 非法 Scope、重复动作和预算耗尽都在 Tool 调用前被阻止。
+- A 的无新增证据抑制不阻塞 B；异构 Batch 仍逐论文统计。
+- Graph State 不保存数据库连接、模型实例或其他不可序列化运行依赖。
+- Checkpoint 后恢复不会重复执行已经登记成功的 Tool 动作或重新分配 Evidence ID。
+- LangGraph 相关测试和当前全部回归测试同时通过。
 
 ### Phase 3：Overview 与证据治理
 
-- Formal Overview Repository。
-- Evidence Qualification。
-- Coverage Manager。
-- Exhaustive / Candidate Verification 策略。
-- Final Evidence Selector。
+- [x] Formal Overview Repository：按 `storage/paper_overviews/<paper_id>/` 保存，显式生成、只读 Tool 不隐式生成。
+- [x] Evidence Qualification：Decision 同轮输出受控的 relation / ownership 标注，只允许引用已登记 Evidence。
+- [x] Coverage Manager：从 Scope、Observation 与 Qualification 重算 `PaperAssessment` 和 `CoverageState`。
+- [x] Exhaustive / Candidate Verification 策略：穷举默认要求直接查询与替代表达；全库发现查询不计作候选论文验证。
+- [x] Final Evidence Selector：过滤 background-only，优先本文直接证据，并保证多篇 positive 论文至少各有一条核心证据。
+- [x] 接入 Phase 2.5 Graph：Coverage 进入 Decision State 与 checkpoint，`finish` 受 Coverage Gate 约束，终态输出 selected evidence。
 
-### Phase 4：工作流集成与产品化
+Phase 3 的各项能力继续实现为框架无关的领域组件，再作为明确的治理或收尾步骤接入 Phase 2.5 建立的 Graph；不得把 Qualification、Coverage 或 Selector 逻辑直接写死在路由表达式中。
 
-- 将状态机接入 LangGraph 或等价编排层。
-- Agentic Answer 流程与现有生成器集成。
-- Trace、可观测性与失败诊断。
-- UI 模式选择与任务进度展示。
-- 多论文 Evaluation 与性能优化。
+### Phase 4：LangGraph 产品化与完整链路集成
 
-LangGraph 放在核心状态与契约稳定之后引入，避免把业务语义绑定到框架细节。
+- 在 Phase 3 已闭环的研究 Graph 后接入 Agentic Answer 节点，并与现有 Grounded Answer Generator 集成。
+- 接入正式 SQLite 或 PostgreSQL Checkpointer，定义 thread/run 身份、恢复、幂等和数据保留策略。
+- 增加 interrupt/resume、Streaming、Trace、可观测性与失败诊断。
+- 完成 UI 模式选择、任务进度展示与需要澄清时的交互。
+- 完成多论文 Evaluation、并发控制与性能优化。
+- 删除生产路径中的手写循环；只保留仍有价值的纯领域单元测试替身。
 
-## 17. Phase 1 必须通过的测试
+LangGraph 在 Phase 2 领域契约稳定后、Phase 3 证据治理前引入。框架负责节点调度、状态持久化、恢复和流式执行；PaperBase 负责 Scope、Plan、Guard、Budget、Evidence 与 Coverage 等业务语义。两层必须保持可独立测试。
+
+## 17. 必须通过的测试
+
+### 17.1 Phase 1
 
 - Agent 提供 Query 时不调用 Query Rewriter。
 - 指定论文范围时不返回范围外 Chunk。
@@ -599,6 +678,45 @@ LangGraph 放在核心状态与契约稳定之后引入，避免把业务语义�
 - 每条 `RetrievedEvidence` 包含 `paper_id`、Seed / Source Chunk IDs 和 `section_id`。
 - Tool 层不提前分配 `E#` / `R#`。
 - 现有经典 RAG 回归测试全部继续通过。
+
+### 17.2 Phase 2
+
+- Workspace Scope 不依赖论文已存在于正式知识库。
+- UI 选择与显式 `paper_id` 必须通过数据库验证；同名论文返回歧义状态。
+- 知识库级任务在运行开始时冻结 Corpus Snapshot。
+- Query Understanding 或 Planner 的结构化输出无效时必须确定性降级，且不能改变可信 Scope。
+- 比较任务的默认计划必须逐论文覆盖 A、B，并允许两次检索使用不同 Query。
+- Agent 不能传入 Top-K；未知论文、未知 Subtask、重复动作在 Tool 执行前拒绝。
+- Evidence Registry 对相同来源精确去重，并保留所有 supporting queries。
+- Batch 的无新增证据计数必须逐论文计算；A 被抑制不能阻塞 B。
+- Tool 后端失败必须返回类型化错误或逐论文错误，不能让循环无界等待。
+- 迭代、LLM、Tool、检索总量和逐论文 Query 均受硬预算限制。
+- Phase 1 与经典 RAG 的全部回归测试继续通过。
+
+### 17.3 Phase 2.5
+
+- Graph 与手写循环对同一动作序列产生相同 Evidence IDs、Trace、停止状态和预算计数。
+- Checkpoint State 只能包含 JSON-compatible DTO，不依赖未注册 Python 类型反序列化。
+- 使用严格 MsgPack 模式运行 checkpoint/resume 测试，不能出现类型白名单警告。
+- 在 `execute_tool` 后中断并用新 Graph 实例恢复时，不重复执行已完成 Tool。
+- Evidence 编号、Action Fingerprints、逐论文预算和抑制状态在恢复后保持不变。
+- 动态 A→B Query、非法 Scope、重复动作、预算耗尽与异构 Batch 行为保持不变。
+- 已存在的 thread ID 只能恢复，不能静默启动第二个任务；未知 thread ID 不能恢复。
+- Graph State 不包含数据库、LLM、Retriever、Tool Executor 或其他运行依赖。
+- LangGraph 专项测试和此前全部回归测试同时通过。
+
+### 17.4 Phase 3
+
+- Qualification 只能引用 Registry 中已有的 Evidence ID，未知或重复引用必须拒绝。
+- Related Work、一般背景和本文工作使用独立 relation / ownership 语义，不能混为直接证据。
+- Candidate Verification 必须执行论文级验证；全库 Discovery Query 不计作候选论文验证。
+- Exhaustive 策略默认要求每篇论文至少完成直接 Query 与替代表达 Query。
+- `no_support_found` 的理由必须限定为当前策略下未找到，不能表达为事实不存在。
+- Agent 在 Coverage 未完成时请求 `finish` 必须被拒绝，且不能绕过预算与非法动作计数。
+- Final Evidence Selector 必须过滤 background-only，并在容量允许时覆盖每篇 positive 论文。
+- 正式 Overview 缺失时 Tool 返回 `unavailable`，不能在读取路径隐式调用 LLM 生成。
+- Qualification、Coverage、Registry 和稳定 Evidence ID 在 checkpoint/resume 后保持一致。
+- Phase 3 专项测试和此前全部回归测试同时通过。
 
 ## 18. 仍可调但不阻塞实施的内容
 

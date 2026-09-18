@@ -31,9 +31,27 @@ Copy-Item config.example.yaml config.yaml
 | `reranking` | BGE Cross-Encoder、候选深度和 Final Top-K。 |
 | `context_expansion` | Final anchors 的同节相邻块扩展和 token 预算。 |
 | `answer_generation` | Evidence 数量、相关性阈值和回答输出预算。 |
-| `paper_overview` | 临时论文 Overview 的字段候选与上下文预算。 |
+| `paper_overview` | Workspace 与正式论文 Overview 共用的字段候选与上下文预算。 |
 | `explain_section` | Explain Section 的分支覆盖和上下文预算。 |
+| `agentic_research` | 单 Agent 循环的预算、逐论文 Query、Coverage 策略与最终 Evidence 上限。 |
 | `retrieval` | 三路正文召回、RRF 权重、Query Planner 和 Bibliography 配额。 |
+
+`agentic_research.enabled: true` 只表示功能允许启用；后端需要通过
+`paperbase.agentic.create_agentic_research_service(...)` 装配 LangGraph、Research Tools
+和真实 LLM。该入口从配置文件同目录的 `.env` 读取 `LLM_*`，并让 Understanding、
+Planner、Decision 共享同一个客户端。结构化输出仍会在本地执行严格 Schema 和领域校验，
+不能把 Provider 的 `json_schema` 声明视为可信输入。
+
+Phase 3 新增的 Coverage 与 Selector 配置包括：
+
+- `coverage_candidate_min_queries_per_paper`：候选论文完成验证前的最少论文级查询数；
+- `coverage_exhaustive_min_queries_per_paper`：穷举任务每篇论文的最少查询数，默认覆盖直接查询和替代表达；
+- `final_evidence_max_units`：最终 Evidence 总上限；
+- `final_evidence_max_per_paper`：单篇论文进入最终 Evidence 的上限。
+
+正式 Overview 独立保存在 `storage/paper_overviews/<paper_id>/overview.json` 与
+`context.json`。生成必须显式调用 `FormalOverviewRepository.generate(...)`；Agent 的
+`get_paper_overview` Tool 只读取已有产物，缺失时返回 `unavailable`。
 
 ## 当前 Retrieval 参数语义
 

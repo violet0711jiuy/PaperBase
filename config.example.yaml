@@ -193,6 +193,25 @@ explain_section:
   max_key_points: 5
   max_output_tokens: 2500
 
+# Phase 2：单 Agent 研究循环。所有数字都是服务端硬上限，不暴露为 Agent Tool 参数。
+agentic_research:
+  enabled: true
+  max_agent_iterations: 8
+  max_tool_calls: 8
+  max_retrieval_queries: 16
+  max_queries_per_paper: 4
+  max_llm_calls: 12
+  max_invalid_actions: 2
+  max_no_new_evidence_per_paper: 2
+  top_k_per_paper: 5
+  # 候选验证策略中，一篇候选论文进入终态前至少执行的论文级查询数。
+  coverage_candidate_min_queries_per_paper: 1
+  # 穷举策略中，每篇论文至少执行“直接查询 + 替代表达”两次查询。
+  coverage_exhaustive_min_queries_per_paper: 2
+  # 最终送入答案阶段的 Evidence 总数和单篇论文上限。
+  final_evidence_max_units: 8
+  final_evidence_max_per_paper: 4
+
 # Step 6：Query Planning、Dense 和 FTS5/BM25 混合检索配置。
 retrieval:
   # 检索器后端标识。

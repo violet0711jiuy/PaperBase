@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Iterable
+from typing import Iterable, TypeAlias
 
 
 class QueryOrigin(str, Enum):
@@ -42,6 +42,10 @@ class PaperSearchStatus(str, Enum):
 
 class ToolName(str, Enum):
     SEARCH_PAPERS = "search_papers"
+    SEARCH_KNOWLEDGE_BASE = "search_knowledge_base"
+    SEARCH_REFERENCES = "search_references"
+    GET_SECTION_CONTEXT = "get_section_context"
+    GET_PAPER_OVERVIEW = "get_paper_overview"
 
 
 class EvidenceSourceType(str, Enum):
@@ -193,10 +197,49 @@ class SearchPapersPayload:
 
 
 @dataclass(frozen=True)
+class KnowledgeBaseSearchPayload:
+    query: str
+    evidence_candidates: tuple[RetrievedEvidence, ...] = ()
+    kind: str = field(default="search_knowledge_base", init=False)
+
+
+@dataclass(frozen=True)
+class ReferenceSearchPayload:
+    paper_id: str
+    query: str
+    evidence_candidates: tuple[RetrievedEvidence, ...] = ()
+    kind: str = field(default="search_references", init=False)
+
+
+@dataclass(frozen=True)
+class SectionContextPayload:
+    paper_id: str
+    section_id: str
+    evidence_candidates: tuple[RetrievedEvidence, ...] = ()
+    kind: str = field(default="get_section_context", init=False)
+
+
+@dataclass(frozen=True)
+class PaperOverviewPayload:
+    paper_id: str
+    evidence_candidates: tuple[RetrievedEvidence, ...] = ()
+    kind: str = field(default="get_paper_overview", init=False)
+
+
+ToolPayload: TypeAlias = (
+    SearchPapersPayload
+    | KnowledgeBaseSearchPayload
+    | ReferenceSearchPayload
+    | SectionContextPayload
+    | PaperOverviewPayload
+)
+
+
+@dataclass(frozen=True)
 class ToolResult:
     status: ToolStatus
     tool_name: ToolName
-    payload: SearchPapersPayload
+    payload: ToolPayload
     metadata: dict[str, object] = field(default_factory=dict)
     error_code: str | None = None
 

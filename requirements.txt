@@ -15,6 +15,8 @@ faiss-cpu>=1.15,<2.0
 # Step 6 使用 ModelScope 的 OpenAI 兼容接口，并从本机未提交的 .env 加载密钥。
 openai>=2.0,<3.0
 python-dotenv>=1.0,<2.0
+# Phase 2.5 使用 StateGraph、Runtime Context 与 Checkpointer 执行可恢复的 Agentic workflow。
+langgraph>=1.2,<2.0
 # Streamlit frontend (Frontend Step 1/2：骨架、Knowledge Base Chat 与 Evidence UI）。
 streamlit>=1.61,<2.0
 # Test runner for the repository test suite.

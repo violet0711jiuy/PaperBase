@@ -182,6 +182,19 @@ def create_paper_overview(
     context = build_overview_context(workspace_root=workspace_root, settings=settings)
     if not context.chunks:
         raise PaperOverviewError("Temporary workspace has no usable non-bibliography chunks.")
+    overview = generate_paper_overview(
+        context=context,
+        client=client,
+    )
+    return _write_overview_artifacts(
+        workspace_root=workspace_root, overview=overview, context=context
+    )
+
+
+def generate_paper_overview(
+    *, context: OverviewContext, client: ChatCompletionClient
+) -> PaperOverview:
+    """从已构造的可信 Context 生成 Overview，不隐式执行任何持久化。"""
     try:
         raw_response = client.complete_json(
             system_prompt=PAPER_OVERVIEW_SYSTEM_PROMPT,
@@ -197,9 +210,7 @@ def create_paper_overview(
         )
     except (LLMRequestError, ValidationError, ValueError, TypeError) as error:
         raise PaperOverviewError("Paper Overview generation returned an invalid result.") from error
-    return _write_overview_artifacts(
-        workspace_root=workspace_root, overview=overview, context=context
-    )
+    return overview
 
 
 def build_overview_context(
@@ -209,6 +220,20 @@ def build_overview_context(
     root = workspace_root.resolve()
     parsed_record = _load_json_object(root / "parsed" / "parsed_paper.json")
     raw_chunks = _load_chunk_records(root / "chunks" / "chunks.jsonl")
+    return build_overview_context_from_records(
+        paper_title=_optional_string(parsed_record.get("paper_title")),
+        raw_chunks=raw_chunks,
+        settings=settings,
+    )
+
+
+def build_overview_context_from_records(
+    *,
+    paper_title: str | None,
+    raw_chunks: Iterable[dict[str, Any]],
+    settings: PaperOverviewSettings,
+) -> OverviewContext:
+    """从正式库或 Workspace 提供的 chunk 记录构造同一套 Overview Context。"""
     candidates = [
         record
         for record in raw_chunks
@@ -216,7 +241,7 @@ def build_overview_context(
     ]
     if not candidates:
         return OverviewContext(
-            paper_title=_optional_string(parsed_record.get("paper_title")),
+            paper_title=paper_title,
             chunks=(),
             selection_debug={
                 "role_candidates": {role: [] for role in _OVERVIEW_ROLES},
@@ -258,7 +283,7 @@ def build_overview_context(
     }
 
     return OverviewContext(
-        paper_title=_optional_string(parsed_record.get("paper_title")),
+        paper_title=paper_title,
         chunks=tuple(selected),
         selection_debug=debug,
     )

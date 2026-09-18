@@ -322,6 +322,26 @@ class ExplainSectionSettings(BaseModel):
         return self
 
 
+class AgenticResearchSettings(BaseModel):
+    """Agentic Research 的硬预算、Coverage 与 Evidence Selector 配置。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    max_agent_iterations: int = Field(default=8, ge=1, le=50)
+    max_tool_calls: int = Field(default=8, ge=1, le=50)
+    max_retrieval_queries: int = Field(default=16, ge=1, le=100)
+    max_queries_per_paper: int = Field(default=4, ge=1, le=20)
+    max_llm_calls: int = Field(default=12, ge=1, le=100)
+    max_invalid_actions: int = Field(default=2, ge=0, le=10)
+    max_no_new_evidence_per_paper: int = Field(default=2, ge=1, le=10)
+    top_k_per_paper: int = Field(default=5, ge=1, le=30)
+    coverage_candidate_min_queries_per_paper: int = Field(default=1, ge=1, le=10)
+    coverage_exhaustive_min_queries_per_paper: int = Field(default=2, ge=1, le=10)
+    final_evidence_max_units: int = Field(default=8, ge=1, le=50)
+    final_evidence_max_per_paper: int = Field(default=4, ge=1, le=20)
+
+
 class AppSettings(BaseModel):
     """PaperBase 当前阶段的完整、解析器无关配置根对象。"""
 
@@ -348,6 +368,9 @@ class AppSettings(BaseModel):
     )
     explain_section: ExplainSectionSettings = Field(
         default_factory=ExplainSectionSettings
+    )
+    agentic_research: AgenticResearchSettings = Field(
+        default_factory=AgenticResearchSettings
     )
 
     # 配置文件路径不是用户在 YAML 中填写的业务参数，因此作为 Pydantic 私有属性保存。

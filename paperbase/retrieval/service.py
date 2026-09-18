@@ -11,20 +11,26 @@ from paperbase.config import default_config_path, load_settings
 from paperbase.database import MetadataDatabase
 from paperbase.embedding import QueryEmbedder, create_document_embedder
 from paperbase.indexing import FaissIndexStore
+from paperbase.llm.client import ChatCompletionClient
 from paperbase.reranking import create_reranker
 
 from .hybrid_retriever import HybridRetriever, RetrievedChunk
 from .query_rewriter import create_query_planner
 
 
-def create_hybrid_retriever(*, config_path: Path | str | None = None) -> HybridRetriever:
+def create_hybrid_retriever(
+    *,
+    config_path: Path | str | None = None,
+    database: MetadataDatabase | None = None,
+    llm_client: ChatCompletionClient | None = None,
+) -> HybridRetriever:
     """构造正式在线检索器。
 
     该函数是后续 Web/API 层唯一需要调用的装配点：它从 SQLite 读取 chunk 映射，
     从正式 FAISS 文件读取向量索引，从项目根目录 ``.env`` 读取 LLM 凭证。
     """
     settings = load_settings(config_path)
-    database = MetadataDatabase(settings.database.path)
+    database = database or MetadataDatabase(settings.database.path)
     database.initialize()
     embedder = create_document_embedder(settings.embedding)
     if not isinstance(embedder, QueryEmbedder):
@@ -36,6 +42,7 @@ def create_hybrid_retriever(*, config_path: Path | str | None = None) -> HybridR
     rewriter = create_query_planner(
         settings=settings.retrieval.query_rewrite,
         env_path=settings.config_path.parent / ".env",
+        client=llm_client,
     )
     reranker = (
         create_reranker(settings.reranking) if settings.reranking.enabled else None

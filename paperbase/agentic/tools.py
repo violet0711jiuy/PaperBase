@@ -1,0 +1,370 @@
+"""Phase 2 Research Tools：参数由 Agent 给出，上限与 Scope 由运行时控制。"""
+
+from __future__ import annotations
+
+from typing import Mapping, Protocol, Sequence
+
+from paperbase.database import MetadataDatabase
+from paperbase.retrieval.contracts import (
+    EvidenceSourceType,
+    KnowledgeBaseSearchPayload,
+    PaperOverviewPayload,
+    PaperSearchSpec,
+    QueryOrigin,
+    ReferenceSearchPayload,
+    RetrievalSource,
+    RetrievedEvidence,
+    SearchPapersRequest,
+    SectionContextPayload,
+    ToolName,
+    ToolResult,
+    ToolStatus,
+)
+from paperbase.retrieval.facade import RetrievalService
+from paperbase.retrieval.hybrid_retriever import RetrievalResult
+from paperbase.retrieval.lexical_terms import extract_lexical_terms, normalize_lexical_terms
+from paperbase.overview.repository import FormalOverviewRepository
+
+from .contracts import (
+    AgentAction,
+    CorpusScopeSnapshot,
+    GetPaperOverviewAction,
+    GetSectionContextAction,
+    QueryContext,
+    QueryScope,
+    ScopeSource,
+    SearchKnowledgeBaseAction,
+    SearchPapersAction,
+    SearchReferencesAction,
+)
+
+
+class GlobalRetriever(Protocol):
+    def retrieve(
+        self,
+        query: str,
+        *,
+        paper_ids: Sequence[str] | None = None,
+        result_limit: int | None = None,
+        query_origin: QueryOrigin = QueryOrigin.INITIAL_UNDERSTANDING,
+        lexical_terms: Sequence[str] = (),
+    ) -> RetrievalResult: ...
+
+
+class ResearchToolExecutor:
+    def __init__(
+        self,
+        *,
+        retrieval_service: RetrievalService,
+        database: MetadataDatabase,
+        global_retriever: GlobalRetriever | None = None,
+        top_k_per_paper: int = 5,
+        workspace_ids_by_paper: Mapping[str, str] | None = None,
+        formal_overview_repository: FormalOverviewRepository | None = None,
+    ) -> None:
+        if top_k_per_paper < 1:
+            raise ValueError("top_k_per_paper must be positive.")
+        self._retrieval_service = retrieval_service
+        self._database = database
+        self._global_retriever = global_retriever
+        self._top_k = top_k_per_paper
+        self._workspace_ids = dict(workspace_ids_by_paper or {})
+        self._formal_overviews = formal_overview_repository
+
+    def execute(
+        self,
+        action: AgentAction,
+        *,
+        context: QueryContext,
+        corpus_snapshot: CorpusScopeSnapshot | None = None,
+    ) -> ToolResult:
+        if isinstance(action, SearchPapersAction):
+            self._validate_paper_ids(
+                tuple(search.paper_id for search in action.searches), context, corpus_snapshot
+            )
+            source = (
+                RetrievalSource.WORKSPACE
+                if context.scope_source is ScopeSource.TRUSTED_WORKSPACE
+                else RetrievalSource.FORMAL_KNOWLEDGE_BASE
+            )
+            return self._retrieval_service.search_papers(
+                SearchPapersRequest(
+                    query_origin=QueryOrigin.AGENT_SUPPLIED,
+                    searches=action.searches,
+                    top_k_per_paper=self._top_k,
+                ),
+                source=source,
+                workspace_ids_by_paper=self._workspace_ids,
+            )
+        if isinstance(action, SearchKnowledgeBaseAction):
+            return self._search_knowledge_base(action, context, corpus_snapshot)
+        if isinstance(action, SearchReferencesAction):
+            self._validate_paper_ids((action.paper_id,), context, corpus_snapshot)
+            try:
+                return self._search_references(action)
+            except Exception as error:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool_name=ToolName.SEARCH_REFERENCES,
+                    payload=ReferenceSearchPayload(action.paper_id, action.query),
+                    error_code=type(error).__name__,
+                )
+        if isinstance(action, GetSectionContextAction):
+            self._validate_paper_ids((action.paper_id,), context, corpus_snapshot)
+            try:
+                return self._get_section_context(action)
+            except Exception as error:
+                return ToolResult(
+                    status=ToolStatus.ERROR,
+                    tool_name=ToolName.GET_SECTION_CONTEXT,
+                    payload=SectionContextPayload(action.paper_id, action.section_id),
+                    error_code=type(error).__name__,
+                )
+        if isinstance(action, GetPaperOverviewAction):
+            self._validate_paper_ids((action.paper_id,), context, corpus_snapshot)
+            return self._get_paper_overview(action, context)
+        raise TypeError(f"Unsupported executable action: {type(action).__name__}")
+
+    def _get_paper_overview(
+        self, action: GetPaperOverviewAction, context: QueryContext
+    ) -> ToolResult:
+        if context.scope_source is ScopeSource.TRUSTED_WORKSPACE:
+            return ToolResult(
+                status=ToolStatus.UNAVAILABLE,
+                tool_name=ToolName.GET_PAPER_OVERVIEW,
+                payload=PaperOverviewPayload(action.paper_id),
+                error_code="FormalOverviewNotAvailableForWorkspace",
+            )
+        if self._formal_overviews is None:
+            return ToolResult(
+                status=ToolStatus.UNAVAILABLE,
+                tool_name=ToolName.GET_PAPER_OVERVIEW,
+                payload=PaperOverviewPayload(action.paper_id),
+                error_code="FormalOverviewRepositoryUnavailable",
+            )
+        try:
+            artifact = self._formal_overviews.get(action.paper_id)
+            if artifact is None:
+                return ToolResult(
+                    status=ToolStatus.UNAVAILABLE,
+                    tool_name=ToolName.GET_PAPER_OVERVIEW,
+                    payload=PaperOverviewPayload(action.paper_id),
+                    error_code="FormalOverviewUnavailable",
+                )
+            evidence = _overview_to_evidence(action.paper_id, artifact.overview)
+            return ToolResult(
+                status=ToolStatus.OK if evidence else ToolStatus.EMPTY,
+                tool_name=ToolName.GET_PAPER_OVERVIEW,
+                payload=PaperOverviewPayload(action.paper_id, evidence),
+                metadata={
+                    "overview_path": str(artifact.overview_path),
+                    "context_path": str(artifact.context_path),
+                },
+            )
+        except Exception as error:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool_name=ToolName.GET_PAPER_OVERVIEW,
+                payload=PaperOverviewPayload(action.paper_id),
+                error_code=type(error).__name__,
+            )
+
+    def _search_knowledge_base(
+        self,
+        action: SearchKnowledgeBaseAction,
+        context: QueryContext,
+        snapshot: CorpusScopeSnapshot | None,
+    ) -> ToolResult:
+        if context.scope is not QueryScope.KNOWLEDGE_BASE or snapshot is None:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool_name=ToolName.SEARCH_KNOWLEDGE_BASE,
+                payload=KnowledgeBaseSearchPayload(query=action.query),
+                error_code="KnowledgeBaseScopeRequired",
+            )
+        if self._global_retriever is None:
+            return ToolResult(
+                status=ToolStatus.UNAVAILABLE,
+                tool_name=ToolName.SEARCH_KNOWLEDGE_BASE,
+                payload=KnowledgeBaseSearchPayload(query=action.query),
+                error_code="GlobalRetrieverUnavailable",
+            )
+        try:
+            result = self._global_retriever.retrieve(
+                action.query,
+                paper_ids=snapshot.paper_ids,
+                result_limit=self._top_k,
+                query_origin=QueryOrigin.AGENT_SUPPLIED,
+                lexical_terms=action.lexical_terms,
+            )
+            evidence = tuple(_retrieved_chunk_to_evidence(chunk) for chunk in result.chunks)
+            return ToolResult(
+                status=ToolStatus.OK if evidence else ToolStatus.EMPTY,
+                tool_name=ToolName.SEARCH_KNOWLEDGE_BASE,
+                payload=KnowledgeBaseSearchPayload(
+                    query=action.query, evidence_candidates=evidence
+                ),
+                metadata={"corpus_snapshot_id": snapshot.snapshot_id},
+            )
+        except Exception as error:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                tool_name=ToolName.SEARCH_KNOWLEDGE_BASE,
+                payload=KnowledgeBaseSearchPayload(query=action.query),
+                error_code=type(error).__name__,
+            )
+
+    def _search_references(self, action: SearchReferencesAction) -> ToolResult:
+        if self._database.get_document(action.paper_id) is None:
+            return ToolResult(
+                status=ToolStatus.UNAVAILABLE,
+                tool_name=ToolName.SEARCH_REFERENCES,
+                payload=ReferenceSearchPayload(action.paper_id, action.query),
+                error_code="UnknownPaper",
+            )
+        terms = normalize_lexical_terms(action.lexical_terms)
+        if not terms:
+            terms = extract_lexical_terms(action.query)
+        rows = (
+            self._database.search_bibliography_keyword_group(
+                terms, paper_id=action.paper_id, top_k=self._top_k
+            )
+            if terms
+            else ()
+        )
+        evidence = tuple(_row_to_evidence(row, EvidenceSourceType.BIBLIOGRAPHY) for row in rows)
+        return ToolResult(
+            status=ToolStatus.OK if evidence else ToolStatus.EMPTY,
+            tool_name=ToolName.SEARCH_REFERENCES,
+            payload=ReferenceSearchPayload(
+                paper_id=action.paper_id,
+                query=action.query,
+                evidence_candidates=evidence,
+            ),
+            metadata={"lexical_terms": terms},
+        )
+
+    def _get_section_context(self, action: GetSectionContextAction) -> ToolResult:
+        section = self._database.get_section(action.section_id)
+        if section is None or str(section["paper_id"]) != action.paper_id:
+            return ToolResult(
+                status=ToolStatus.UNAVAILABLE,
+                tool_name=ToolName.GET_SECTION_CONTEXT,
+                payload=SectionContextPayload(action.paper_id, action.section_id),
+                error_code="UnknownSection",
+            )
+        rows = self._database.list_content_chunks_in_section_id(
+            paper_id=action.paper_id, section_id=action.section_id
+        )
+        evidence: tuple[RetrievedEvidence, ...] = ()
+        if rows:
+            evidence = (
+                RetrievedEvidence(
+                    source_type=EvidenceSourceType.SECTION_CONTEXT,
+                    paper_id=action.paper_id,
+                    paper_title=str(rows[0]["paper_title"]),
+                    seed_chunk_ids=tuple(str(row["chunk_id"]) for row in rows),
+                    source_chunk_ids=tuple(str(row["chunk_id"]) for row in rows),
+                    section_id=action.section_id,
+                    section=str(section["section_title"]),
+                    page_start=min(
+                        (int(row["page_start"]) for row in rows if row["page_start"] is not None),
+                        default=None,
+                    ),
+                    page_end=max(
+                        (int(row["page_end"]) for row in rows if row["page_end"] is not None),
+                        default=None,
+                    ),
+                    content="\n\n".join(str(row["raw_text"]) for row in rows),
+                    retrieval_metadata={"chunk_count": len(rows)},
+                ),
+            )
+        return ToolResult(
+            status=ToolStatus.OK if evidence else ToolStatus.EMPTY,
+            tool_name=ToolName.GET_SECTION_CONTEXT,
+            payload=SectionContextPayload(
+                paper_id=action.paper_id,
+                section_id=action.section_id,
+                evidence_candidates=evidence,
+            ),
+        )
+
+    @staticmethod
+    def _validate_paper_ids(
+        paper_ids: tuple[str, ...],
+        context: QueryContext,
+        snapshot: CorpusScopeSnapshot | None,
+    ) -> None:
+        allowed = (
+            set(snapshot.paper_ids)
+            if context.scope is QueryScope.KNOWLEDGE_BASE and snapshot is not None
+            else set(context.target_paper_ids)
+        )
+        invalid = tuple(paper_id for paper_id in paper_ids if paper_id not in allowed)
+        if invalid:
+            raise ValueError("Action targets paper IDs outside the trusted scope: " + ", ".join(invalid))
+
+
+def _row_to_evidence(row: object, source_type: EvidenceSourceType) -> RetrievedEvidence:
+    return RetrievedEvidence(
+        source_type=source_type,
+        paper_id=str(row["paper_id"]),  # type: ignore[index]
+        paper_title=str(row["paper_title"]),  # type: ignore[index]
+        seed_chunk_ids=(str(row["chunk_id"]),),  # type: ignore[index]
+        source_chunk_ids=(str(row["chunk_id"]),),  # type: ignore[index]
+        section_id=row["section_id"],  # type: ignore[index]
+        section=str(row["section"]),  # type: ignore[index]
+        page_start=row["page_start"],  # type: ignore[index]
+        page_end=row["page_end"],  # type: ignore[index]
+        content=str(row["raw_text"]),  # type: ignore[index]
+        score=float(row["bm25_score"]),  # type: ignore[index]
+        retrieval_metadata={"route": "bibliography_fts"},
+    )
+
+
+def _overview_to_evidence(paper_id: str, overview: object) -> tuple[RetrievedEvidence, ...]:
+    """把字段级 Overview 转成可独立标注且保留原始 chunk provenance 的证据。"""
+    evidence: list[RetrievedEvidence] = []
+    for field_name in (
+        "research_problem",
+        "main_method",
+        "contributions",
+        "datasets",
+        "experimental_setup",
+        "main_results",
+        "limitations",
+    ):
+        field = getattr(overview, field_name)
+        source_ids = tuple(field.source_chunk_ids)
+        if not source_ids:
+            continue
+        evidence.append(
+            RetrievedEvidence(
+                source_type=EvidenceSourceType.OVERVIEW,
+                paper_id=paper_id,
+                paper_title=overview.paper_title,
+                seed_chunk_ids=source_ids,
+                source_chunk_ids=source_ids,
+                section=" / ".join(field.source_sections) or "Paper Overview",
+                content=f"[{field_name}] {field.content}",
+                retrieval_metadata={"overview_field": field_name},
+            )
+        )
+    return tuple(evidence)
+
+
+def _retrieved_chunk_to_evidence(chunk: object) -> RetrievedEvidence:
+    return RetrievedEvidence(
+        source_type=EvidenceSourceType(str(chunk.section_type)),
+        paper_id=str(chunk.paper_id),
+        paper_title=str(chunk.paper_title),
+        seed_chunk_ids=(str(chunk.chunk_id),),
+        source_chunk_ids=(str(chunk.chunk_id),),
+        section_id=chunk.section_id,
+        section=str(chunk.section),
+        page_start=chunk.page_start,
+        page_end=chunk.page_end,
+        content=str(chunk.raw_text),
+        score=chunk.rerank_score if chunk.rerank_score is not None else chunk.fused_score,
+        retrieval_metadata={"rank": chunk.rank, "expanded": False},
+    )

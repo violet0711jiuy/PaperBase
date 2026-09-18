@@ -8,6 +8,7 @@ from .service import (
     create_paper_overview,
     run_paper_overview_stage,
 )
+from .repository import FormalOverviewArtifact, FormalOverviewRepository
 
 __all__ = [
     "PaperOverview",
@@ -16,4 +17,6 @@ __all__ = [
     "build_overview_context",
     "create_paper_overview",
     "run_paper_overview_stage",
+    "FormalOverviewArtifact",
+    "FormalOverviewRepository",
 ]

@@ -1,0 +1,102 @@
+"""Phase 2.5 Agentic RAG Workflow 的生产装配入口。"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from paperbase.config import load_settings
+from paperbase.database import MetadataDatabase
+from paperbase.generation.section_expander import SectionAwareNeighborExpander
+from paperbase.llm.client import (
+    ChatCompletionClient,
+    OpenAICompatibleChatClient,
+    load_llm_runtime_settings,
+)
+from paperbase.overview.repository import FormalOverviewRepository
+from paperbase.retrieval.adapters import FormalKnowledgeBaseAdapter
+from paperbase.retrieval.facade import RetrievalService
+from paperbase.retrieval.hybrid_retriever import HybridRetriever
+from paperbase.retrieval.service import create_hybrid_retriever
+
+from .decision import LLMDecisionAgent
+from .graph import LangGraphResearchWorkflow
+from .planner import ResearchPlanner
+from .query_understanding import QueryUnderstandingService
+from .scope_resolver import ScopeResolver
+from .service import AgenticResearchService
+from .tools import ResearchToolExecutor
+
+if TYPE_CHECKING:
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+
+
+class AgenticResearchConfigurationError(RuntimeError):
+    """功能关闭时请求 Agentic 生产装配。"""
+
+
+def create_agentic_research_service(
+    *,
+    config_path: Path | str | None = None,
+    client: ChatCompletionClient | None = None,
+    database: MetadataDatabase | None = None,
+    hybrid_retriever: HybridRetriever | None = None,
+    checkpointer: "BaseCheckpointSaver | None" = None,
+) -> AgenticResearchService:
+    """用一个共享的真实 LLM Client 装配正式知识库 LangGraph Service。
+
+    正常应用调用不传 ``client``，工厂会从项目 ``.env`` 加载并创建
+    :class:`OpenAICompatibleChatClient`。显式依赖注入只用于契约测试或替换供应商。
+    Workspace Adapter 的生命周期属于单个临时 Workspace，将由后续 UI/Router 层装配，
+    不应在正式知识库工厂中常驻。
+    """
+    settings = load_settings(config_path)
+    if not settings.agentic_research.enabled:
+        raise AgenticResearchConfigurationError(
+            "agentic_research.enabled 已关闭，不能创建 Agentic Research Service。"
+        )
+
+    active_database = database or MetadataDatabase(
+        settings.database.path,
+        busy_timeout_ms=settings.database.busy_timeout_ms,
+    )
+    active_database.initialize()
+    active_client = client or OpenAICompatibleChatClient(
+        load_llm_runtime_settings(settings.config_path.parent / ".env")
+    )
+    active_retriever = hybrid_retriever or create_hybrid_retriever(
+        config_path=settings.config_path,
+        database=active_database,
+        llm_client=active_client,
+    )
+
+    expander = SectionAwareNeighborExpander(
+        database=active_database,
+        settings=settings.context_expansion,
+    )
+    retrieval_service = RetrievalService(
+        formal_adapter=FormalKnowledgeBaseAdapter(
+            database=active_database,
+            retriever=active_retriever,
+            expander=expander,
+        )
+    )
+    tool_executor = ResearchToolExecutor(
+        retrieval_service=retrieval_service,
+        database=active_database,
+        global_retriever=active_retriever,
+        top_k_per_paper=settings.agentic_research.top_k_per_paper,
+        formal_overview_repository=FormalOverviewRepository(
+            settings.storage.papers_dir.parent / "paper_overviews"
+        ),
+    )
+    workflow = LangGraphResearchWorkflow(
+        scope_resolver=ScopeResolver(active_database),
+        query_understanding=QueryUnderstandingService(active_client),
+        planner=ResearchPlanner(active_client),
+        decision_agent=LLMDecisionAgent(active_client),
+        tool_executor=tool_executor,
+        settings=settings.agentic_research,
+        checkpointer=checkpointer,
+    )
+    return AgenticResearchService(workflow=workflow)

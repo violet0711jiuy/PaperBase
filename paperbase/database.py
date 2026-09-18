@@ -577,6 +577,16 @@ class MetadataDatabase:
                 "SELECT * FROM documents WHERE paper_id = ?", (paper_id,)
             ).fetchone()
 
+    def list_documents(self) -> tuple[sqlite3.Row, ...]:
+        """返回正式知识库论文目录，供 Scope Resolver 做确定性身份解析。"""
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(
+                connection.execute(
+                    "SELECT * FROM documents ORDER BY paper_id"
+                ).fetchall()
+            )
+
     def list_sections(self, paper_id: str) -> tuple[sqlite3.Row, ...]:
         """按原始 heading 阅读顺序返回一篇论文的完整 Section Tree 节点。"""
         self.initialize()
