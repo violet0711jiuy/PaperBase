@@ -12,7 +12,10 @@ from paperbase.agentic.contracts import (
     FinishAction,
     GetSectionContextAction,
     GuardState,
+    EvidenceTarget,
+    PaperSearchAttempt,
     RegistryState,
+    ResearchObservation,
     SearchKnowledgeBaseAction,
     SearchPapersAction,
     SearchReferencesAction,
@@ -102,6 +105,31 @@ class AgenticCheckpointSerdeTests(unittest.TestCase):
         dto = dump_contract(selection, CandidateSelection)
         self.assertTrue(_is_json_compatible(dto))
         self.assertEqual(load_contract(dto, CandidateSelection), selection)
+
+    def test_search_attempt_intent_round_trips_in_observation(self) -> None:
+        observation = ResearchObservation(
+            iteration=2,
+            action_name="search_papers",
+            tool_status=ToolStatus.EMPTY,
+            added_evidence_ids=(),
+            reused_evidence_ids=(),
+            search_attempts=(
+                PaperSearchAttempt(
+                    paper_id="A",
+                    query="方法边界",
+                    lexical_terms=("limitation",),
+                    evidence_targets=frozenset({EvidenceTarget.CLAIM}),
+                    missing_information=("哪些场景失效",),
+                    target_subtask_id="S2",
+                    status="empty",
+                ),
+            ),
+        )
+        dto = dump_contract((observation,), tuple[ResearchObservation, ...])
+        restored = load_contract(dto, tuple[ResearchObservation, ...])
+
+        self.assertTrue(_is_json_compatible(dto))
+        self.assertEqual(restored, (observation,))
 
 
 def _is_json_compatible(value) -> bool:

@@ -126,9 +126,37 @@ class PaperBatchExecution:
     paper_id: str
     query: str
     lexical_terms: tuple[str, ...]
+    evidence_targets: frozenset[str] = frozenset()
+    missing_information: tuple[str, ...] = ()
+    target_subtask_id: str | None = None
     result: object | None = None
     error_code: str | None = None
     error_message: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "paper_id", _required_text(self.paper_id, "paper_id"))
+        object.__setattr__(self, "query", _required_text(self.query, "query"))
+        object.__setattr__(
+            self,
+            "lexical_terms",
+            _normalized_text_tuple(self.lexical_terms, "lexical_terms"),
+        )
+        object.__setattr__(
+            self,
+            "evidence_targets",
+            frozenset(_normalized_text_tuple(self.evidence_targets, "evidence_targets")),
+        )
+        object.__setattr__(
+            self,
+            "missing_information",
+            _normalized_text_tuple(self.missing_information, "missing_information"),
+        )
+        if self.target_subtask_id is not None:
+            object.__setattr__(
+                self,
+                "target_subtask_id",
+                _required_text(self.target_subtask_id, "target_subtask_id"),
+            )
 
     @property
     def succeeded(self) -> bool:
@@ -179,11 +207,37 @@ class PaperSearchOutcome:
     status: PaperSearchStatus
     query: str
     lexical_terms: tuple[str, ...]
+    evidence_targets: frozenset[str] = frozenset()
+    missing_information: tuple[str, ...] = ()
+    target_subtask_id: str | None = None
     evidence_candidates: tuple[RetrievedEvidence, ...] = ()
     error_code: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", PaperSearchStatus(self.status))
+        object.__setattr__(self, "paper_id", _required_text(self.paper_id, "paper_id"))
+        object.__setattr__(self, "query", _required_text(self.query, "query"))
+        object.__setattr__(
+            self,
+            "lexical_terms",
+            _normalized_text_tuple(self.lexical_terms, "lexical_terms"),
+        )
+        object.__setattr__(
+            self,
+            "evidence_targets",
+            frozenset(_normalized_text_tuple(self.evidence_targets, "evidence_targets")),
+        )
+        object.__setattr__(
+            self,
+            "missing_information",
+            _normalized_text_tuple(self.missing_information, "missing_information"),
+        )
+        if self.target_subtask_id is not None:
+            object.__setattr__(
+                self,
+                "target_subtask_id",
+                _required_text(self.target_subtask_id, "target_subtask_id"),
+            )
         if self.status is PaperSearchStatus.OK and not self.evidence_candidates:
             raise ValueError("An ok paper outcome requires evidence candidates.")
         if self.status is PaperSearchStatus.EMPTY and self.evidence_candidates:

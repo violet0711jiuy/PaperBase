@@ -9,7 +9,7 @@ from paperbase.retrieval.contracts import (
     ToolResult,
 )
 
-from .contracts import RegistryDelta, ResearchObservation
+from .contracts import EvidenceTarget, PaperSearchAttempt, RegistryDelta, ResearchObservation
 
 
 def build_observation(
@@ -22,12 +22,27 @@ def build_observation(
     paper_statuses: list[tuple[str, str]] = []
     queries_by_paper: list[tuple[str, str]] = []
     error_codes: list[str] = []
+    search_attempts: list[PaperSearchAttempt] = []
     if isinstance(result.payload, SearchPapersPayload):
         for outcome in result.payload.paper_results:
             paper_statuses.append((outcome.paper_id, outcome.status.value))
             queries_by_paper.append((outcome.paper_id, outcome.query))
             if outcome.error_code:
                 error_codes.append(outcome.error_code)
+            search_attempts.append(
+                PaperSearchAttempt(
+                    paper_id=outcome.paper_id,
+                    query=outcome.query,
+                    lexical_terms=outcome.lexical_terms,
+                    evidence_targets=frozenset(
+                        EvidenceTarget(value) for value in outcome.evidence_targets
+                    ),
+                    missing_information=outcome.missing_information,
+                    target_subtask_id=outcome.target_subtask_id,
+                    status=outcome.status.value,
+                    error_code=outcome.error_code,
+                )
+            )
     elif isinstance(result.payload, ReferenceSearchPayload):
         queries_by_paper.append((result.payload.paper_id, result.payload.query))
     elif isinstance(result.payload, KnowledgeBaseSearchPayload):
@@ -48,4 +63,5 @@ def build_observation(
         error_codes=tuple(dict.fromkeys(error_codes)),
         no_new_evidence=not delta.added_ids,
         remaining_budget=dict(remaining_budget),
+        search_attempts=tuple(search_attempts),
     )

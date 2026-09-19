@@ -114,6 +114,9 @@ class RetrievalService:
                         paper_id=search.paper_id,
                         query=search.query,
                         lexical_terms=search.lexical_terms,
+                        evidence_targets=search.evidence_targets,
+                        missing_information=search.missing_information,
+                        target_subtask_id=search.target_subtask_id,
                         error_code=type(error).__name__,
                         error_message=str(error),
                     )
@@ -124,6 +127,9 @@ class RetrievalService:
                     paper_id=search.paper_id,
                     query=search.query,
                     lexical_terms=search.lexical_terms,
+                    evidence_targets=search.evidence_targets,
+                    missing_information=search.missing_information,
+                    target_subtask_id=search.target_subtask_id,
                     result=result,
                 )
             )

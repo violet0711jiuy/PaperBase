@@ -43,7 +43,9 @@ class EvidenceRegistry:
     ) -> RegistryDelta:
         added: list[str] = []
         reused: list[str] = []
-        for evidence, query in _evidence_with_queries(result, supporting_queries):
+        for evidence, query, targets, missing, subtask_id in _evidence_with_queries(
+            result, supporting_queries
+        ):
             key = _evidence_key(evidence)
             current = self._records_by_key.get(key)
             query_values = tuple(
@@ -63,7 +65,21 @@ class EvidenceRegistry:
                         dict.fromkeys((*current.originating_tools, result.tool_name.value))
                     ),
                     target_subtask_ids=tuple(
-                        dict.fromkeys((*current.target_subtask_ids, *target_subtask_ids))
+                        dict.fromkeys(
+                            (
+                                *current.target_subtask_ids,
+                                *target_subtask_ids,
+                                *((subtask_id,) if subtask_id else ()),
+                            )
+                        )
+                    ),
+                    requested_evidence_targets=frozenset(
+                        (*current.requested_evidence_targets, *targets)
+                    ),
+                    requested_missing_information=tuple(
+                        dict.fromkeys(
+                            (*current.requested_missing_information, *missing)
+                        )
                     ),
                 )
                 reused.append(current.evidence_id)
@@ -82,7 +98,17 @@ class EvidenceRegistry:
                 last_seen_iteration=iteration,
                 originating_tools=(result.tool_name.value,),
                 target_subtask_ids=tuple(dict.fromkeys(target_subtask_ids)),
+                requested_evidence_targets=frozenset(targets),
+                requested_missing_information=tuple(missing),
             )
+            if subtask_id:
+                current_record = self._records_by_key[key]
+                self._records_by_key[key] = replace(
+                    current_record,
+                    target_subtask_ids=tuple(
+                        dict.fromkeys((*current_record.target_subtask_ids, subtask_id))
+                    ),
+                )
             added.append(evidence_id)
         return RegistryDelta(tuple(added), tuple(reused))
 
@@ -158,11 +184,23 @@ def _evidence_with_queries(
     if isinstance(payload, SearchPapersPayload):
         for paper_result in payload.paper_results:
             for evidence in paper_result.evidence_candidates:
-                yield evidence, paper_result.query
+                yield (
+                    evidence,
+                    paper_result.query,
+                    paper_result.evidence_targets,
+                    paper_result.missing_information,
+                    paper_result.target_subtask_id,
+                )
         return
     query = getattr(payload, "query", "")
     for evidence in getattr(payload, "evidence_candidates", ()):
-        yield evidence, query or (fallback_queries[0] if fallback_queries else "")
+        yield (
+            evidence,
+            query or (fallback_queries[0] if fallback_queries else ""),
+            frozenset(),
+            (),
+            None,
+        )
 
 
 def _evidence_key(evidence: object) -> tuple[object, ...]:

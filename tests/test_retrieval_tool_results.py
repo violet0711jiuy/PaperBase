@@ -96,6 +96,9 @@ def _success(paper_id: str, *, with_chunk: bool, expanded: bool = False) -> Pape
         paper_id=paper_id,
         query=f"{paper_id} method",
         lexical_terms=(paper_id,),
+        evidence_targets=frozenset({"method"}),
+        missing_information=("核心机制",),
+        target_subtask_id="S1",
         result=_snapshot(paper_id, with_chunk=with_chunk, expanded=expanded),
     )
 
@@ -159,6 +162,31 @@ class RetrievalToolResultTests(unittest.TestCase):
             evidence.retrieval_metadata["source_matches"][0]["route"],  # type: ignore[index]
             "dense_resolved",
         )
+
+    def test_search_intent_survives_success_and_error_outcomes(self) -> None:
+        result = build_search_papers_tool_result(
+            (
+                _success("paper-a", with_chunk=True),
+                PaperBatchExecution(
+                    paper_id="paper-b",
+                    query="paper-b limitation",
+                    lexical_terms=("limitation",),
+                    evidence_targets=frozenset({"claim"}),
+                    missing_information=("适用边界",),
+                    target_subtask_id="S2",
+                    error_code="RuntimeError",
+                ),
+            ),
+            query_origin=QueryOrigin.AGENT_SUPPLIED,
+        )
+
+        success, failure = result.payload.paper_results
+        self.assertEqual(success.evidence_targets, frozenset({"method"}))
+        self.assertEqual(success.missing_information, ("核心机制",))
+        self.assertEqual(success.target_subtask_id, "S1")
+        self.assertEqual(failure.evidence_targets, frozenset({"claim"}))
+        self.assertEqual(failure.missing_information, ("适用边界",))
+        self.assertEqual(failure.target_subtask_id, "S2")
 
     def test_tool_name_must_match_payload_kind(self) -> None:
         @dataclass(frozen=True)

@@ -10,6 +10,7 @@ from typing import TypeAlias
 
 from paperbase.llm.client import LLMCallRecord
 from paperbase.retrieval.contracts import PaperSearchSpec, RetrievedEvidence, ToolStatus
+from paperbase.retrieval.evidence_fingerprint import build_evidence_fingerprint
 
 
 class Intent(str, Enum):
@@ -468,6 +469,9 @@ class EvidenceRecord:
     last_seen_iteration: int
     originating_tools: tuple[str, ...] = ()
     target_subtask_ids: tuple[str, ...] = ()
+    fingerprint: str | None = None
+    requested_evidence_targets: frozenset[EvidenceTarget] = frozenset()
+    requested_missing_information: tuple[str, ...] = ()
     analysis_status: EvidenceAnalysisStatus = EvidenceAnalysisStatus.PENDING
     digest: str | None = None
     claims: tuple[EvidenceClaim, ...] = ()
@@ -476,6 +480,27 @@ class EvidenceRecord:
     qualification: EvidenceQualification | None = None
 
     def __post_init__(self) -> None:
+        fingerprint = self.fingerprint or build_evidence_fingerprint(self.evidence)
+        if len(fingerprint) != 64 or any(
+            character not in "0123456789abcdef" for character in fingerprint.casefold()
+        ):
+            raise ValueError("fingerprint 必须是 64 位十六进制 SHA-256。")
+        object.__setattr__(self, "fingerprint", fingerprint.casefold())
+        object.__setattr__(
+            self,
+            "requested_evidence_targets",
+            frozenset(EvidenceTarget(value) for value in self.requested_evidence_targets),
+        )
+        object.__setattr__(
+            self,
+            "requested_missing_information",
+            tuple(
+                dict.fromkeys(
+                    _text(value, "requested_missing_information")
+                    for value in self.requested_missing_information
+                )
+            ),
+        )
         status = EvidenceAnalysisStatus(self.analysis_status)
         claims = tuple(self.claims)
         digest = self.digest
@@ -530,6 +555,20 @@ class RegistryState:
 
 
 @dataclass(frozen=True)
+class PaperSearchAttempt:
+    """一次逐论文搜索的完整意图与结果摘要。"""
+
+    paper_id: str
+    query: str
+    lexical_terms: tuple[str, ...] = ()
+    evidence_targets: frozenset[EvidenceTarget] = frozenset()
+    missing_information: tuple[str, ...] = ()
+    target_subtask_id: str | None = None
+    status: str = ""
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
 class ResearchObservation:
     iteration: int
     action_name: str
@@ -541,6 +580,7 @@ class ResearchObservation:
     error_codes: tuple[str, ...] = ()
     no_new_evidence: bool = False
     remaining_budget: dict[str, int] = field(default_factory=dict)
+    search_attempts: tuple[PaperSearchAttempt, ...] = ()
 
 
 @dataclass(frozen=True)

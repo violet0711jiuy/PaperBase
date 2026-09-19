@@ -48,6 +48,9 @@ def _execution_to_outcome(execution: PaperBatchExecution) -> PaperSearchOutcome:
             status=status,
             query=execution.query,
             lexical_terms=execution.lexical_terms,
+            evidence_targets=execution.evidence_targets,
+            missing_information=execution.missing_information,
+            target_subtask_id=execution.target_subtask_id,
             error_code=execution.error_code,
         )
     if not isinstance(execution.result, PaperRetrievalSnapshot):
@@ -56,6 +59,9 @@ def _execution_to_outcome(execution: PaperBatchExecution) -> PaperSearchOutcome:
             status=PaperSearchStatus.ERROR,
             query=execution.query,
             lexical_terms=execution.lexical_terms,
+            evidence_targets=execution.evidence_targets,
+            missing_information=execution.missing_information,
+            target_subtask_id=execution.target_subtask_id,
             error_code="InvalidAdapterResult",
         )
     evidence = _snapshot_to_evidence(execution.result)
@@ -64,6 +70,9 @@ def _execution_to_outcome(execution: PaperBatchExecution) -> PaperSearchOutcome:
         status=PaperSearchStatus.OK if evidence else PaperSearchStatus.EMPTY,
         query=execution.query,
         lexical_terms=execution.lexical_terms,
+        evidence_targets=execution.evidence_targets,
+        missing_information=execution.missing_information,
+        target_subtask_id=execution.target_subtask_id,
         evidence_candidates=evidence,
     )
 

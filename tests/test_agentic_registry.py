@@ -60,6 +60,60 @@ class EvidenceRegistryTests(unittest.TestCase):
         self.assertEqual(registry.records[0].originating_tools, ("search_papers",))
         self.assertEqual(registry.records[0].target_subtask_ids, ("S1", "S2"))
 
+    def test_registry_keeps_search_targets_gaps_and_stable_fingerprint(self) -> None:
+        outcome = PaperSearchOutcome(
+            paper_id="paper_a",
+            status=PaperSearchStatus.OK,
+            query="定位核心方法",
+            lexical_terms=("encoder",),
+            evidence_targets=frozenset({"method"}),
+            missing_information=("编码器如何工作",),
+            target_subtask_id="S-method",
+            evidence_candidates=(_evidence(),),
+        )
+        result = ToolResult(
+            status=ToolStatus.OK,
+            tool_name=ToolName.SEARCH_PAPERS,
+            payload=SearchPapersPayload((outcome,)),
+        )
+
+        first_registry = EvidenceRegistry()
+        first_registry.register_tool_result(result, iteration=1)
+        record = first_registry.records[0]
+        self.assertEqual(
+            {target.value for target in record.requested_evidence_targets},
+            {"method"},
+        )
+        self.assertEqual(record.requested_missing_information, ("编码器如何工作",))
+        self.assertEqual(record.target_subtask_ids, ("S-method",))
+
+        second_evidence = RetrievedEvidence(
+            source_type=EvidenceSourceType.CONTENT,
+            paper_id="paper_a",
+            seed_chunk_ids=("chunk_1",),
+            source_chunk_ids=("chunk_2", "chunk_1"),
+            content="  EVIDENCE   text ",
+            score=0.01,
+        )
+        second_result = ToolResult(
+            status=ToolStatus.OK,
+            tool_name=ToolName.SEARCH_PAPERS,
+            payload=SearchPapersPayload(
+                (
+                    PaperSearchOutcome(
+                        paper_id="paper_a",
+                        status=PaperSearchStatus.OK,
+                        query="另一轮检索",
+                        lexical_terms=(),
+                        evidence_candidates=(second_evidence,),
+                    ),
+                )
+            ),
+        )
+        second_registry = EvidenceRegistry()
+        second_registry.register_tool_result(second_result, iteration=9)
+        self.assertEqual(second_registry.records[0].fingerprint, record.fingerprint)
+
     def test_bibliography_uses_independent_r_numbering(self) -> None:
         result = ToolResult(
             status=ToolStatus.OK,
