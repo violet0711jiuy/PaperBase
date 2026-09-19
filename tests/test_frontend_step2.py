@@ -94,6 +94,7 @@ def test_agentic_stream_persists_answer_thread_and_evidence(tmp_path) -> None:
             conversation.conversation_id,
             selected_paper_ids=("A", "B"),
             knowledge_base_all=False,
+            thread_id="research-test",
         )
     )
 
@@ -112,6 +113,40 @@ def test_agentic_stream_persists_answer_thread_and_evidence(tmp_path) -> None:
     assert audit.thread_id == "research-test"
     assert audit.schema_version == 1
     assert service.export_conversation_turn_audit(turn) == audit.to_json(indent=2)
+    assert service.get_pending_agentic_task(conversation.conversation_id) is None
+
+
+def test_agentic_interruption_can_resume_without_starting_a_new_thread(tmp_path) -> None:
+    fake = _RecoverableFakeAgenticService()
+    service = PaperBaseService(
+        _temporary_settings(tmp_path),
+        agentic_service=fake,
+    )
+    conversation = service.create_kb_conversation()
+
+    first_events = list(
+        service.stream_knowledge_base_agentic(
+            "比较 A 和 B",
+            conversation.conversation_id,
+            selected_paper_ids=("A", "B"),
+            knowledge_base_all=False,
+            thread_id="resume-thread",
+        )
+    )
+    pending = service.get_pending_agentic_task(conversation.conversation_id)
+
+    assert first_events[-1].kind == "interrupted"
+    assert pending is not None
+    assert pending.thread_id == "resume-thread"
+    assert service.get_conversation_turns(conversation.conversation_id) == ()
+
+    resumed_events = list(service.resume_knowledge_base_agentic(conversation.conversation_id))
+
+    assert resumed_events[-1].kind == "completed"
+    assert fake.started_threads == ["resume-thread"]
+    assert fake.resumed_threads == ["resume-thread"]
+    assert service.get_pending_agentic_task(conversation.conversation_id) is None
+    assert len(service.get_conversation_turns(conversation.conversation_id)) == 1
 
 
 class _FakeAnswerService:
@@ -201,6 +236,90 @@ class _FakeAgenticService:
             kind="completed",
             message="研究任务已完成",
             thread_id="research-test",
+            result=result,
+        )
+
+
+class _RecoverableFakeAgenticService:
+    """模拟同一 checkpoint 的中断与恢复，不重复执行新任务入口。"""
+
+    def __init__(self) -> None:
+        self.started_threads: list[str] = []
+        self.resumed_threads: list[str] = []
+
+    def stream_research(
+        self,
+        query,
+        *,
+        selected_paper_ids,
+        knowledge_base_all,
+        thread_id=None,
+    ):
+        _ = query, selected_paper_ids, knowledge_base_all
+        self.started_threads.append(thread_id)
+        yield SimpleNamespace(
+            kind="started",
+            message="研究任务已开始",
+            thread_id=thread_id,
+            result=None,
+        )
+        yield SimpleNamespace(
+            kind="interrupted",
+            message="研究任务已暂停",
+            thread_id=thread_id,
+            result=None,
+        )
+
+    def resume_stream(self, thread_id):
+        self.resumed_threads.append(thread_id)
+        yield SimpleNamespace(
+            kind="started",
+            message="正在恢复研究任务",
+            thread_id=thread_id,
+            result=None,
+        )
+        source = SimpleNamespace(
+            source_type=SimpleNamespace(value="content"),
+            paper_id="A",
+            paper_title="Paper A",
+            section="方法",
+            page_start=2,
+            page_end=3,
+            content="Paper A 的方法证据。",
+        )
+        evidence = SimpleNamespace(evidence_id="E1", evidence=source)
+        result = SimpleNamespace(
+            status=SimpleNamespace(value="completed"),
+            stop_reason=SimpleNamespace(value="agent_finished"),
+            answer=SimpleNamespace(
+                status="success",
+                answer="恢复后的回答 [E1]。",
+                citations=("E1",),
+                insufficient_evidence=False,
+                partial_answer=False,
+                coverage_note=None,
+                llm_diagnostics=(),
+            ),
+            selected_evidence=(evidence,),
+            evidence=(evidence,),
+            observations=(),
+            query_context=SimpleNamespace(
+                resolved_query="比较 A 和 B",
+                scope=SimpleNamespace(value="selected_papers"),
+            ),
+            plan=None,
+            coverage=None,
+            candidate_selection=None,
+            budget_usage=SimpleNamespace(),
+            thread_id=thread_id,
+            error_codes=(),
+            clarification=None,
+            llm_diagnostics=(),
+        )
+        yield SimpleNamespace(
+            kind="completed",
+            message="研究任务已完成",
+            thread_id=thread_id,
             result=result,
         )
 

@@ -10,6 +10,7 @@ from .store import (
     ConversationStore,
     ConversationStoreError,
     ConversationTurn,
+    PendingAgenticTask,
     format_turns_as_context,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "ConversationStore",
     "ConversationStoreError",
     "ConversationTurn",
+    "PendingAgenticTask",
     "format_turns_as_context",
 ]

@@ -1,6 +1,6 @@
 # Agentic RAG v1 真实运行发现与修订计划
 
-> 状态：`P0-P3_IMPLEMENTED / P4_PLANNED`
+> 状态：`P0-P4_IMPLEMENTED`
 > 记录日期：2026-09-19
 > 文档性质：Phase 4 首个真实闭环后的问题记录、架构修订建议与实施优先级。
 > 基线关系：本文不直接覆盖《Agentic RAG v1 冻结架构》；涉及冻结语义的修改，应在实现前形成明确契约和迁移测试。
@@ -363,9 +363,16 @@ Answer Generator 应接收 Claim、Relation、Ownership 和原始 Evidence 映�
 
 ### P4：产品审计体验
 
-1. UI 展示 Candidate、Uncertain、Excluded 及理由。
-2. 展示每篇论文的 Query、Digest、Claim Ownership 和 Coverage。
-3. 展示部分回答和中断的明确原因。
+> 实施状态：`COMPLETED`（2026-09-19）。
+
+1. 使用版本化安全审计快照持久化 Candidate、Query、Digest、Claim Ownership、Coverage、
+   Tool 时间线、预算和 LLM 安全诊断。
+2. UI 展示 Candidate、Uncertain、Excluded 及理由，并按论文展示动态 Query 和研究缺口。
+3. 展示 Claim 与 Evidence 的归属、关系和原文锚点，继续复用原始 Evidence 卡片。
+4. 展示部分回答、预算耗尽、无可用动作、无效动作上限和失败的明确原因。
+5. 使用会话级 pending task 和原 LangGraph `thread_id` 支持中断恢复；完成回合和 pending
+   删除在同一 SQLite 事务中提交。
+6. 支持脱敏 JSON 审计导出，不包含 Prompt、隐藏推理、API Key 或原始 Graph State。
 
 ## 7. 推荐实施顺序
 
@@ -510,6 +517,35 @@ P2 完成后的全量验证结果：`291 passed, 15 subtests passed`。
 - 普通快速 RAG 与 Phase 1～4 既有回归保持通过。
 
 P3 完成后的全量验证结果：`310 passed, 15 subtests passed`。
+
+### 8.0.4 P4 实施记录（2026-09-19）
+
+本轮完成了产品审计、历史恢复和中断恢复闭环：
+
+- 新增 `AgenticAuditSnapshot` v1，将运行时领域状态投影为稳定的用户审计契约；快照包含
+  论文筛选、逐论文研究、SearchAttempt、Filter/Cache 汇总、Claim 归属、Coverage、预算和
+  安全 LLM 诊断，不包含 Prompt、隐藏推理、API Key、向量分数或原始 LangGraph State；
+- `conversation_turns` 新增 nullable `audit_json`，旧数据库幂等补列；最终答案、Evidence、
+  审计快照在同一个事务中写入，损坏快照只降级审计展示，不影响答案历史；
+- Knowledge Base 历史回合新增“研究过程与归因”，展示研究摘要、Candidate/Uncertain/Excluded、
+  每篇论文的动态 Query 与覆盖缺口、确定性 Tool 时间线、Evidence Digest 和 Claim Ownership；
+- Answer 的部分完成、预算耗尽、Scope 未解析、无可用动作、无效动作上限和 fatal error 均有
+  稳定中文解释；技术错误和 Token 统计进入默认收起的高级诊断；
+- 新增会话级 `pending_agentic_tasks`。任务启动前登记原 `thread_id`，中断或进程异常后可以从
+  SQLite checkpoint 继续；恢复不创建新线程，LangGraph Guard 继续阻止重复 Tool；
+- 最终回合写入与 pending 删除位于同一事务，避免“答案已保存但页面仍提示恢复”的开环；
+- UI 提供显式继续和放弃恢复入口，以及带 Schema 版本的脱敏 JSON 下载。
+
+新增回归覆盖：
+
+- 审计 Schema JSON 往返和未知版本拒绝；
+- Prompt、隐藏推理、Chunk 内部 ID、分数和密钥字段不进入审计快照；
+- 旧 Conversation 数据库迁移、损坏 `audit_json` 降级和历史重启恢复；
+- pending task 跨进程恢复、同会话禁止第二线程、最终回合原子清理 pending；
+- 同一 `thread_id` 中断后恢复并只生成一个正式对话回合；
+- 完成、部分回答、预算耗尽和 fatal error 的用户提示。
+
+P4 完成后的全量验证结果：`319 passed, 15 subtests passed`。
 
 ### 8.1 全库方法归纳
 

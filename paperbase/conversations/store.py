@@ -59,6 +59,18 @@ class ConversationTurn:
     audit_json: str | None = None
 
 
+@dataclass(frozen=True)
+class PendingAgenticTask:
+    """一个会话中尚未形成最终回答的可恢复 Agentic 任务。"""
+
+    conversation_id: str
+    thread_id: str
+    user_query: str
+    status: str
+    created_at: str
+    updated_at: str
+
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
     conversation_id TEXT PRIMARY KEY,
@@ -92,6 +104,19 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
 
 CREATE INDEX IF NOT EXISTS idx_conversation_turns_recent
     ON conversation_turns(conversation_id, turn_index DESC);
+
+CREATE TABLE IF NOT EXISTS pending_agentic_tasks (
+    conversation_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL UNIQUE,
+    user_query TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    CHECK (status IN ('running', 'interrupted', 'recovering')),
+    CHECK (length(trim(thread_id)) > 0),
+    CHECK (length(trim(user_query)) > 0)
+);
 """
 
 
@@ -223,6 +248,7 @@ class ConversationStore:
         audit_path: str | None = None,
         evidence_json: str | None = None,
         audit_json: str | None = None,
+        finalize_agentic_thread_id: str | None = None,
     ) -> ConversationTurn:
         """原子追加回合；turn_index 在同一会话中严格单调递增。
 
@@ -286,6 +312,18 @@ class ConversationStore:
                         turn.created_at,
                     ),
                 )
+                if finalize_agentic_thread_id is not None:
+                    normalized_thread_id = _required_text(
+                        finalize_agentic_thread_id,
+                        field_name="finalize_agentic_thread_id",
+                    )
+                    connection.execute(
+                        """
+                        DELETE FROM pending_agentic_tasks
+                        WHERE conversation_id = ? AND thread_id = ?
+                        """,
+                        (conversation_id, normalized_thread_id),
+                    )
                 connection.execute(
                     "UPDATE conversations SET updated_at = ? WHERE conversation_id = ?",
                     (turn.created_at, conversation_id),
@@ -295,6 +333,91 @@ class ConversationStore:
                 connection.rollback()
                 raise
         return turn
+
+    def upsert_pending_agentic_task(
+        self,
+        conversation_id: str,
+        *,
+        thread_id: str,
+        user_query: str,
+        status: str,
+    ) -> PendingAgenticTask:
+        """登记或更新一个会话唯一的待完成 Agentic 任务。"""
+        normalized_thread = _required_text(thread_id, field_name="thread_id")
+        normalized_query = _required_text(user_query, field_name="user_query")
+        normalized_status = _pending_status(status)
+        self.get_conversation(conversation_id)
+        now = _utc_now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT conversation_id, thread_id, user_query, status, created_at, updated_at
+                FROM pending_agentic_tasks WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+            if existing is not None and str(existing["thread_id"]) != normalized_thread:
+                raise ConversationStoreError(
+                    "当前会话已有尚未完成的 Agentic Research 任务。"
+                )
+            created_at = str(existing["created_at"]) if existing is not None else now
+            connection.execute(
+                """
+                INSERT INTO pending_agentic_tasks (
+                    conversation_id, thread_id, user_query, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    user_query = excluded.user_query,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    conversation_id,
+                    normalized_thread,
+                    normalized_query,
+                    normalized_status,
+                    created_at,
+                    now,
+                ),
+            )
+        return PendingAgenticTask(
+            conversation_id=conversation_id,
+            thread_id=normalized_thread,
+            user_query=normalized_query,
+            status=normalized_status,
+            created_at=created_at,
+            updated_at=now,
+        )
+
+    def get_pending_agentic_task(
+        self, conversation_id: str
+    ) -> PendingAgenticTask | None:
+        """读取会话的待恢复任务；没有时返回 ``None``。"""
+        self.get_conversation(conversation_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT conversation_id, thread_id, user_query, status, created_at, updated_at
+                FROM pending_agentic_tasks WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+        return _pending_task_from_row(row) if row is not None else None
+
+    def delete_pending_agentic_task(
+        self, conversation_id: str, *, thread_id: str
+    ) -> None:
+        """精确删除失效的待恢复任务，不影响其它会话或 checkpoint。"""
+        normalized_thread = _required_text(thread_id, field_name="thread_id")
+        self.get_conversation(conversation_id)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM pending_agentic_tasks
+                WHERE conversation_id = ? AND thread_id = ?
+                """,
+                (conversation_id, normalized_thread),
+            )
 
     def get_recent_turns(
         self, conversation_id: str, max_turns: int
@@ -398,6 +521,18 @@ def _conversation_from_row(row: sqlite3.Row) -> ConversationRecord:
     )
 
 
+def _pending_task_from_row(row: sqlite3.Row) -> PendingAgenticTask:
+    """把 SQLite 行转换为待恢复任务领域对象。"""
+    return PendingAgenticTask(
+        conversation_id=str(row["conversation_id"]),
+        thread_id=str(row["thread_id"]),
+        user_query=str(row["user_query"]),
+        status=_pending_status(str(row["status"])),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
 def _turn_from_row(row: sqlite3.Row) -> ConversationTurn:
     """集中转换 turn 行，保留可选审计和 Evidence 字段的 null 语义。"""
     try:
@@ -461,6 +596,14 @@ def _optional_json_text(value: object, *, field_name: str) -> str | None:
         json.loads(normalized)
     except (TypeError, json.JSONDecodeError) as error:
         raise ValueError(f"{field_name} must contain valid JSON.") from error
+    return normalized
+
+
+def _pending_status(value: object) -> str:
+    """限制 pending 状态，避免 UI 根据任意字符串推断可恢复性。"""
+    normalized = _required_text(str(value), field_name="status")
+    if normalized not in {"running", "interrupted", "recovering"}:
+        raise ValueError(f"Unsupported pending Agentic task status: {normalized}")
     return normalized
 
 

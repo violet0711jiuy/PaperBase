@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, dataclass
 import json
 from typing import Mapping
@@ -35,6 +36,12 @@ class SearchAttemptAudit:
 
 
 @dataclass(frozen=True)
+class FilterReasonAudit:
+    reason: str
+    count: int
+
+
+@dataclass(frozen=True)
 class ResearchStepAudit:
     iteration: int
     action_name: str
@@ -46,6 +53,7 @@ class ResearchStepAudit:
     filter_accepted: int = 0
     filter_rejected: int = 0
     filter_deprioritized: int = 0
+    filter_reasons: tuple[FilterReasonAudit, ...] = ()
     cache_hits: int = 0
     cache_misses: int = 0
     cache_writes: int = 0
@@ -252,8 +260,10 @@ def build_agentic_audit_snapshot(
             )
 
     diagnostic_records = tuple(getattr(result, "llm_diagnostics", ()) or ())
-    if answer is not None:
-        diagnostic_records += tuple(getattr(answer, "llm_diagnostics", ()) or ())
+    # 完整 LangGraph 结果已把 Answer 节点诊断汇总到 result；轻量替身或旧结果
+    # 可能只在 answer 中携带，因此仅在顶层为空时回退，避免重复展示同一次调用。
+    if not diagnostic_records and answer is not None:
+        diagnostic_records = tuple(getattr(answer, "llm_diagnostics", ()) or ())
     llm_calls = tuple(_llm_call(item) for item in diagnostic_records)
 
     query_context = getattr(result, "query_context", None)
@@ -338,6 +348,12 @@ def _step_audit(observation: object, titles: Mapping[str, str]) -> ResearchStepA
         )
         for item in tuple(getattr(observation, "search_attempts", ()) or ())
     )
+    reason_counts = Counter(
+        str(reason)
+        for decision in tuple(getattr(report, "decisions", ()) or ())
+        for reason in tuple(getattr(decision, "reasons", ()) or ())
+        if str(reason).strip()
+    )
     return ResearchStepAudit(
         iteration=int(getattr(observation, "iteration", 0) or 0),
         action_name=str(getattr(observation, "action_name", "unknown")),
@@ -349,6 +365,10 @@ def _step_audit(observation: object, titles: Mapping[str, str]) -> ResearchStepA
         filter_accepted=int(getattr(report, "accepted_candidates", 0) or 0),
         filter_rejected=int(getattr(report, "rejected_candidates", 0) or 0),
         filter_deprioritized=int(getattr(report, "deprioritized_candidates", 0) or 0),
+        filter_reasons=tuple(
+            FilterReasonAudit(reason=reason, count=count)
+            for reason, count in sorted(reason_counts.items())
+        ),
         cache_hits=int(getattr(cache, "hits", 0) or 0),
         cache_misses=int(getattr(cache, "misses", 0) or 0),
         cache_writes=int(getattr(cache, "writes", 0) or 0),
@@ -440,6 +460,10 @@ def _step_from_payload(item: dict[str, object]) -> ResearchStepAudit:
     values["attempts"] = tuple(
         SearchAttemptAudit(**attempt)
         for attempt in _object_list(values.get("attempts"))
+    )
+    values["filter_reasons"] = tuple(
+        FilterReasonAudit(**reason)
+        for reason in _object_list(values.get("filter_reasons"))
     )
     values["error_codes"] = _strings(values.get("error_codes"))
     return ResearchStepAudit(**values)

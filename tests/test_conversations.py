@@ -168,6 +168,54 @@ class ConversationStoreTests(unittest.TestCase):
             self.assertEqual(restored.assistant_answer, "仍然可见的回答")
             self.assertIsNone(restored.audit_json)
 
+    def test_pending_agentic_task_survives_restart_and_finalizes_atomically(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "conversations.sqlite3"
+            store = ConversationStore(path)
+            conversation = store.create_conversation("knowledge_base", "default")
+            store.upsert_pending_agentic_task(
+                conversation.conversation_id,
+                thread_id="thread-resume",
+                user_query="比较 A 和 B",
+                status="interrupted",
+            )
+
+            restarted = ConversationStore(path)
+            pending = restarted.get_pending_agentic_task(conversation.conversation_id)
+            self.assertIsNotNone(pending)
+            self.assertEqual(pending.thread_id, "thread-resume")  # type: ignore[union-attr]
+
+            restarted.append_turn(
+                conversation.conversation_id,
+                user_query="比较 A 和 B",
+                assistant_answer="最终回答",
+                finalize_agentic_thread_id="thread-resume",
+            )
+
+            self.assertIsNone(
+                restarted.get_pending_agentic_task(conversation.conversation_id)
+            )
+            self.assertEqual(len(restarted.get_turns(conversation.conversation_id)), 1)
+
+    def test_pending_agentic_task_rejects_second_thread_in_same_conversation(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            store = ConversationStore(Path(temporary_directory) / "conversations.sqlite3")
+            conversation = store.create_conversation("knowledge_base", "default")
+            store.upsert_pending_agentic_task(
+                conversation.conversation_id,
+                thread_id="thread-a",
+                user_query="问题 A",
+                status="running",
+            )
+
+            with self.assertRaisesRegex(Exception, "尚未完成"):
+                store.upsert_pending_agentic_task(
+                    conversation.conversation_id,
+                    thread_id="thread-b",
+                    user_query="问题 B",
+                    status="running",
+                )
+
     def test_turns_survive_store_reinstantiation_and_keep_recent_order(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "conversations.sqlite3"

@@ -8,6 +8,8 @@ import re
 
 import streamlit as st
 
+from paperbase.agentic.audit import AgenticAuditSnapshot
+
 if __package__ == "app.pages":
     from app.components.answer_sections import split_answer_sections as _split_answer_sections
     from app.components.evidence_preview import build_evidence_preview
@@ -109,6 +111,16 @@ def _render_conversation(service: PaperBaseService, conversation_id: str) -> Non
                     st.info("这是后端根据当前上下文返回的澄清提示，请补充明确的论文或主题。")
                 metadata = service.get_conversation_turn_metadata(turn)
                 _render_answer_status(metadata, turn.assistant_answer, is_unresolved=is_unresolved)
+                audit = service.get_conversation_turn_audit(turn)
+                _render_agentic_audit(
+                    audit,
+                    audit_json=(
+                        service.export_conversation_turn_audit(turn)
+                        if audit is not None
+                        else None
+                    ),
+                    turn_id=turn.turn_id,
+                )
                 evidence = service.get_conversation_turn_evidence(turn)
                 _render_evidence(
                     evidence,
@@ -156,6 +168,283 @@ def _render_answer_status(
         st.warning("当前论文证据不足以支持完整回答，请尝试补充更具体的问题。")
     if metadata.coverage_note and "证据覆盖说明" not in answer:
         _render_answer_section("4. 覆盖提示", metadata.coverage_note, muted=True)
+
+
+def _render_agentic_audit(
+    audit: AgenticAuditSnapshot | None,
+    *,
+    audit_json: str | None,
+    turn_id: str,
+) -> None:
+    """显示可持久化的研究过程，不暴露 Prompt、隐藏推理或原始 Graph State。"""
+    if audit is None:
+        return
+    status_text, status_level = _audit_status_message(audit)
+    if status_level == "success":
+        st.success(status_text)
+    elif status_level == "warning":
+        st.warning(status_text)
+    else:
+        st.error(status_text)
+
+    with st.expander("查看研究过程与归因", expanded=False):
+        _render_audit_summary(audit)
+        _render_candidate_audit(audit)
+        _render_paper_research_audit(audit)
+        _render_research_timeline(audit)
+        _render_claim_audit(audit)
+        _render_advanced_diagnostics(audit)
+        if audit_json:
+            st.download_button(
+                "导出脱敏审计 JSON",
+                data=audit_json,
+                file_name=f"paperbase-agentic-audit-{turn_id}.json",
+                mime="application/json",
+                key=f"kb-audit-download-{turn_id}",
+            )
+
+
+def _render_audit_summary(audit: AgenticAuditSnapshot) -> None:
+    """展示研究结论状态与实际预算使用情况。"""
+    st.markdown("#### 研究摘要")
+    scope_label = _SCOPE_LABELS.get(audit.scope or "", audit.scope or "未记录")
+    coverage_label = (
+        "已完成"
+        if audit.coverage_complete is True
+        else "尚未完全覆盖"
+        if audit.coverage_complete is False
+        else "未记录"
+    )
+    st.markdown(
+        f"范围：**{scope_label}** · 覆盖：**{coverage_label}** · "
+        f"迭代：**{audit.budget.agent_iterations}** · "
+        f"工具调用：**{audit.budget.tool_calls}** · "
+        f"检索查询：**{audit.budget.retrieval_queries}** · "
+        f"LLM 调用：**{audit.budget.llm_calls}**"
+    )
+    if audit.clarification:
+        st.info(f"需要补充的信息：{audit.clarification}")
+
+
+def _render_candidate_audit(audit: AgenticAuditSnapshot) -> None:
+    """按处置结果展示论文元数据筛选，明确哪些论文没有进入正文检索。"""
+    if not audit.candidates:
+        return
+    st.markdown("#### 论文筛选")
+    for disposition in ("candidate", "uncertain", "excluded"):
+        items = tuple(
+            item for item in audit.candidates if item.disposition == disposition
+        )
+        if not items:
+            continue
+        st.markdown(f"**{_CANDIDATE_LABELS.get(disposition, disposition)}（{len(items)}）**")
+        for item in items:
+            st.markdown(f"- {item.title}：{item.reason}")
+
+
+def _render_paper_research_audit(audit: AgenticAuditSnapshot) -> None:
+    """逐论文展示动态 Query、Coverage 与尚未解决的研究缺口。"""
+    if not audit.papers:
+        return
+    st.markdown("#### 逐论文研究")
+    for paper in audit.papers:
+        status = _PAPER_STATUS_LABELS.get(paper.status, paper.status)
+        with st.container(border=True):
+            st.markdown(f"**{paper.title}** · {status}")
+            if paper.rationale:
+                st.caption(paper.rationale)
+            if paper.queries_tried:
+                st.markdown("检索 Query：")
+                for query in paper.queries_tried:
+                    st.code(query, language=None)
+            _render_tag_line("已覆盖目标", paper.covered_targets)
+            _render_tag_line("未覆盖目标", paper.remaining_targets)
+            _render_tag_line("已回答信息", paper.addressed_information)
+            _render_tag_line("仍缺信息", paper.remaining_information)
+            _render_tag_line("涉及章节", paper.sections_seen)
+
+
+def _render_research_timeline(audit: AgenticAuditSnapshot) -> None:
+    """用确定性格式展示 Tool 执行和筛选结果，不再请求 LLM 总结。"""
+    if not audit.steps:
+        return
+    st.markdown("#### 研究时间线")
+    for step in audit.steps:
+        status = _TOOL_STATUS_LABELS.get(step.tool_status, step.tool_status)
+        st.markdown(
+            f"**第 {step.iteration} 步 · {step.action_name}** — {status}；"
+            f"新增 {step.added_count} 条，复用 {step.reused_count} 条"
+        )
+        for attempt in step.attempts:
+            attempt_status = _TOOL_STATUS_LABELS.get(attempt.status, attempt.status)
+            suffix = f"；错误：{attempt.error_code}" if attempt.error_code else ""
+            st.markdown(
+                f"- {attempt.title}：`{attempt.query}` → {attempt_status}{suffix}"
+            )
+        if step.filter_total:
+            st.caption(
+                "Evidence Filter："
+                f"候选 {step.filter_total}，接纳 {step.filter_accepted}，"
+                f"排除 {step.filter_rejected}，降权 {step.filter_deprioritized}"
+            )
+            if step.filter_reasons:
+                st.caption(
+                    "筛选原因："
+                    + "、".join(
+                        f"{_FILTER_REASON_LABELS.get(item.reason, item.reason)} × {item.count}"
+                        for item in step.filter_reasons
+                    )
+                )
+        if step.cache_hits or step.cache_misses or step.cache_writes or step.cache_errors:
+            st.caption(
+                "分析缓存："
+                f"命中 {step.cache_hits}，未命中 {step.cache_misses}，"
+                f"写入 {step.cache_writes}，错误 {step.cache_errors}"
+            )
+
+
+def _render_claim_audit(audit: AgenticAuditSnapshot) -> None:
+    """展示 Evidence Digest 与 Claim 级归属，防止跨论文错误归因。"""
+    qualified = tuple(item for item in audit.evidence if item.selected or item.cited)
+    if not qualified:
+        return
+    st.markdown("#### 结论与证据归因")
+    for item in qualified:
+        cited = " · 回答已引用" if item.cited else ""
+        with st.container(border=True):
+            st.markdown(f"**{item.evidence_id} · {item.paper_title}{cited}**")
+            if item.digest:
+                st.markdown(item.digest)
+            _render_tag_line("覆盖目标", item.covered_targets)
+            for claim in item.claims:
+                relation = _RELATION_LABELS.get(claim.relation, claim.relation)
+                ownership = _OWNERSHIP_LABELS.get(claim.ownership, claim.ownership)
+                st.markdown(
+                    f"- **{claim.claim_id}**：{claim.statement}  "
+                    f"  \n  关系：{relation} · 归属：{ownership}"
+                )
+                if claim.rationale:
+                    st.caption(f"判定理由：{claim.rationale}")
+                if claim.source_excerpt:
+                    st.caption(f"原文锚点：{claim.source_excerpt}")
+
+
+def _render_advanced_diagnostics(audit: AgenticAuditSnapshot) -> None:
+    """默认折叠技术诊断；记录数值和状态，不显示任何调用正文。"""
+    if not audit.llm_calls and not audit.error_codes:
+        return
+    with st.container(border=True):
+        st.markdown("##### 高级诊断")
+        if audit.error_codes:
+            st.markdown("错误代码：" + "、".join(audit.error_codes))
+        for call in audit.llm_calls:
+            outcome = "成功" if call.success else "失败"
+            tokens = []
+            if call.prompt_tokens is not None:
+                tokens.append(f"输入 {call.prompt_tokens}")
+            if call.completion_tokens is not None:
+                tokens.append(f"输出 {call.completion_tokens}")
+            token_text = " · Token " + "/".join(tokens) if tokens else ""
+            detail = call.error_stage or call.finish_reason or "未记录结束原因"
+            st.markdown(
+                f"- {call.node} 第 {call.attempt} 次：{outcome} · {detail}{token_text}"
+            )
+            if call.recovery_action:
+                st.caption(f"恢复动作：{call.recovery_action}")
+
+
+def _render_tag_line(label: str, values: tuple[str, ...]) -> None:
+    """把短列表统一渲染成单行，空列表不制造视觉噪声。"""
+    if values:
+        translated = tuple(_TARGET_LABELS.get(item, item) for item in values)
+        st.markdown(f"{label}：" + "、".join(translated))
+
+
+def _audit_status_message(audit: AgenticAuditSnapshot) -> tuple[str, str]:
+    """将终止原因转换成稳定的用户提示和严重级别。"""
+    reason = _STOP_REASON_MESSAGES.get(
+        audit.stop_reason,
+        "研究任务已经结束，可展开查看本轮完成的步骤和证据。",
+    )
+    if audit.run_status == "completed":
+        return f"研究任务已完成。{reason}", "success"
+    if audit.run_status in {"partial", "needs_clarification", "no_evidence"}:
+        return f"研究任务未完全覆盖问题。{reason}", "warning"
+    return f"研究任务未能完成。{reason}", "error"
+
+
+_STOP_REASON_MESSAGES = {
+    "agent_finished": "Agent 已完成证据收集和回答生成。",
+    "budget_exhausted": "已达到本轮迭代、工具或查询预算，现有结果可能只是部分回答。",
+    "scope_unresolved": "尚未确定需要研究的论文范围，请补充论文名称或选择论文。",
+    "no_available_actions": "现有信息下已没有新的安全检索动作。",
+    "invalid_action_limit": "Planner 连续产生无效动作，系统已停止以避免重复调用。",
+    "fatal_error": "运行时发生不可恢复错误，已保留完成的证据和步骤。",
+}
+
+_SCOPE_LABELS = {
+    "single_paper": "单篇论文",
+    "selected_papers": "指定论文",
+    "knowledge_base": "整个知识库",
+}
+
+_CANDIDATE_LABELS = {
+    "candidate": "候选论文",
+    "uncertain": "待验证论文",
+    "excluded": "已排除论文",
+}
+
+_PAPER_STATUS_LABELS = {
+    "unvisited": "尚未检索",
+    "candidate": "候选",
+    "positive": "已找到支持证据",
+    "no_support_found": "未找到支持证据",
+    "uncertain": "证据仍不确定",
+    "excluded": "已在元数据筛选阶段排除",
+}
+
+_TOOL_STATUS_LABELS = {
+    "ok": "成功",
+    "empty": "没有找到新证据",
+    "partial": "部分成功",
+    "error": "失败",
+    "unavailable": "不可用",
+}
+
+_RELATION_LABELS = {
+    "supports": "支持",
+    "contradicts": "反驳",
+    "background_only": "仅作背景",
+    "uncertain": "不确定",
+    "irrelevant": "无关",
+}
+
+_OWNERSHIP_LABELS = {
+    "this_paper": "本文工作",
+    "prior_work": "既有工作",
+    "general_background": "一般背景",
+    "unknown": "归属未知",
+}
+
+_TARGET_LABELS = {
+    "paper_own_fact": "论文本身事实",
+    "method": "方法",
+    "result": "结果",
+    "claim": "核心主张",
+    "prior_work": "相关工作",
+    "field_overview": "领域概览",
+    "reference": "参考文献",
+    "general": "一般信息",
+}
+
+_FILTER_REASON_LABELS = {
+    "below_relevance_threshold": "相关度低于阈值",
+    "duplicate_fingerprint": "证据内容重复",
+    "overlapping_source_window": "来源窗口高度重叠",
+    "table_fragment": "表格碎片信息不足",
+    "deprioritized_table_fragment": "表格碎片已降权",
+    "rescued_result_table": "结果表格保守保留",
+}
 
 
 def _render_evidence(
@@ -309,6 +598,10 @@ def _friendly_error(error: Exception) -> str:
         return "当前会话不属于这个知识库，请新建会话后重试。"
     if "问题不能为空" in message:
         return "问题不能为空，请输入后再发送。"
+    if "暂停的研究任务" in message or "尚未完成" in message:
+        return "当前会话已有未完成的研究任务，请先继续或放弃恢复入口。"
+    if "Unknown research thread" in message or "没有可继续" in message:
+        return "研究检查点不存在或已经失效，可以放弃恢复入口后重新提问。"
     # 模型路径、SQLite 路径和供应商原始报错不进入主 UI，避免暴露工程内部信息。
     return "知识库服务暂时不可用，请稍后重试。"
 
@@ -473,6 +766,57 @@ def _render_chat_panel(
         unsafe_allow_html=True,
     )
     st.markdown("<div class='pb-chat-divider'></div>", unsafe_allow_html=True)
+    pending = None
+    if conversation_id:
+        try:
+            pending = service.get_pending_agentic_task(conversation_id)
+        except Exception as error:  # noqa: BLE001 - 恢复入口失败不阻塞历史阅读。
+            st.warning(f"暂时无法读取研究任务状态：{_friendly_error(error)}")
+    if pending is not None and conversation_id is not None:
+        status_label = {
+            "running": "上次运行可能意外中断",
+            "interrupted": "研究任务已暂停",
+            "recovering": "研究任务正在恢复",
+        }.get(pending.status, "研究任务尚未完成")
+        st.warning(f"{status_label}：{pending.user_query}")
+        resume_column, discard_column = st.columns(2)
+        with resume_column:
+            resume_clicked = st.button(
+                "从检查点继续",
+                type="primary",
+                use_container_width=True,
+                key=f"kb-resume-{pending.thread_id}",
+            )
+        with discard_column:
+            discard_clicked = st.button(
+                "放弃恢复入口",
+                type="secondary",
+                use_container_width=True,
+                key=f"kb-discard-{pending.thread_id}",
+            )
+        if resume_clicked:
+            try:
+                with st.status("正在恢复研究任务…", expanded=True) as progress:
+                    completed = False
+                    for event in service.resume_knowledge_base_agentic(conversation_id):
+                        progress.update(label=event.message)
+                        if event.kind == "completed":
+                            completed = True
+                    progress.update(
+                        label="研究任务已完成" if completed else "研究任务再次暂停",
+                        state="complete" if completed else "error",
+                    )
+            except Exception as error:  # noqa: BLE001 - 保留恢复入口供再次处理。
+                st.error(_friendly_error(error))
+            else:
+                st.rerun()
+        if discard_clicked:
+            try:
+                service.discard_pending_agentic_task(conversation_id)
+            except Exception as error:  # noqa: BLE001 - 不泄漏 checkpoint 路径。
+                st.error(_friendly_error(error))
+            else:
+                st.rerun()
     # 只保留 Streamlit 原生 height container 作为唯一的消息滚动层。
     with st.container(height=640, border=False, key="kb-message-scroll"):
         if conversation_id:
@@ -494,14 +838,14 @@ def _render_chat_panel(
                 "向知识库提问",
                 placeholder="向知识库提问，例如：ESDTW 和 DTW 有什么区别？",
                 label_visibility="collapsed",
-                disabled=conversation_id is None,
+                disabled=conversation_id is None or pending is not None,
             )
         with send_column:
             submitted = st.form_submit_button(
                 "➤",
                 type="primary",
                 use_container_width=True,
-                disabled=conversation_id is None,
+                disabled=conversation_id is None or pending is not None,
             )
     if submitted and query.strip() and conversation_id:
         try:

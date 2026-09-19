@@ -23,6 +23,7 @@ import sqlite3
 # workspace 仍然只由后端写入配置指定的 storage/staging。
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Iterator
+from uuid import uuid4
 
 # AppSettings 是后端统一配置模型，load_settings 读取项目 config.yaml。
 from paperbase.config import AppSettings, load_settings
@@ -34,6 +35,7 @@ from paperbase.conversations import (
     ConversationRecord,
     ConversationStore,
     ConversationTurn,
+    PendingAgenticTask,
 )
 from paperbase.generation import AnswerServiceResult, create_answer_service
 from paperbase.agentic.audit import (
@@ -667,19 +669,101 @@ class PaperBaseService:
     ) -> "Iterator[ResearchProgressEvent]":
         """流式执行 Agentic Research；完成事件发出前先持久化会话回合。"""
         normalized_query = self._validate_kb_agentic_request(query, conversation_id)
-        for event in self._get_agentic_service().stream_research(
-            normalized_query,
-            selected_paper_ids=selected_paper_ids,
-            knowledge_base_all=knowledge_base_all,
-            thread_id=thread_id,
-        ):
-            if event.kind == "completed" and event.result is not None:
-                self._persist_agentic_turn(
-                    conversation_id=conversation_id,
-                    query=normalized_query,
-                    result=event.result,
-                )
-            yield event
+        existing = self._conversations.get_pending_agentic_task(conversation_id)
+        resolved_thread_id = thread_id or f"research_{uuid4().hex}"
+        if existing is not None and existing.thread_id != resolved_thread_id:
+            raise RuntimeError("当前会话已有暂停的研究任务，请先继续或放弃该任务。")
+        self._conversations.upsert_pending_agentic_task(
+            conversation_id,
+            thread_id=resolved_thread_id,
+            user_query=normalized_query,
+            status="running",
+        )
+        try:
+            for event in self._get_agentic_service().stream_research(
+                normalized_query,
+                selected_paper_ids=selected_paper_ids,
+                knowledge_base_all=knowledge_base_all,
+                thread_id=resolved_thread_id,
+            ):
+                if event.kind == "completed" and event.result is not None:
+                    self._persist_agentic_turn(
+                        conversation_id=conversation_id,
+                        query=normalized_query,
+                        result=event.result,
+                    )
+                elif event.kind == "interrupted":
+                    self._conversations.upsert_pending_agentic_task(
+                        conversation_id,
+                        thread_id=resolved_thread_id,
+                        user_query=normalized_query,
+                        status="interrupted",
+                    )
+                yield event
+        except Exception:
+            self._conversations.upsert_pending_agentic_task(
+                conversation_id,
+                thread_id=resolved_thread_id,
+                user_query=normalized_query,
+                status="interrupted",
+            )
+            raise
+
+    def get_pending_agentic_task(
+        self, conversation_id: str
+    ) -> PendingAgenticTask | None:
+        """读取当前会话可继续的 Agentic 任务。"""
+        self._validate_kb_conversation(conversation_id)
+        return self._conversations.get_pending_agentic_task(conversation_id)
+
+    def resume_knowledge_base_agentic(
+        self, conversation_id: str
+    ) -> "Iterator[ResearchProgressEvent]":
+        """从原 checkpoint 继续待完成任务，完成后原子生成正式回合。"""
+        self._validate_kb_conversation(conversation_id)
+        pending = self._conversations.get_pending_agentic_task(conversation_id)
+        if pending is None:
+            raise RuntimeError("当前会话没有可继续的研究任务。")
+        self._conversations.upsert_pending_agentic_task(
+            conversation_id,
+            thread_id=pending.thread_id,
+            user_query=pending.user_query,
+            status="recovering",
+        )
+        try:
+            for event in self._get_agentic_service().resume_stream(pending.thread_id):
+                if event.kind == "completed" and event.result is not None:
+                    self._persist_agentic_turn(
+                        conversation_id=conversation_id,
+                        query=pending.user_query,
+                        result=event.result,
+                    )
+                elif event.kind == "interrupted":
+                    self._conversations.upsert_pending_agentic_task(
+                        conversation_id,
+                        thread_id=pending.thread_id,
+                        user_query=pending.user_query,
+                        status="interrupted",
+                    )
+                yield event
+        except Exception:
+            self._conversations.upsert_pending_agentic_task(
+                conversation_id,
+                thread_id=pending.thread_id,
+                user_query=pending.user_query,
+                status="interrupted",
+            )
+            raise
+
+    def discard_pending_agentic_task(self, conversation_id: str) -> None:
+        """放弃失效的恢复入口；只删会话链接，不删除 LangGraph checkpoint。"""
+        self._validate_kb_conversation(conversation_id)
+        pending = self._conversations.get_pending_agentic_task(conversation_id)
+        if pending is not None:
+            self._conversations.delete_pending_agentic_task(
+                conversation_id,
+                thread_id=pending.thread_id,
+            )
 
     def get_answer_evidence(self, result: AnswerServiceResult) -> tuple[KnowledgeBaseEvidence, ...]:
         """把本轮后端 Evidence 转成页面视图模型，不暴露内部 chunk 字段。"""
@@ -890,12 +974,16 @@ class PaperBaseService:
         normalized_query = " ".join(query.split())
         if not normalized_query:
             raise ValueError("问题不能为空。")
+        self._validate_kb_conversation(conversation_id)
+        return normalized_query
+
+    def _validate_kb_conversation(self, conversation_id: str) -> None:
+        """统一验证正式知识库会话边界。"""
         self._conversations.get_conversation(
             conversation_id,
             expected_scope_type="knowledge_base",
             expected_scope_id=FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
         )
-        return normalized_query
 
     def _persist_agentic_turn(
         self,
@@ -933,6 +1021,7 @@ class PaperBaseService:
             resolution_status=answer.status,
             evidence_json=evidence_json,
             audit_json=audit_snapshot.to_json(),
+            finalize_agentic_thread_id=result.thread_id,
         )
         payload = {
             "conversation_id": conversation_id,

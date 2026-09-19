@@ -70,6 +70,9 @@ def test_audit_snapshot_round_trip_and_redacts_internal_fields() -> None:
             accepted_candidates=1,
             rejected_candidates=1,
             deprioritized_candidates=0,
+            decisions=(
+                SimpleNamespace(reasons=("below_relevance_threshold",)),
+            ),
         ),
         evidence_analysis_cache=SimpleNamespace(hits=0, misses=1, writes=1, errors=0),
         error_codes=(),
@@ -135,6 +138,7 @@ def test_audit_snapshot_round_trip_and_redacts_internal_fields() -> None:
     assert restored.schema_version == AUDIT_SCHEMA_VERSION
     assert restored.candidates[1].title == "无关论文 B"
     assert restored.steps[0].attempts[0].query == "paper A forecasting method"
+    assert restored.steps[0].filter_reasons[0].reason == "below_relevance_threshold"
     assert restored.evidence[0].claims[0].ownership == "this_paper"
     for forbidden in (
         "system_prompt",
