@@ -19,7 +19,7 @@ from paperbase.agentic.contracts import (
     ResearchSubtask,
     ScopeSource,
 )
-from paperbase.agentic.decision import DecisionState, _state_prompt
+from paperbase.agentic.decision import DecisionState, _state_prompt, _visible_evidence
 from paperbase.agentic.evidence_analysis import LLMEvidenceAnalyzer
 from paperbase.agentic.selector import FinalEvidenceSelector
 from paperbase.retrieval.contracts import EvidenceSourceType, RetrievedEvidence
@@ -55,6 +55,70 @@ def _record(content: str = "Existing studies use ARIMA. We propose EMVE.") -> Ev
 
 
 class EvidenceAnalysisTests(unittest.TestCase):
+    def test_decision_visibility_prefers_relevance_and_paper_diversity(self) -> None:
+        context = QueryContext(
+            original_query="wind speed forecasting methods",
+            resolved_query="wind speed forecasting methods",
+            semantic_query_en="wind speed forecasting methods",
+            lexical_keywords_en=("wind speed", "forecasting"),
+            intent=Intent.SYNTHESIZE,
+            scope=QueryScope.SELECTED_PAPERS,
+            target_paper_ids=("A", "B"),
+            scope_source=ScopeSource.UI_SELECTION,
+            retrieval_goal=ResearchGoal.SYNTHESIS_SUPPORT,
+            default_evidence_targets=frozenset({EvidenceTarget.METHOD}),
+        )
+        plan = ResearchPlan(
+            "synthesize",
+            (
+                ResearchSubtask(
+                    "S1",
+                    "collect evidence",
+                    ("A", "B"),
+                    frozenset({EvidenceTarget.METHOD}),
+                    "covered",
+                ),
+            ),
+        )
+
+        def analyzed(evidence_id: str, paper_id: str, text: str, score: float):
+            return EvidenceRecord(
+                evidence_id=evidence_id,
+                evidence=RetrievedEvidence(
+                    source_type=EvidenceSourceType.CONTENT,
+                    paper_id=paper_id,
+                    seed_chunk_ids=(evidence_id,),
+                    source_chunk_ids=(evidence_id,),
+                    content=text,
+                    score=score,
+                ),
+                supporting_queries=(text,),
+                first_seen_iteration=1,
+                last_seen_iteration=1,
+                analysis_status=EvidenceAnalysisStatus.QUALIFIED,
+                digest=text,
+                claims=(
+                    EvidenceClaim(
+                        f"{evidence_id}:C1",
+                        text,
+                        EvidenceRelation.SUPPORTS,
+                        EvidenceOwnership.THIS_PAPER,
+                        "直接相关",
+                        text,
+                    ),
+                ),
+            )
+
+        records = (
+            analyzed("E1", "A", "air pollution prediction", 1.0),
+            analyzed("E2", "A", "wind speed forecasting transformer", 0.8),
+            analyzed("E3", "B", "wind forecasting statistical method", 0.4),
+        )
+        visible = _visible_evidence(
+            DecisionState(context, plan, records, (), BudgetUsage()), limit=2
+        )
+        self.assertEqual([item.evidence_id for item in visible], ["E2", "E3"])
+
     def test_one_evidence_can_separate_prior_work_and_this_paper_claims(self) -> None:
         response = json.dumps(
             {

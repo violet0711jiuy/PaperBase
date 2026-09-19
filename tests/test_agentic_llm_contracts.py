@@ -79,6 +79,8 @@ class AgenticLLMContractTests(unittest.TestCase):
         self.assertEqual(decision, {"question": "compare"})
         self.assertIn("绝不能增加、删除", QUERY_UNDERSTANDING_SYSTEM_PROMPT)
         self.assertIn("不要选择 Tool", RESEARCH_PLANNER_SYSTEM_PROMPT)
+        self.assertIn("绝不能超过 3 个", RESEARCH_PLANNER_SYSTEM_PROMPT)
+        self.assertIn("不要提前枚举具体方法类别", RESEARCH_PLANNER_SYSTEM_PROMPT)
         for action_name in (
             "search_papers",
             "search_knowledge_base",

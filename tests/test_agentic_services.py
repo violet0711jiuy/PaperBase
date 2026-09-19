@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from paperbase.agentic.contracts import (
@@ -39,6 +40,17 @@ class _CatalogDatabase:
 class _InvalidJSONClient:
     def complete_json(self, **kwargs):
         return "{not-json"
+
+
+class _OverplannedClient:
+    def complete_json(self, **kwargs):
+        task = {
+            "goal": "预设一个具体方法类别",
+            "target_paper_ids": ["paper_a"],
+            "evidence_targets": ["method"],
+            "success_criteria": "找到证据",
+        }
+        return json.dumps({"goal": "过度规划", "subtasks": [task] * 4})
 
 
 class AgenticServiceTests(unittest.TestCase):
@@ -95,9 +107,23 @@ class AgenticServiceTests(unittest.TestCase):
             frozenset({EvidenceTarget.METHOD}),
         )
         planned = ResearchPlanner().plan(understood.context)
-        self.assertEqual(planned.plan.subtasks[0].target_paper_ids, ("paper_a",))
-        self.assertEqual(planned.plan.subtasks[1].target_paper_ids, ("paper_b",))
-        self.assertEqual(planned.plan.subtasks[2].target_paper_ids, ("paper_a", "paper_b"))
+        self.assertEqual(len(planned.plan.subtasks), 2)
+        self.assertEqual(
+            planned.plan.subtasks[0].target_paper_ids, ("paper_a", "paper_b")
+        )
+        self.assertEqual(
+            planned.plan.subtasks[1].target_paper_ids, ("paper_a", "paper_b")
+        )
+
+    def test_overplanned_llm_output_falls_back_to_two_compact_tasks(self) -> None:
+        resolution = self.resolver.resolve("paper_a 的方法是什么？")
+        context = QueryUnderstandingService().understand(
+            "paper_a 的方法是什么？", resolution
+        ).context
+        planned = ResearchPlanner(_OverplannedClient()).plan(context)
+        self.assertTrue(planned.used_fallback)
+        self.assertEqual(len(planned.plan.subtasks), 2)
+        self.assertNotIn("具体方法类别", planned.plan.subtasks[0].goal)
 
     def test_invalid_llm_output_falls_back_without_changing_scope(self) -> None:
         resolution = self.resolver.resolve("paper_a 的方法是什么？")

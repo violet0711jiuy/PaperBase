@@ -104,58 +104,85 @@ class LLMCandidateSelector:
         metadata_source: PaperMetadataSource,
         *,
         max_attempts: int = 2,
+        batch_size: int = 12,
     ) -> None:
+        if max_attempts < 1 or batch_size < 1:
+            raise ValueError("Candidate Selection limits must be positive.")
         self._client = client
         self._metadata_source = metadata_source
         self._max_attempts = max_attempts
+        self._batch_size = batch_size
 
     def select(
         self, *, question: str, snapshot: CorpusScopeSnapshot
     ) -> CandidateSelectionResult:
         metadata = self._metadata_source.get_many(snapshot.paper_ids)
-        errors: list[str] = []
-        for attempt in range(1, self._max_attempts + 1):
-            try:
-                raw = self._client.complete_json(
-                    system_prompt=CANDIDATE_SELECTION_SYSTEM_PROMPT,
-                    user_prompt=build_candidate_selection_user_prompt(
-                        {
-                            "question": question,
-                            "scope_snapshot_id": snapshot.snapshot_id,
-                            "papers": [item.__dict__ for item in metadata],
-                            "previous_validation_errors": errors[-1:],
-                        }
-                    ),
-                    json_schema=CandidateSelectionDraft.model_json_schema(),
-                    schema_name="paperbase_candidate_selection",
-                )
-                draft = CandidateSelectionDraft.model_validate_json(raw)
-                selection = _validate_and_build(snapshot, draft)
-                return CandidateSelectionResult(selection, attempt)
-            except Exception as error:
-                errors.append(f"{type(error).__name__}: {error}")
-        fallback = CandidateSelection(
-            scope_paper_ids=snapshot.paper_ids,
-            assessments=tuple(
+        if not metadata:
+            return CandidateSelectionResult(CandidateSelection((), ()), 0)
+        assessments: list[CandidateAssessment] = []
+        llm_calls = 0
+        used_fallback = False
+        for offset in range(0, len(metadata), self._batch_size):
+            batch = metadata[offset : offset + self._batch_size]
+            expected_ids = tuple(item.paper_id for item in batch)
+            errors: list[str] = []
+            accepted: CandidateSelection | None = None
+            for _attempt in range(self._max_attempts):
+                llm_calls += 1
+                try:
+                    raw = self._client.complete_json(
+                        system_prompt=CANDIDATE_SELECTION_SYSTEM_PROMPT,
+                        user_prompt=build_candidate_selection_user_prompt(
+                            {
+                                "question": question,
+                                "scope_snapshot_id": snapshot.snapshot_id,
+                                "papers": [item.__dict__ for item in batch],
+                                "previous_validation_errors": errors[-1:],
+                            }
+                        ),
+                        json_schema=CandidateSelectionDraft.model_json_schema(),
+                        schema_name="paperbase_candidate_selection",
+                    )
+                    draft = CandidateSelectionDraft.model_validate_json(raw)
+                    accepted = _validate_and_build(expected_ids, draft)
+                    break
+                except Exception as error:
+                    errors.append(f"{type(error).__name__}: {error}")
+            if accepted is not None:
+                assessments.extend(accepted.assessments)
+                continue
+            used_fallback = True
+            assessments.extend(
                 CandidateAssessment(
                     paper_id,
                     CandidateDisposition.UNCERTAIN,
                     "元数据筛选失败，保守进入一次浅层正文验证。",
                 )
-                for paper_id in snapshot.paper_ids
-            ),
+                for paper_id in expected_ids
+            )
+        selection = CandidateSelection(
+            scope_paper_ids=snapshot.paper_ids,
+            assessments=tuple(assessments),
         )
-        return CandidateSelectionResult(fallback, self._max_attempts, True)
+        return CandidateSelectionResult(selection, llm_calls, used_fallback)
 
 
 def _validate_and_build(
-    snapshot: CorpusScopeSnapshot, draft: CandidateSelectionDraft
+    expected_ids: tuple[str, ...], draft: CandidateSelectionDraft
 ) -> CandidateSelection:
+    draft_ids = [item.paper_id for item in draft.assessments]
+    if len(draft_ids) != len(set(draft_ids)) or set(draft_ids) != set(expected_ids):
+        raise ValueError("Candidate Selection 必须完整且不重复地返回输入 paper_id。")
+    by_id = {item.paper_id: item for item in draft.assessments}
     return CandidateSelection(
-        scope_paper_ids=snapshot.paper_ids,
+        scope_paper_ids=expected_ids,
         assessments=tuple(
-            CandidateAssessment(item.paper_id, item.disposition, item.reason)
-            for item in draft.assessments
+            CandidateAssessment(
+                paper_id,
+                by_id[paper_id].disposition,
+                by_id[paper_id].reason,
+            )
+            for paper_id in expected_ids
         ),
     )
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Protocol
 
 from paperbase.llm.client import ChatCompletionClient
@@ -151,7 +152,7 @@ def _to_action(draft: ActionDraft) -> AgentAction:
 
 def _state_prompt(state: DecisionState, errors: list[str]) -> str:
     # Decision 只读取 Evidence Analysis 产生的短摘要与 Claim；完整原文保留在 Registry。
-    visible_evidence = _visible_evidence(state.evidence)
+    visible_evidence = _visible_evidence(state)
     summary = {
         "question": state.context.resolved_query,
         "scope": state.context.scope.value,
@@ -259,25 +260,55 @@ def _validate_action_references(action: AgentAction, state: DecisionState) -> No
 
 
 def _visible_evidence(
-    evidence: tuple[EvidenceRecord, ...], *, limit: int = 12
+    state: DecisionState, *, limit: int = 12
 ) -> tuple[EvidenceRecord, ...]:
-    """优先给 Decision 展示已分析、可支持结论且跨论文分布的短摘要。"""
-    ranked = sorted(
-        evidence,
-        key=lambda record: (
-            bool(record.claims),
-            any(
-                claim.relation.value in {"supports", "contradicts"}
-                for claim in record.claims
+    """按当前问题相关性排序，并先为每篇论文保留一个可见位置。"""
+    evidence = state.evidence
+    query_terms = _query_terms(state.context)
+    remaining_ids = set(state.coverage.remaining_paper_ids if state.coverage else ())
+
+    def rank(record: EvidenceRecord) -> tuple[float, ...]:
+        searchable = " ".join(
+            (
+                record.digest or "",
+                *(claim.statement for claim in record.claims),
+            )
+        ).casefold()
+        relevance = float(sum(term in searchable for term in query_terms))
+        return (
+            float(record.evidence.paper_id in remaining_ids),
+            relevance,
+            float(bool(record.claims)),
+            float(
+                any(
+                    claim.relation.value in {"supports", "contradicts"}
+                    for claim in record.claims
+                )
             ),
             record.evidence.score or 0.0,
-        ),
+        )
+
+    ranked = sorted(
+        evidence,
+        key=rank,
         reverse=True,
     )
     selected: list[EvidenceRecord] = []
     counts: dict[str, int] = {}
+    # 第一轮每篇只取最高相关的一条，避免 limit 较小时被单篇高分 Evidence 吞没。
     for record in ranked:
         paper_id = record.evidence.paper_id
+        if paper_id in counts:
+            continue
+        selected.append(record)
+        counts[paper_id] = 1
+        if len(selected) >= limit:
+            return tuple(selected)
+    # 第二轮再按全局相关性补齐，同时保留单篇上限。
+    for record in ranked:
+        paper_id = record.evidence.paper_id
+        if record in selected:
+            continue
         if counts.get(paper_id, 0) >= 3:
             continue
         selected.append(record)
@@ -285,3 +316,22 @@ def _visible_evidence(
         if len(selected) >= limit:
             break
     return tuple(selected)
+
+
+def _query_terms(context: QueryContext) -> tuple[str, ...]:
+    """提取轻量、确定性的中英文相关性词项，不额外调用模型。"""
+    values = [
+        context.resolved_query,
+        context.semantic_query_en or "",
+        *context.lexical_keywords_en,
+    ]
+    terms: list[str] = []
+    for value in values:
+        folded = value.casefold()
+        terms.extend(re.findall(r"[a-z0-9][a-z0-9_-]{1,}", folded))
+        for sequence in re.findall(r"[\u3400-\u9fff]+", folded):
+            terms.extend(
+                sequence[index : index + 2]
+                for index in range(max(0, len(sequence) - 1))
+            )
+    return tuple(dict.fromkeys(term for term in terms if len(term) >= 2))

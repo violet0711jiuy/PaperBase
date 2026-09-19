@@ -54,6 +54,8 @@ class ResearchPlanner:
 
 
 def _validate_and_build(draft: ResearchPlanDraft, context: QueryContext) -> ResearchPlan:
+    if len(draft.subtasks) > 3:
+        raise ValueError("Compact Planner 不能生成超过 3 个 Subtask。")
     allowed = set(context.target_paper_ids)
     tasks: list[ResearchSubtask] = []
     covered: set[str] = set()
@@ -80,36 +82,49 @@ def _validate_and_build(draft: ResearchPlanDraft, context: QueryContext) -> Rese
 
 
 def _fallback_plan(context: QueryContext) -> ResearchPlan:
-    tasks: list[ResearchSubtask] = []
+    targets = (
+        () if context.scope is QueryScope.KNOWLEDGE_BASE else context.target_paper_ids
+    )
     if context.scope is QueryScope.KNOWLEDGE_BASE:
-        tasks.append(
+        tasks = [
             ResearchSubtask(
                 subtask_id="S1",
-                goal="在冻结的知识库范围内寻找支持问题的论文证据",
+                goal="从已筛选的候选论文中逐篇收集与问题直接相关的证据",
                 target_paper_ids=(),
                 evidence_targets=context.default_evidence_targets,
-                success_criteria="获得至少一条与问题直接相关、可追溯到论文的证据",
-            )
-        )
+                success_criteria="每篇候选论文均已获得直接证据或形成可审计的未找到记录",
+            ),
+            ResearchSubtask(
+                subtask_id="S2",
+                goal="合并证据并检查候选覆盖、归属与信息缺口",
+                target_paper_ids=(),
+                evidence_targets=context.default_evidence_targets,
+                success_criteria="结论能够说明已覆盖候选、排除范围和剩余不确定性",
+            ),
+        ]
     else:
-        for index, paper_id in enumerate(context.target_paper_ids, start=1):
-            tasks.append(
-                ResearchSubtask(
-                    subtask_id=f"S{index}",
-                    goal=f"检索论文 {paper_id} 中与问题相关的证据",
-                    target_paper_ids=(paper_id,),
-                    evidence_targets=context.default_evidence_targets,
-                    success_criteria=f"为论文 {paper_id} 获得可追溯的直接证据",
-                )
-            )
-        if context.intent is Intent.COMPARE:
-            tasks.append(
-                ResearchSubtask(
-                    subtask_id=f"S{len(tasks) + 1}",
-                    goal="检查各论文证据是否覆盖共同的比较维度",
-                    target_paper_ids=context.target_paper_ids,
-                    evidence_targets=context.default_evidence_targets,
-                    success_criteria="每篇目标论文均有足以支撑比较的证据",
-                )
-            )
+        tasks = [
+            ResearchSubtask(
+                subtask_id="S1",
+                goal="逐篇收集与问题直接相关且可归属的论文证据",
+                target_paper_ids=targets,
+                evidence_targets=context.default_evidence_targets,
+                success_criteria="每篇目标论文均获得直接证据或可审计的未找到记录",
+            ),
+            ResearchSubtask(
+                subtask_id="S2",
+                goal=(
+                    "按共同维度比较各论文证据并检查信息缺口"
+                    if context.intent is Intent.COMPARE
+                    else "核对证据归属、覆盖范围与尚缺信息"
+                ),
+                target_paper_ids=targets,
+                evidence_targets=context.default_evidence_targets,
+                success_criteria=(
+                    "共同点、差异和证据缺口均能追溯到对应论文"
+                    if context.intent is Intent.COMPARE
+                    else "回答边界与证据支持范围清晰可审计"
+                ),
+            ),
+        ]
     return ResearchPlan(goal=context.resolved_query, subtasks=tuple(tasks))

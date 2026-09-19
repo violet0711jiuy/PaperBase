@@ -36,10 +36,37 @@ def _response(*assessments):
 
 
 class CandidateSelectionTests(unittest.TestCase):
+    def test_large_scope_is_processed_in_bounded_batches(self) -> None:
+        client = _QueuedClient(
+            (
+                _response(
+                    {"paper_id": "A", "disposition": "candidate", "reason": "相关"},
+                    {"paper_id": "B", "disposition": "excluded", "reason": "无关"},
+                ),
+                _response(
+                    {"paper_id": "C", "disposition": "uncertain", "reason": "不足"}
+                ),
+            )
+        )
+        result = LLMCandidateSelector(
+            client, _MetadataSource(), batch_size=2
+        ).select(
+            question="风速预测",
+            snapshot=CorpusScopeSnapshot.create(("A", "B", "C")),
+        )
+        self.assertEqual(result.llm_calls, 2)
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(result.selection.screened_paper_ids, ("A", "B", "C"))
+
     def test_selector_returns_complete_mutually_exclusive_partition(self) -> None:
         client = _QueuedClient(
             (
                 _response(
+                    {
+                        "paper_id": "C",
+                        "disposition": "uncertain",
+                        "reason": "元数据不足",
+                    },
                     {
                         "paper_id": "A",
                         "disposition": "candidate",
@@ -49,11 +76,6 @@ class CandidateSelectionTests(unittest.TestCase):
                         "paper_id": "B",
                         "disposition": "excluded",
                         "reason": "研究空气污染",
-                    },
-                    {
-                        "paper_id": "C",
-                        "disposition": "uncertain",
-                        "reason": "元数据不足",
                     },
                 ),
             )
@@ -65,6 +87,7 @@ class CandidateSelectionTests(unittest.TestCase):
         self.assertEqual(result.selection.candidate_paper_ids, ("A",))
         self.assertEqual(result.selection.uncertain_paper_ids, ("C",))
         self.assertEqual(result.selection.excluded_paper_ids, ("B",))
+        self.assertEqual(result.selection.screened_paper_ids, ("A", "B", "C"))
         self.assertFalse(result.used_fallback)
         prompt = json.loads(client.calls[0]["user_prompt"])
         self.assertEqual(

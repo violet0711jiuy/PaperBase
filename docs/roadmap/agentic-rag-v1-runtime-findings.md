@@ -1,6 +1,6 @@
 # Agentic RAG v1 真实运行发现与修订计划
 
-> 状态：`P0_IMPLEMENTED / P1-P4_PLANNED`
+> 状态：`P0-P1_IMPLEMENTED / P2-P4_PLANNED`
 > 记录日期：2026-09-19
 > 文档性质：Phase 4 首个真实闭环后的问题记录、架构修订建议与实施优先级。
 > 基线关系：本文不直接覆盖《Agentic RAG v1 冻结架构》；涉及冻结语义的修改，应在实现前形成明确契约和迁移测试。
@@ -337,6 +337,8 @@ Answer Generator 应接收 Claim、Relation、Ownership 和原始 Evidence 映�
 
 ### P1：检索范围与规划质量
 
+> 实施状态：`COMPLETED`（2026-09-19）。
+
 1. 增加 Candidate Selection 条件必经节点。
 2. Coverage 改为“全库元数据覆盖 + 候选正文覆盖”。
 3. Planner 压缩为 2～3 个证据收集任务。
@@ -406,6 +408,37 @@ Commit 12 UI 审计展示、契约测试与全量回归
 - Evidence Analysis 在 Coverage 前完成并可跨 checkpoint 恢复。
 
 全量验证结果：`275 passed, 15 subtests passed`。
+
+### 8.0.1 P1 实施记录（2026-09-19）
+
+本轮已完成 P1 的四项修复：
+
+- `knowledge_base` Scope 在 Query Understanding 后条件必经 `select_candidates` 节点；显式选择
+  的单篇/多篇论文保持用户可信选择，不被自动筛掉；
+- Candidate Selector 使用标题、摘要、关键词和已有正式 Overview，输出完整、互斥的
+  `candidate / uncertain / excluded` 分区；无效输出保守回退为 `uncertain`；
+- Candidate Selection 按 12 篇一批有界执行，避免知识库扩大后产生无界 Prompt；
+- Guard 在筛选后锁定 Candidate Scope，禁止重新执行全库检索绕过，也禁止对 `excluded`
+  论文执行正文、章节、参考文献或 Overview 动作；
+- Coverage 显式区分 `scope / screened / candidate / uncertain / excluded / verified`；
+  穷举问题的完成条件改为全 Scope 已筛选且 candidate/uncertain 已验证；
+- `uncertain` 论文只要求一次浅层正文验证，避免和高置信 Candidate 一样反复深查；
+- Planner Prompt 要求 2～3 个证据收集任务，本地拒绝超过 3 个的模型计划，Schema 上限收紧为 4；
+- fallback Planner 不再按论文数量或预设方法类别膨胀，而是稳定生成“收集证据 + 检查缺口/综合”两步计划；
+- Decision Evidence 可见性改为问题词项相关性排序，并先为每篇论文保留一条，再按全局相关性
+  和单篇上限补齐，避免高分单篇吞没多论文上下文。
+
+新增回归覆盖：
+
+- Candidate 分区完整性、重复/越界 ID 拒绝和保守回退；
+- 大 Scope 有界批处理；
+- Candidate Selection checkpoint 往返；
+- `excluded` 论文无法到达 Tool Executor；
+- 全库筛选覆盖、Candidate 正文验证与 Uncertain 浅验证；
+- Planner 过度展开时自动回退到 Compact Plan；
+- Evidence 可见性的相关性优先和跨论文多样性。
+
+P1 完成后的全量验证结果：`284 passed, 15 subtests passed`。
 
 ### 8.1 全库方法归纳
 
