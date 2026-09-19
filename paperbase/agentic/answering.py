@@ -39,6 +39,7 @@ def generate_agentic_answer(
         insufficient_evidence=outcome.insufficient_evidence,
         partial_answer=outcome.partial_answer,
         coverage_note=outcome.coverage_note,
+        llm_diagnostics=outcome.llm_diagnostics,
     )
 
 

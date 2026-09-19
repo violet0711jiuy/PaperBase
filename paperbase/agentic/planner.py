@@ -6,13 +6,27 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from paperbase.llm.client import ChatCompletionClient, LLMRequestError
+from paperbase.llm.client import (
+    ChatCompletionClient,
+    LLMCompletion,
+    LLMRequestError,
+    complete_json_with_diagnostics,
+)
 from paperbase.prompts.agentic_planner import (
     RESEARCH_PLANNER_SYSTEM_PROMPT,
     build_research_planner_user_prompt,
 )
 
-from .contracts import EvidenceTarget, Intent, QueryContext, QueryScope, ResearchPlan, ResearchSubtask
+from .contracts import (
+    EvidenceTarget,
+    Intent,
+    LLMCallRecord,
+    QueryContext,
+    QueryScope,
+    ResearchPlan,
+    ResearchSubtask,
+)
+from paperbase.llm.diagnostics import failure_record, success_record
 from .schemas import ResearchPlanDraft
 
 
@@ -21,6 +35,7 @@ class PlannerResult:
     plan: ResearchPlan
     used_fallback: bool
     llm_calls: int
+    llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
 
 class ResearchPlanner:
@@ -31,8 +46,10 @@ class ResearchPlanner:
         fallback = _fallback_plan(context)
         if self._client is None:
             return PlannerResult(fallback, True, 0)
+        completion: LLMCompletion | None = None
         try:
-            raw = self._client.complete_json(
+            completion = complete_json_with_diagnostics(
+                self._client,
                 system_prompt=RESEARCH_PLANNER_SYSTEM_PROMPT,
                 user_prompt=build_research_planner_user_prompt(
                     question=context.resolved_query,
@@ -46,11 +63,29 @@ class ResearchPlanner:
                 json_schema=ResearchPlanDraft.model_json_schema(),
                 schema_name="paperbase_research_plan",
             )
-            draft = ResearchPlanDraft.model_validate_json(raw)
+            draft = ResearchPlanDraft.model_validate_json(completion.content)
             plan = _validate_and_build(draft, context)
-            return PlannerResult(plan, False, 1)
-        except (LLMRequestError, ValidationError, ValueError, TypeError):
-            return PlannerResult(fallback, True, 1)
+            return PlannerResult(
+                plan,
+                False,
+                1,
+                (success_record(node="build_plan", attempt=1, completion=completion),),
+            )
+        except (LLMRequestError, ValidationError, ValueError, TypeError) as error:
+            return PlannerResult(
+                fallback,
+                True,
+                1,
+                (
+                    failure_record(
+                        node="build_plan",
+                        attempt=1,
+                        error=error,
+                        completion=completion,
+                        can_retry=False,
+                    ),
+                ),
+            )
 
 
 def _validate_and_build(draft: ResearchPlanDraft, context: QueryContext) -> ResearchPlan:

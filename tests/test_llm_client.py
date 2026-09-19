@@ -9,18 +9,29 @@ from paperbase.llm.client import (
     LLMRequestError,
     LLMRuntimeSettings,
     OpenAICompatibleChatClient,
+    _extract_non_stream_completion,
     _extract_non_stream_content,
 )
 
 
-def _response(content: str | None) -> SimpleNamespace:
+def _response(
+    content: str | None,
+    *,
+    finish_reason: str = "stop",
+    reasoning_content: str = "内部推理",
+) -> SimpleNamespace:
     """构造最小非流式响应替身；额外 reasoning_content 不应被业务代码读取。"""
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
-                message=SimpleNamespace(content=content, reasoning_content="内部推理")
+                message=SimpleNamespace(
+                    content=content,
+                    reasoning_content=reasoning_content,
+                ),
+                finish_reason=finish_reason,
             )
-        ]
+        ],
+        usage=SimpleNamespace(prompt_tokens=17, completion_tokens=23),
     )
 
 
@@ -36,8 +47,24 @@ class NonStreamExtractionTests(unittest.TestCase):
             _extract_non_stream_content(SimpleNamespace(choices=[]))
 
     def test_rejects_response_without_final_content(self) -> None:
-        with self.assertRaisesRegex(LLMRequestError, "no final text"):
-            _extract_non_stream_content(_response(None))
+        with self.assertRaisesRegex(LLMRequestError, "no final text") as raised:
+            _extract_non_stream_content(
+                _response(None, finish_reason="length", reasoning_content="推理用完预算")
+            )
+        self.assertEqual(raised.exception.error_stage, "empty_content")
+        self.assertEqual(raised.exception.finish_reason, "length")
+        self.assertEqual(raised.exception.prompt_tokens, 17)
+        self.assertEqual(raised.exception.completion_tokens, 23)
+        self.assertEqual(raised.exception.reasoning_chars, 6)
+
+    def test_completion_exposes_safe_metrics_without_reasoning_text(self) -> None:
+        completion = _extract_non_stream_completion(
+            _response('{"ok": true}', reasoning_content="不应持久化的推理")
+        )
+        self.assertEqual(completion.content_chars, 12)
+        self.assertEqual(completion.reasoning_chars, 8)
+        self.assertEqual(completion.finish_reason, "stop")
+        self.assertFalse(hasattr(completion, "reasoning_content"))
 
     def test_json_object_mode_injects_schema_and_keeps_local_validation_contract(self) -> None:
         completions = _FakeCompletions()

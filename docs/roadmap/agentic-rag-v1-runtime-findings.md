@@ -1,6 +1,6 @@
 # Agentic RAG v1 真实运行发现与修订计划
 
-> 状态：`P0-P1_IMPLEMENTED / P2-P4_PLANNED`
+> 状态：`P0-P2_IMPLEMENTED / P3-P4_PLANNED`
 > 记录日期：2026-09-19
 > 文档性质：Phase 4 首个真实闭环后的问题记录、架构修订建议与实施优先级。
 > 基线关系：本文不直接覆盖《Agentic RAG v1 冻结架构》；涉及冻结语义的修改，应在实现前形成明确契约和迁移测试。
@@ -346,6 +346,8 @@ Answer Generator 应接收 Claim、Relation、Ownership 和原始 Evidence 映�
 
 ### P2：稳定性与诊断
 
+> 实施状态：`COMPLETED`（2026-09-19）。
+
 1. 增加节点级 token 配置。
 2. 持久化安全调用统计和错误阶段。
 3. 根据错误类型选择缩短上下文、提高预算或结构修复，避免无差别重复同一请求。
@@ -439,6 +441,38 @@ Commit 12 UI 审计展示、契约测试与全量回归
 - Evidence 可见性的相关性优先和跨论文多样性。
 
 P1 完成后的全量验证结果：`284 passed, 15 subtests passed`。
+
+### 8.0.2 P2 实施记录（2026-09-19）
+
+本轮完成了 P2 的稳定性与诊断闭环：
+
+- `OpenAICompatibleChatClient` 在保留旧 `complete_json() -> str` 契约的同时，新增带
+  `finish_reason`、usage、最终内容字符数和隐藏推理字符数的诊断调用；隐藏推理正文、
+  Prompt 和 API Key 均不会进入诊断对象；
+- Query Understanding、Planner、Candidate Selection、Decision、Evidence Analysis 和
+  Answer 分别使用 1000、1400、2400、2400、3000、4000 的节点级输出预算；这些视图
+  复用同一个 SDK 连接池，不影响现有测试替身和替代 Provider；
+- `LLMCallRecord` 随 LangGraph state 进入 checkpoint，并最终汇总到
+  `ResearchRunResult.llm_diagnostics`；记录包含节点、尝试次数、token/字符数、错误阶段、
+  恢复动作，以及不含 `input_value` 的 ValidationError 类型/字段路径；
+- 错误阶段已区分 `request_error`、`empty_content`、`invalid_json`、`schema_validation`、
+  `domain_validation` 和 `guard_rejection`；
+- `empty_content + finish_reason=length` 不再原样重试：Candidate Selection 缩短元数据可选
+  字段，Decision 将可见 Evidence 上限从 12 降到 6，Evidence Analysis 将单条正文长度减半；
+- 非法 JSON/Schema 输出使用结构修复提示，完整性、越界 ID 和原文锚点等领域错误使用领域
+  修复提示；提示只回灌错误类别，不回灌可能包含外部响应的原始异常；
+- Guard 拒绝被单独记录为 `guard_rejection`，与模型请求或 Schema 失败明确分离。
+
+新增回归覆盖：
+
+- DeepSeek 式“隐藏推理耗尽预算、`finish_reason=length`、最终 content 为空”的失败路径；
+- length 恢复后第二次 Prompt 的 Evidence/正文确实缩短，而非相同参数重复请求；
+- `invalid_json` 与 `domain_validation` 分别进入结构修复和领域修复；
+- 安全诊断跨 checkpoint 到最终结果，且不含 content 或 reasoning text；
+- 生产工厂为六个 LLM 节点装配正确的独立输出预算；
+- Coverage/Scope Guard 拒绝形成独立的 `guard_rejection` 记录。
+
+P2 完成后的全量验证结果：`291 passed, 15 subtests passed`。
 
 ### 8.1 全库方法归纳
 

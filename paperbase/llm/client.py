@@ -16,7 +16,74 @@ class LLMConfigurationError(RuntimeError):
 
 
 class LLMRequestError(RuntimeError):
-    """远程 LLM 调用超时、失败或返回空文本时抛出，可由检索层安全降级。"""
+    """LLM 调用失败；只携带可持久化的安全诊断，不保存请求或响应正文。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_stage: str = "request_error",
+        finish_reason: str | None = None,
+        prompt_tokens: int | None = None,
+        completion_tokens: int | None = None,
+        content_chars: int = 0,
+        reasoning_chars: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.error_stage = error_stage
+        self.finish_reason = finish_reason
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.content_chars = content_chars
+        self.reasoning_chars = reasoning_chars
+
+
+@dataclass(frozen=True)
+class LLMCompletion:
+    """一次非流式补全及其安全元数据；正文只在当前调用栈中使用。"""
+
+    content: str
+    finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    reasoning_chars: int = 0
+
+    @property
+    def content_chars(self) -> int:
+        return len(self.content)
+
+
+@dataclass(frozen=True)
+class LLMCallRecord:
+    """可安全持久化的调用诊断，不包含提示词、正文或隐藏推理。"""
+
+    node: str
+    attempt: int
+    success: bool
+    finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    content_chars: int = 0
+    reasoning_chars: int = 0
+    error_stage: str | None = None
+    recovery_action: str | None = None
+    validation_summary: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.node, str) or not self.node.strip():
+            raise ValueError("node must be a non-empty string.")
+        object.__setattr__(self, "node", " ".join(self.node.split()))
+        if self.attempt < 1:
+            raise ValueError("attempt must be positive.")
+        for name in (
+            "prompt_tokens",
+            "completion_tokens",
+            "content_chars",
+            "reasoning_chars",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must not be negative.")
 
 
 @dataclass(frozen=True)
@@ -48,6 +115,38 @@ class ChatCompletionClient(Protocol):
         schema_name: str,
     ) -> str:
         """返回满足 API JSON Schema 输出约束的原始 JSON 文本，供调用方再做 Pydantic 校验。"""
+
+
+def complete_json_with_diagnostics(
+    client: ChatCompletionClient,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    json_schema: dict[str, Any],
+    schema_name: str,
+) -> LLMCompletion:
+    """优先读取诊断接口；旧测试替身仍可只实现 ``complete_json``。"""
+    diagnostic_call = getattr(client, "complete_json_diagnostic", None)
+    if callable(diagnostic_call):
+        return diagnostic_call(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            json_schema=json_schema,
+            schema_name=schema_name,
+        )
+    content = client.complete_json(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        json_schema=json_schema,
+        schema_name=schema_name,
+    )
+    if not isinstance(content, str) or not content.strip():
+        raise LLMRequestError(
+            "LLM response contains no final text content.",
+            error_stage="empty_content",
+            content_chars=len(content) if isinstance(content, str) else 0,
+        )
+    return LLMCompletion(content=content.strip())
 
 
 def load_llm_runtime_settings(env_path: Path) -> LLMRuntimeSettings:
@@ -160,10 +259,24 @@ class OpenAICompatibleChatClient:
         并取回最终文本，不在此处解释任何业务字段。即使供应商承诺遵守 Schema，调用方仍会
         再执行 Pydantic 校验，避免把外部响应直接信任为内部业务对象。
         """
+        return self.complete_json_diagnostic(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            json_schema=json_schema,
+            schema_name=schema_name,
+        ).content
+
+    def complete_json_diagnostic(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        json_schema: dict[str, Any],
+        schema_name: str,
+    ) -> LLMCompletion:
+        """执行结构化补全并返回 finish reason、usage 与字符数诊断。"""
         structured_system_prompt = system_prompt
         if self._settings.structured_output_mode == "json_object":
-            # 部分 OpenAI 兼容模型不实现 json_schema，但支持 json_object。此时将完整
-            # Schema 注入提示词，返回后仍由调用方的 Pydantic 模型执行确定性校验。
             structured_system_prompt = (
                 f"{system_prompt}\n\n"
                 "你必须只输出一个 JSON 对象，且严格满足以下 JSON Schema；"
@@ -193,14 +306,14 @@ class OpenAICompatibleChatClient:
                 response_format=response_format,
                 stream=False,
             )
-            content = _extract_non_stream_content(response)
+            completion = _extract_non_stream_completion(response)
         except LLMRequestError:
             raise
         except Exception as error:
             raise LLMRequestError(
                 f"LLM structured request failed: {type(error).__name__}"
             ) from error
-        return content.strip()
+        return completion
 
 
 def _extract_non_stream_content(response: Any) -> str:
@@ -210,11 +323,44 @@ def _extract_non_stream_content(response: Any) -> str:
     用户可见结果或日志。这里仅接受最终 ``message.content``；服务端返回空 choices 时给出
     明确错误，供健康检查或正式检索的降级逻辑处理。
     """
+    return _extract_non_stream_completion(response).content
+
+
+def _extract_non_stream_completion(response: Any) -> LLMCompletion:
+    """提取最终内容和安全统计；隐藏推理只计算字符数，不读取或持久化文本。"""
     choices = getattr(response, "choices", None)
     if not isinstance(choices, list) or not choices:
         raise LLMRequestError("LLM response contains no choices.")
-    message = getattr(choices[0], "message", None)
+    choice = choices[0]
+    message = getattr(choice, "message", None)
     content = getattr(message, "content", None)
+    reasoning = getattr(message, "reasoning_content", None)
+    reasoning_chars = len(reasoning) if isinstance(reasoning, str) else 0
+    finish_reason = getattr(choice, "finish_reason", None)
+    finish_reason = finish_reason if isinstance(finish_reason, str) else None
+    usage = getattr(response, "usage", None)
+    prompt_tokens = _optional_nonnegative_int(getattr(usage, "prompt_tokens", None))
+    completion_tokens = _optional_nonnegative_int(
+        getattr(usage, "completion_tokens", None)
+    )
     if not isinstance(content, str) or not content.strip():
-        raise LLMRequestError("LLM response contains no final text content.")
-    return content
+        raise LLMRequestError(
+            "LLM response contains no final text content.",
+            error_stage="empty_content",
+            finish_reason=finish_reason,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            content_chars=len(content) if isinstance(content, str) else 0,
+            reasoning_chars=reasoning_chars,
+        )
+    return LLMCompletion(
+        content=content.strip(),
+        finish_reason=finish_reason,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        reasoning_chars=reasoning_chars,
+    )
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    return value if isinstance(value, int) and value >= 0 else None

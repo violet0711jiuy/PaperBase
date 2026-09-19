@@ -343,6 +343,10 @@ class AgenticResearchSettings(BaseModel):
     coverage_exhaustive_min_queries_per_paper: int = Field(default=2, ge=1, le=10)
     final_evidence_max_units: int = Field(default=8, ge=1, le=50)
     final_evidence_max_per_paper: int = Field(default=4, ge=1, le=20)
+    query_understanding_max_output_tokens: int = Field(default=1_000, ge=200, le=8_000)
+    planner_max_output_tokens: int = Field(default=1_400, ge=400, le=8_000)
+    candidate_selection_max_output_tokens: int = Field(default=2_400, ge=400, le=8_000)
+    decision_max_output_tokens: int = Field(default=2_400, ge=400, le=8_000)
     evidence_analysis_max_output_tokens: int = Field(default=3_000, ge=400, le=8_000)
 
     @field_validator("checkpoint_path", mode="after")

@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from paperbase.llm.client import ChatCompletionClient
+from paperbase.llm.client import (
+    ChatCompletionClient,
+    LLMCompletion,
+    complete_json_with_diagnostics,
+)
 from paperbase.prompts.evidence_analysis import (
     EVIDENCE_ANALYSIS_SYSTEM_PROMPT,
     build_evidence_analysis_user_prompt,
@@ -16,7 +20,9 @@ from .contracts import (
     EvidenceAnalysisStatus,
     EvidenceClaim,
     EvidenceRecord,
+    LLMCallRecord,
 )
+from paperbase.llm.diagnostics import failure_record, repair_hint, success_record
 from .schemas import EvidenceAnalysisBatchDraft
 
 
@@ -24,6 +30,7 @@ from .schemas import EvidenceAnalysisBatchDraft
 class EvidenceAnalysisResult:
     analyses: tuple[EvidenceAnalysis, ...]
     llm_calls: int
+    llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
 
 class EvidenceAnalyzer(Protocol):
@@ -60,34 +67,61 @@ class LLMEvidenceAnalyzer:
         )
         analyses: list[EvidenceAnalysis] = []
         llm_calls = 0
+        diagnostics: list[LLMCallRecord] = []
         for offset in range(0, len(pending), self._batch_size):
             batch = pending[offset : offset + self._batch_size]
             errors: list[str] = []
             accepted: tuple[EvidenceAnalysis, ...] | None = None
-            for _attempt in range(self._max_attempts):
+            content_limit = self._max_content_chars
+            for attempt in range(1, self._max_attempts + 1):
                 llm_calls += 1
+                completion: LLMCompletion | None = None
                 try:
-                    raw = self._client.complete_json(
+                    completion = complete_json_with_diagnostics(
+                        self._client,
                         system_prompt=EVIDENCE_ANALYSIS_SYSTEM_PROMPT,
                         user_prompt=build_evidence_analysis_user_prompt(
                             {
                                 "question": question,
-                                "evidence": [_payload(item, self._max_content_chars) for item in batch],
+                                "evidence": [
+                                    _payload(item, content_limit) for item in batch
+                                ],
                                 "previous_validation_errors": errors[-1:],
                             }
                         ),
                         json_schema=EvidenceAnalysisBatchDraft.model_json_schema(),
                         schema_name="paperbase_evidence_analysis",
                     )
-                    draft = EvidenceAnalysisBatchDraft.model_validate_json(raw)
+                    draft = EvidenceAnalysisBatchDraft.model_validate_json(
+                        completion.content
+                    )
                     accepted = _convert_and_validate(batch, draft)
+                    diagnostics.append(
+                        success_record(
+                            node="analyze_evidence",
+                            attempt=attempt,
+                            completion=completion,
+                        )
+                    )
                     break
                 except Exception as error:
-                    errors.append(f"{type(error).__name__}: {error}")
+                    record = failure_record(
+                        node="analyze_evidence",
+                        attempt=attempt,
+                        error=error,
+                        completion=completion,
+                        can_retry=attempt < self._max_attempts,
+                    )
+                    diagnostics.append(record)
+                    errors.append(repair_hint(error))
+                    if record.recovery_action == "compact_context":
+                        content_limit = max(100, content_limit // 2)
             if accepted is not None:
                 analyses.extend(accepted)
             else:
-                error_code = errors[-1][:300] if errors else "EvidenceAnalysisFailed"
+                error_code = (
+                    diagnostics[-1].error_stage if diagnostics else None
+                ) or "EvidenceAnalysisFailed"
                 analyses.extend(
                     EvidenceAnalysis(
                         evidence_id=item.evidence_id,
@@ -96,7 +130,9 @@ class LLMEvidenceAnalyzer:
                     )
                     for item in batch
                 )
-        return EvidenceAnalysisResult(tuple(analyses), llm_calls)
+        return EvidenceAnalysisResult(
+            tuple(analyses), llm_calls, tuple(diagnostics)
+        )
 
 
 def _payload(record: EvidenceRecord, max_content_chars: int) -> dict[str, object]:

@@ -5,6 +5,7 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
+from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ValidationError
 
 from paperbase.agentic.factory import create_agentic_research_service
@@ -35,6 +36,16 @@ ROOT = Path(__file__).resolve().parents[1]
 class _Client:
     def complete_json(self, **kwargs):
         raise AssertionError("装配测试不应真正调用模型")
+
+
+class _BudgetClient(_Client):
+    def __init__(self, budget: int | None = None, calls=None) -> None:
+        self.budget = budget
+        self.calls = calls if calls is not None else []
+
+    def with_max_tokens(self, max_tokens: int):
+        self.calls.append(max_tokens)
+        return _BudgetClient(max_tokens, self.calls)
 
 
 class _Database:
@@ -162,6 +173,25 @@ class AgenticLLMContractTests(unittest.TestCase):
         self.assertIs(context.candidate_selector._client, shared_client)
         self.assertIs(context.evidence_analyzer._client, shared_client)
         self.assertIs(context.answer_generator._client, shared_client)
+
+    def test_production_factory_assigns_independent_node_output_budgets(self) -> None:
+        client = _BudgetClient()
+        service = create_agentic_research_service(
+            config_path=ROOT / "config.example.yaml",
+            client=client,
+            database=_Database(),
+            hybrid_retriever=_Retriever(),
+            checkpointer=InMemorySaver(),
+        )
+
+        context = service._workflow._context
+        self.assertEqual(context.query_understanding._client.budget, 1000)
+        self.assertEqual(context.planner._client.budget, 1400)
+        self.assertEqual(context.candidate_selector._client.budget, 2400)
+        self.assertEqual(context.decision_agent._client.budget, 2400)
+        self.assertEqual(context.evidence_analyzer._client.budget, 3000)
+        self.assertEqual(context.answer_generator._client.budget, 4000)
+        self.assertEqual(client.calls, [1000, 1400, 2400, 2400, 3000, 4000])
 
 
 def _assert_all_properties_required(

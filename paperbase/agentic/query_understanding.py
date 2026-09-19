@@ -6,7 +6,12 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
-from paperbase.llm.client import ChatCompletionClient, LLMRequestError
+from paperbase.llm.client import (
+    ChatCompletionClient,
+    LLMCompletion,
+    LLMRequestError,
+    complete_json_with_diagnostics,
+)
 from paperbase.prompts.agentic_query_understanding import (
     QUERY_UNDERSTANDING_SYSTEM_PROMPT,
     build_query_understanding_user_prompt,
@@ -21,7 +26,9 @@ from .contracts import (
     ResearchGoal,
     ScopeResolution,
     ScopeResolutionStatus,
+    LLMCallRecord,
 )
+from paperbase.llm.diagnostics import failure_record, success_record
 from .schemas import QueryUnderstandingDraft
 
 
@@ -30,6 +37,7 @@ class QueryUnderstandingResult:
     context: QueryContext
     used_fallback: bool
     llm_calls: int
+    llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
 
 class QueryUnderstandingService:
@@ -45,10 +53,13 @@ class QueryUnderstandingService:
         draft = fallback
         used_fallback = self._client is None
         llm_calls = 0
+        diagnostics: list[LLMCallRecord] = []
         if self._client is not None:
             llm_calls = 1
+            completion: LLMCompletion | None = None
             try:
-                raw = self._client.complete_json(
+                completion = complete_json_with_diagnostics(
+                    self._client,
                     system_prompt=QUERY_UNDERSTANDING_SYSTEM_PROMPT,
                     user_prompt=build_query_understanding_user_prompt(
                         query=query,
@@ -58,9 +69,23 @@ class QueryUnderstandingService:
                     json_schema=QueryUnderstandingDraft.model_json_schema(),
                     schema_name="paperbase_query_understanding",
                 )
-                draft = QueryUnderstandingDraft.model_validate_json(raw)
+                draft = QueryUnderstandingDraft.model_validate_json(completion.content)
+                diagnostics.append(
+                    success_record(
+                        node="understand_query", attempt=1, completion=completion
+                    )
+                )
                 used_fallback = False
-            except (LLMRequestError, ValidationError, ValueError, TypeError):
+            except (LLMRequestError, ValidationError, ValueError, TypeError) as error:
+                diagnostics.append(
+                    failure_record(
+                        node="understand_query",
+                        attempt=1,
+                        error=error,
+                        completion=completion,
+                        can_retry=False,
+                    )
+                )
                 draft = fallback
                 used_fallback = True
         deterministic_terms = extract_lexical_terms(query)
@@ -83,7 +108,9 @@ class QueryUnderstandingService:
             ),
             search_bibliography=(EvidenceTarget.REFERENCE in targets),
         )
-        return QueryUnderstandingResult(context, used_fallback, llm_calls)
+        return QueryUnderstandingResult(
+            context, used_fallback, llm_calls, tuple(diagnostics)
+        )
 
 
 def _deterministic_draft(

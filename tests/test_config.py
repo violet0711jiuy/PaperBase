@@ -45,6 +45,11 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(settings.retrieval.query_rewrite.enabled)
         self.assertEqual(settings.answer_generation.max_output_tokens, 4000)
         self.assertEqual(
+            settings.agentic_research.query_understanding_max_output_tokens, 1000
+        )
+        self.assertEqual(settings.agentic_research.planner_max_output_tokens, 1400)
+        self.assertEqual(settings.agentic_research.decision_max_output_tokens, 2400)
+        self.assertEqual(
             settings.database.path,
             project_root / "storage" / "paperbase.sqlite3",
         )

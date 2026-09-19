@@ -39,8 +39,9 @@ Copy-Item config.example.yaml config.yaml
 `agentic_research.enabled: true` 只表示功能允许启用；后端需要通过
 `paperbase.agentic.create_agentic_research_service(...)` 装配 LangGraph、Research Tools
 和真实 LLM。该入口从配置文件同目录的 `.env` 读取 `LLM_*`，并让 Understanding、
-Planner、Decision 共享同一个客户端。结构化输出仍会在本地执行严格 Schema 和领域校验，
-不能把 Provider 的 `json_schema` 声明视为可信输入。
+Planner、Candidate Selection、Decision、Evidence Analysis 和 Answer 复用同一连接池，
+但分别使用节点级输出预算。结构化输出仍会在本地执行严格 Schema 和领域校验，不能把
+Provider 的 `json_schema` 声明视为可信输入。
 
 Phase 3 新增的 Coverage 与 Selector 配置包括：
 
@@ -48,6 +49,18 @@ Phase 3 新增的 Coverage 与 Selector 配置包括：
 - `coverage_exhaustive_min_queries_per_paper`：穷举任务每篇论文的最少查询数，默认覆盖直接查询和替代表达；
 - `final_evidence_max_units`：最终 Evidence 总上限；
 - `final_evidence_max_per_paper`：单篇论文进入最终 Evidence 的上限。
+
+P2 新增的节点输出预算包括：
+
+- `query_understanding_max_output_tokens`；
+- `planner_max_output_tokens`；
+- `candidate_selection_max_output_tokens`；
+- `decision_max_output_tokens`；
+- `evidence_analysis_max_output_tokens`。
+
+这些值只控制对应节点的可见输出上限；API Key、Prompt、LLM 原始输出和隐藏推理正文不会
+写入诊断记录。运行记录只持久化 token 数、字符数、`finish_reason`、错误阶段和不含输入值
+的 ValidationError 类型/字段路径。
 
 正式 Overview 独立保存在 `storage/paper_overviews/<paper_id>/overview.json` 与
 `context.json`。生成必须显式调用 `FormalOverviewRepository.generate(...)`；Agent 的

@@ -73,15 +73,22 @@ def create_agentic_research_service(
         database=active_database,
         llm_client=active_client,
     )
-    answer_client = active_client
     with_max_tokens = getattr(active_client, "with_max_tokens", None)
-    if callable(with_max_tokens):
-        answer_client = with_max_tokens(settings.answer_generation.max_output_tokens)
-    evidence_analysis_client = active_client
-    if callable(with_max_tokens):
-        evidence_analysis_client = with_max_tokens(
-            settings.agentic_research.evidence_analysis_max_output_tokens
-        )
+    def client_for(max_tokens: int) -> ChatCompletionClient:
+        return with_max_tokens(max_tokens) if callable(with_max_tokens) else active_client
+
+    understanding_client = client_for(
+        settings.agentic_research.query_understanding_max_output_tokens
+    )
+    planner_client = client_for(settings.agentic_research.planner_max_output_tokens)
+    candidate_client = client_for(
+        settings.agentic_research.candidate_selection_max_output_tokens
+    )
+    decision_client = client_for(settings.agentic_research.decision_max_output_tokens)
+    evidence_analysis_client = client_for(
+        settings.agentic_research.evidence_analysis_max_output_tokens
+    )
+    answer_client = client_for(settings.answer_generation.max_output_tokens)
 
     expander = SectionAwareNeighborExpander(
         database=active_database,
@@ -117,11 +124,11 @@ def create_agentic_research_service(
 
     workflow = LangGraphResearchWorkflow(
         scope_resolver=ScopeResolver(active_database),
-        query_understanding=QueryUnderstandingService(active_client),
-        planner=ResearchPlanner(active_client),
-        decision_agent=LLMDecisionAgent(active_client),
+        query_understanding=QueryUnderstandingService(understanding_client),
+        planner=ResearchPlanner(planner_client),
+        decision_agent=LLMDecisionAgent(decision_client),
         candidate_selector=LLMCandidateSelector(
-            active_client,
+            candidate_client,
             FormalPaperMetadataRepository(
                 database=active_database,
                 overview_repository=overview_repository,

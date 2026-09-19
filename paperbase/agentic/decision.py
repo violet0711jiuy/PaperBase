@@ -6,7 +6,11 @@ from dataclasses import dataclass
 import re
 from typing import Protocol
 
-from paperbase.llm.client import ChatCompletionClient
+from paperbase.llm.client import (
+    ChatCompletionClient,
+    LLMCompletion,
+    complete_json_with_diagnostics,
+)
 from paperbase.prompts.agentic_decision import (
     AGENT_DECISION_SYSTEM_PROMPT,
     build_agent_decision_user_prompt,
@@ -23,6 +27,7 @@ from .contracts import (
     FinishAction,
     GetPaperOverviewAction,
     GetSectionContextAction,
+    LLMCallRecord,
     QueryContext,
     ResearchObservation,
     ResearchPlan,
@@ -30,6 +35,7 @@ from .contracts import (
     SearchPapersAction,
     SearchReferencesAction,
 )
+from paperbase.llm.diagnostics import failure_record, repair_hint, success_record
 from .schemas import (
     AGENT_DECISION_ADAPTER,
     ActionDraft,
@@ -42,9 +48,16 @@ from .schemas import (
 
 
 class DecisionError(RuntimeError):
-    def __init__(self, message: str, *, llm_calls: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        llm_calls: int,
+        llm_diagnostics: tuple[LLMCallRecord, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.llm_calls = llm_calls
+        self.llm_diagnostics = llm_diagnostics
 
 
 @dataclass(frozen=True)
@@ -65,6 +78,7 @@ class DecisionResult:
     llm_calls: int
     # 兼容旧的 ScriptedDecisionAgent / ResearchRuntime；生产 LLM Decision 不再生成此字段。
     qualifications: tuple[EvidenceQualification, ...] = ()
+    llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
 
 class DecisionAgent(Protocol):
@@ -78,21 +92,48 @@ class LLMDecisionAgent:
 
     def decide(self, state: DecisionState) -> DecisionResult:
         errors: list[str] = []
+        diagnostics: list[LLMCallRecord] = []
+        evidence_limit = 12
         for attempt in range(1, self._max_attempts + 1):
+            completion: LLMCompletion | None = None
             try:
-                raw = self._client.complete_json(
+                completion = complete_json_with_diagnostics(
+                    self._client,
                     system_prompt=AGENT_DECISION_SYSTEM_PROMPT,
-                    user_prompt=_state_prompt(state, errors),
+                    user_prompt=_state_prompt(
+                        state, errors, evidence_limit=evidence_limit
+                    ),
                     json_schema=AGENT_DECISION_ADAPTER.json_schema(),
                     schema_name="paperbase_agent_action",
                 )
-                draft = AGENT_DECISION_ADAPTER.validate_json(raw)
+                draft = AGENT_DECISION_ADAPTER.validate_json(completion.content)
                 action = _to_action(draft.decision)
                 _validate_action_references(action, state)
-                return DecisionResult(action, attempt)
+                diagnostics.append(
+                    success_record(
+                        node="decide_action", attempt=attempt, completion=completion
+                    )
+                )
+                return DecisionResult(
+                    action, attempt, llm_diagnostics=tuple(diagnostics)
+                )
             except Exception as error:
-                errors.append(f"{type(error).__name__}: {error}")
-        raise DecisionError("Decision output remained invalid after repair.", llm_calls=self._max_attempts)
+                record = failure_record(
+                    node="decide_action",
+                    attempt=attempt,
+                    error=error,
+                    completion=completion,
+                    can_retry=attempt < self._max_attempts,
+                )
+                diagnostics.append(record)
+                errors.append(repair_hint(error))
+                if record.recovery_action == "compact_context":
+                    evidence_limit = 6
+        raise DecisionError(
+            "Decision output remained invalid after repair.",
+            llm_calls=self._max_attempts,
+            llm_diagnostics=tuple(diagnostics),
+        )
 
 
 class ScriptedDecisionAgent:
@@ -150,9 +191,11 @@ def _to_action(draft: ActionDraft) -> AgentAction:
     return FinishAction(draft.reason)
 
 
-def _state_prompt(state: DecisionState, errors: list[str]) -> str:
+def _state_prompt(
+    state: DecisionState, errors: list[str], *, evidence_limit: int = 12
+) -> str:
     # Decision 只读取 Evidence Analysis 产生的短摘要与 Claim；完整原文保留在 Registry。
-    visible_evidence = _visible_evidence(state)
+    visible_evidence = _visible_evidence(state, limit=evidence_limit)
     summary = {
         "question": state.context.resolved_query,
         "scope": state.context.scope.value,

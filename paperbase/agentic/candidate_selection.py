@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
-from paperbase.llm.client import ChatCompletionClient
+from paperbase.llm.client import (
+    ChatCompletionClient,
+    LLMCompletion,
+    complete_json_with_diagnostics,
+)
 from paperbase.overview.repository import FormalOverviewRepository
 from paperbase.prompts.candidate_selection import (
     CANDIDATE_SELECTION_SYSTEM_PROMPT,
@@ -17,7 +21,9 @@ from .contracts import (
     CandidateDisposition,
     CandidateSelection,
     CorpusScopeSnapshot,
+    LLMCallRecord,
 )
+from paperbase.llm.diagnostics import failure_record, repair_hint, success_record
 from .schemas import CandidateSelectionDraft
 
 
@@ -35,6 +41,7 @@ class CandidateSelectionResult:
     selection: CandidateSelection
     llm_calls: int
     used_fallback: bool = False
+    llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
 
 class PaperMetadataSource(Protocol):
@@ -122,32 +129,57 @@ class LLMCandidateSelector:
         assessments: list[CandidateAssessment] = []
         llm_calls = 0
         used_fallback = False
+        diagnostics: list[LLMCallRecord] = []
         for offset in range(0, len(metadata), self._batch_size):
             batch = metadata[offset : offset + self._batch_size]
             expected_ids = tuple(item.paper_id for item in batch)
             errors: list[str] = []
             accepted: CandidateSelection | None = None
-            for _attempt in range(self._max_attempts):
+            compact_context = False
+            for attempt in range(1, self._max_attempts + 1):
                 llm_calls += 1
+                completion: LLMCompletion | None = None
                 try:
-                    raw = self._client.complete_json(
+                    completion = complete_json_with_diagnostics(
+                        self._client,
                         system_prompt=CANDIDATE_SELECTION_SYSTEM_PROMPT,
                         user_prompt=build_candidate_selection_user_prompt(
                             {
                                 "question": question,
                                 "scope_snapshot_id": snapshot.snapshot_id,
-                                "papers": [item.__dict__ for item in batch],
+                                "papers": [
+                                    _metadata_payload(item, compact=compact_context)
+                                    for item in batch
+                                ],
                                 "previous_validation_errors": errors[-1:],
                             }
                         ),
                         json_schema=CandidateSelectionDraft.model_json_schema(),
                         schema_name="paperbase_candidate_selection",
                     )
-                    draft = CandidateSelectionDraft.model_validate_json(raw)
+                    draft = CandidateSelectionDraft.model_validate_json(
+                        completion.content
+                    )
                     accepted = _validate_and_build(expected_ids, draft)
+                    diagnostics.append(
+                        success_record(
+                            node="select_candidates",
+                            attempt=attempt,
+                            completion=completion,
+                        )
+                    )
                     break
                 except Exception as error:
-                    errors.append(f"{type(error).__name__}: {error}")
+                    record = failure_record(
+                        node="select_candidates",
+                        attempt=attempt,
+                        error=error,
+                        completion=completion,
+                        can_retry=attempt < self._max_attempts,
+                    )
+                    diagnostics.append(record)
+                    errors.append(repair_hint(error))
+                    compact_context = record.recovery_action == "compact_context"
             if accepted is not None:
                 assessments.extend(accepted.assessments)
                 continue
@@ -164,7 +196,22 @@ class LLMCandidateSelector:
             scope_paper_ids=snapshot.paper_ids,
             assessments=tuple(assessments),
         )
-        return CandidateSelectionResult(selection, llm_calls, used_fallback)
+        return CandidateSelectionResult(
+            selection, llm_calls, used_fallback, tuple(diagnostics)
+        )
+
+
+def _metadata_payload(item: PaperMetadata, *, compact: bool) -> dict[str, object]:
+    """length 截断后缩短可选字段，但始终保留 paper_id 与完整标题。"""
+    if not compact:
+        return item.__dict__
+    return {
+        "paper_id": item.paper_id,
+        "title": item.title,
+        "abstract": item.abstract[:240] if item.abstract else None,
+        "keywords": item.keywords[:160] if item.keywords else None,
+        "overview": item.overview[:240] if item.overview else None,
+    }
 
 
 def _validate_and_build(

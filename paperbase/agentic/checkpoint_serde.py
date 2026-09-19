@@ -17,6 +17,7 @@ from .contracts import (
     EvidenceQualification,
     EvidenceRecord,
     GuardState,
+    LLMCallRecord,
     QueryContext,
     RegistryState,
     ResearchObservation,
@@ -48,6 +49,7 @@ _ADAPTERS: dict[object, TypeAdapter[Any]] = {
     GuardState: TypeAdapter(GuardState),
     tuple[ResearchObservation, ...]: TypeAdapter(tuple[ResearchObservation, ...]),
     tuple[ActionTrace, ...]: TypeAdapter(tuple[ActionTrace, ...]),
+    tuple[LLMCallRecord, ...]: TypeAdapter(tuple[LLMCallRecord, ...]),
     ResearchRunResult: TypeAdapter(ResearchRunResult),
     ResearchAnswer: TypeAdapter(ResearchAnswer),
 }

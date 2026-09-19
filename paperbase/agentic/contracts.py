@@ -8,6 +8,7 @@ from enum import Enum
 from hashlib import sha256
 from typing import TypeAlias
 
+from paperbase.llm.client import LLMCallRecord
 from paperbase.retrieval.contracts import PaperSearchSpec, RetrievedEvidence, ToolStatus
 
 
@@ -580,6 +581,7 @@ class ResearchAnswer:
     insufficient_evidence: bool = False
     partial_answer: bool = False
     coverage_note: str | None = None
+    llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", _text(self.status, "status"))
@@ -701,6 +703,7 @@ class ResearchRunResult:
     thread_id: str | None = None
     error_codes: tuple[str, ...] = ()
     clarification: str | None = None
+    llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
 
 def _text(value: object, name: str) -> str:

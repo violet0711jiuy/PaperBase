@@ -12,11 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from paperbase.config import AnswerGenerationSettings
 from paperbase.llm.client import (
     ChatCompletionClient,
+    LLMCallRecord,
+    LLMCompletion,
     LLMRequestError,
     LLMRuntimeSettings,
     OpenAICompatibleChatClient,
     load_llm_runtime_settings,
+    complete_json_with_diagnostics,
 )
+from paperbase.llm.diagnostics import failure_record, success_record
 from paperbase.prompts.answer_generation import (
     ANSWER_GENERATION_SYSTEM_PROMPT,
     build_answer_generation_user_prompt,
@@ -69,6 +73,7 @@ class AnswerGenerationOutcome:
     insufficient_evidence: bool
     partial_answer: bool = False
     coverage_note: str | None = None
+    llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
 
 class GroundedAnswerGenerator:
@@ -131,26 +136,50 @@ class GroundedAnswerGenerator:
             evidence=bounded_evidence,
             conversation_context=normalized_context,
         )
+        completion: LLMCompletion | None = None
         try:
-            raw_response = self._client.complete_json(
+            completion = complete_json_with_diagnostics(
+                self._client,
                 system_prompt=ANSWER_GENERATION_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 json_schema=AnswerGenerationDraft.model_json_schema(),
                 schema_name="paperbase_grounded_answer",
             )
             result = _normalize_and_validate_answer(
-                _compose_answer(AnswerGenerationDraft.model_validate_json(raw_response)),
+                _compose_answer(
+                    AnswerGenerationDraft.model_validate_json(completion.content)
+                ),
                 allowed_evidence_ids={item.evidence_id for item in bounded_evidence},
             )
-            return _to_outcome(result, status="success")
-        except (LLMRequestError, ValidationError, ValueError, TypeError):
+            return _to_outcome(
+                result,
+                status="success",
+                llm_diagnostics=(
+                    success_record(
+                        node="generate_answer", attempt=1, completion=completion
+                    ),
+                ),
+            )
+        except (LLMRequestError, ValidationError, ValueError, TypeError) as error:
             # 回答结构由 API 层 JSON Schema 和本地 Pydantic 模型双重保证。这里的失败既可能
             # 是 JSON 语法/类型不合法，也可能是模型给出了不存在的 E#/R#。两种情况都不应让
             # 第二次 LLM 调用来猜测如何“修复”；直接降级为可人工审阅的证据列表，才能避免
             # 修复器意外改写回答含义、伪造引用或掩盖供应商的结构化输出兼容问题。
-            return self._fallback_outcome()
+            return self._fallback_outcome(
+                llm_diagnostics=(
+                    failure_record(
+                        node="generate_answer",
+                        attempt=1,
+                        error=error,
+                        completion=completion,
+                        can_retry=False,
+                    ),
+                )
+            )
 
-    def _fallback_outcome(self) -> AnswerGenerationOutcome:
+    def _fallback_outcome(
+        self, *, llm_diagnostics: tuple[LLMCallRecord, ...] = ()
+    ) -> AnswerGenerationOutcome:
         """生成环节是可选增强；失败时让调用方继续展示已审计的证据。"""
         return AnswerGenerationOutcome(
             status="fallback",
@@ -159,6 +188,7 @@ class GroundedAnswerGenerator:
             # 这是“生成失败”，不是把已有检索证据错误判成无关；但尚无可展示的论文结论。
             insufficient_evidence=True,
             coverage_note="回答模型未生成符合证据引用约束的内容，尚未形成可引用的论文结论。",
+            llm_diagnostics=llm_diagnostics,
         )
 
 
@@ -315,7 +345,12 @@ def _has_ambiguous_singular_paper_reference(
     )
 
 
-def _to_outcome(result: AnswerGenerationResult, *, status: str) -> AnswerGenerationOutcome:
+def _to_outcome(
+    result: AnswerGenerationResult,
+    *,
+    status: str,
+    llm_diagnostics: tuple[LLMCallRecord, ...] = (),
+) -> AnswerGenerationOutcome:
     """将 Pydantic 对象冻结为服务层稳定返回值，避免调用方意外修改结果。"""
     return AnswerGenerationOutcome(
         status=status,
@@ -324,4 +359,5 @@ def _to_outcome(result: AnswerGenerationResult, *, status: str) -> AnswerGenerat
         insufficient_evidence=result.insufficient_evidence,
         partial_answer=result.partial_answer,
         coverage_note=result.coverage_note,
+        llm_diagnostics=llm_diagnostics,
     )

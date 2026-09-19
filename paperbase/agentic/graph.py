@@ -26,6 +26,7 @@ from .contracts import (
     EvidenceRecord,
     FinishAction,
     GuardState,
+    LLMCallRecord,
     QueryContext,
     QueryScope,
     RegistryState,
@@ -105,6 +106,7 @@ class AgentGraphState(TypedDict, total=False):
     answer: CheckpointValue
     next_node: NextNode
     result: CheckpointValue
+    llm_diagnostics: CheckpointValue
 
 
 @dataclass(frozen=True)
@@ -351,6 +353,7 @@ class LangGraphResearchWorkflow:
             "guard_state": dump_contract(GuardState(), GuardState),
             "observations": dump_contract((), tuple[ResearchObservation, ...]),
             "traces": dump_contract((), tuple[ActionTrace, ...]),
+            "llm_diagnostics": dump_contract((), tuple[LLMCallRecord, ...]),
             "error_codes": [],
         }
         return resolved_thread_id, config, initial_state
@@ -526,6 +529,9 @@ def _understand_query(
     tracker.record_preparation_llm_calls(understood.llm_calls)
     return {
         "query_context": dump_contract(understood.context, QueryContext),
+        "llm_diagnostics": _append_llm_diagnostics(
+            state, understood.llm_diagnostics
+        ),
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
         "next_node": (
             "select_candidates"
@@ -555,14 +561,21 @@ def _select_candidates(
     tracker = _tracker(state, runtime.context.settings)
     tracker.record_preparation_llm_calls(result.llm_calls)
     if tracker.llm_calls + int(runtime.context.answer_generator is not None) > runtime.context.settings.max_llm_calls:
-        return _terminal_update(
+        update = _terminal_update(
             state,
             tracker=tracker,
             status=ResearchRunStatus.NO_EVIDENCE,
             reason=StopReason.BUDGET_EXHAUSTED,
         )
+        update["llm_diagnostics"] = _append_llm_diagnostics(
+            state, result.llm_diagnostics
+        )
+        return update
     return {
         "candidate_selection": dump_contract(result.selection, CandidateSelection),
+        "llm_diagnostics": _append_llm_diagnostics(
+            state, result.llm_diagnostics
+        ),
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
         "next_node": "build_plan",
     }
@@ -581,6 +594,7 @@ def _build_plan(
     tracker.record_preparation_llm_calls(planned.llm_calls)
     return {
         "plan": dump_contract(planned.plan, ResearchPlan),
+        "llm_diagnostics": _append_llm_diagnostics(state, planned.llm_diagnostics),
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
         "next_node": "decide_action",
     }
@@ -641,7 +655,7 @@ def _decide_action(
             ActionTrace(tracker.iterations, "invalid_decision", False, str(error)),
         )
         if not capacity.accepted:
-            return _terminal_update(
+            update = _terminal_update(
                 state,
                 tracker=tracker,
                 traces=traces,
@@ -652,8 +666,12 @@ def _decide_action(
                 ),
                 reason=StopReason.BUDGET_EXHAUSTED,
             )
+            update["llm_diagnostics"] = _append_llm_diagnostics(
+                state, error.llm_diagnostics
+            )
+            return update
         if tracker.record_invalid_action():
-            return _terminal_update(
+            update = _terminal_update(
                 state,
                 tracker=tracker,
                 traces=traces,
@@ -664,9 +682,16 @@ def _decide_action(
                 ),
                 reason=StopReason.INVALID_ACTION_LIMIT,
             )
+            update["llm_diagnostics"] = _append_llm_diagnostics(
+                state, error.llm_diagnostics
+            )
+            return update
         return {
             "guard_state": dump_contract(tracker.snapshot(), GuardState),
             "traces": traces,
+            "llm_diagnostics": _append_llm_diagnostics(
+                state, error.llm_diagnostics
+            ),
             "next_node": "decide_action",
         }
     capacity = tracker.record_decision(
@@ -683,16 +708,23 @@ def _decide_action(
                 capacity.detail,
             ),
         )
-        return _terminal_update(
+        update = _terminal_update(
             state,
             tracker=tracker,
             traces=traces,
             status=_partial_or_no_evidence(registry),
             reason=StopReason.BUDGET_EXHAUSTED,
         )
+        update["llm_diagnostics"] = _append_llm_diagnostics(
+            state, decision.llm_diagnostics
+        )
+        return update
     return {
         "action": dump_contract(decision.action, AgentAction),
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
+        "llm_diagnostics": _append_llm_diagnostics(
+            state, decision.llm_diagnostics
+        ),
         "next_node": "assess_action",
     }
 
@@ -722,19 +754,30 @@ def _assess_action(
                     "CoverageIncomplete: " + ", ".join(coverage.remaining_paper_ids),
                 ),
             )
-            if tracker.record_invalid_action():
-                return _terminal_update(
+            invalid_limit = tracker.record_invalid_action()
+            guard_diagnostic = _guard_rejection_record(
+                tracker, can_retry=not invalid_limit
+            )
+            if invalid_limit:
+                update = _terminal_update(
                     state,
                     tracker=tracker,
                     traces=traces,
                     status=_partial_or_no_evidence(registry),
                     reason=StopReason.INVALID_ACTION_LIMIT,
                 )
+                update["llm_diagnostics"] = _append_llm_diagnostics(
+                    state, (guard_diagnostic,)
+                )
+                return update
             return {
                 "registry_state": dump_contract(registry.snapshot(), RegistryState),
                 "coverage": dump_contract(coverage, CoverageState),
                 "guard_state": dump_contract(tracker.snapshot(), GuardState),
                 "traces": traces,
+                "llm_diagnostics": _append_llm_diagnostics(
+                    state, (guard_diagnostic,)
+                ),
                 "next_node": "decide_action",
             }
         traces = _append_trace(
@@ -804,15 +847,24 @@ def _validate_action(
         ),
     )
     if guard.budget_exhausted:
-        return _terminal_update(
+        guard_diagnostic = _guard_rejection_record(tracker, can_retry=False)
+        update = _terminal_update(
             state,
             tracker=tracker,
             traces=traces,
             status=_partial_or_no_evidence(registry),
             reason=StopReason.BUDGET_EXHAUSTED,
         )
-    if tracker.record_invalid_action():
-        return _terminal_update(
+        update["llm_diagnostics"] = _append_llm_diagnostics(
+            state, (guard_diagnostic,)
+        )
+        return update
+    invalid_limit = tracker.record_invalid_action()
+    guard_diagnostic = _guard_rejection_record(
+        tracker, can_retry=not invalid_limit
+    )
+    if invalid_limit:
+        update = _terminal_update(
             state,
             tracker=tracker,
             traces=traces,
@@ -823,9 +875,16 @@ def _validate_action(
             ),
             reason=StopReason.INVALID_ACTION_LIMIT,
         )
+        update["llm_diagnostics"] = _append_llm_diagnostics(
+            state, (guard_diagnostic,)
+        )
+        return update
     return {
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
         "traces": traces,
+        "llm_diagnostics": _append_llm_diagnostics(
+            state, (guard_diagnostic,)
+        ),
         "next_node": "decide_action",
     }
 
@@ -953,6 +1012,7 @@ def _analyze_evidence(
         )
         analyses = result.analyses
         llm_calls = result.llm_calls
+        llm_diagnostics = result.llm_diagnostics
     except Exception as error:
         analyses = tuple(
             EvidenceAnalysis(
@@ -963,6 +1023,7 @@ def _analyze_evidence(
             for record in pending
         )
         llm_calls = 0
+        llm_diagnostics = ()
     try:
         registry.apply_analyses(analyses)
     except ValueError as error:
@@ -973,6 +1034,9 @@ def _analyze_evidence(
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
         "pending_analysis_ids": [],
         "next_node": "decide_action",
+        "llm_diagnostics": _append_llm_diagnostics(
+            state, llm_diagnostics
+        ),
     }
     if tracker.llm_calls + int(runtime.context.answer_generator is not None) > runtime.context.settings.max_llm_calls:
         update.update(
@@ -1109,6 +1173,9 @@ def _generate_answer(
         ),
         "selected_evidence": dump_contract(selected, tuple[EvidenceRecord, ...]),
         "answer": dump_contract(answer, ResearchAnswer),
+        "llm_diagnostics": _append_llm_diagnostics(
+            state, answer.llm_diagnostics
+        ),
         "guard_state": (
             dump_contract(tracker.snapshot(), GuardState)
             if runtime.context.answer_generator is not None and selected and context
@@ -1163,6 +1230,7 @@ def _finish_run(
         thread_id=state.get("thread_id"),
         error_codes=tuple(state.get("error_codes", [])),
         clarification=state.get("clarification"),
+        llm_diagnostics=_llm_diagnostics(state),
     )
     return {"result": dump_contract(result, ResearchRunResult)}
 
@@ -1181,6 +1249,36 @@ def _append_trace(
     state: AgentGraphState, trace: ActionTrace
 ) -> CheckpointValue:
     return dump_contract((*_traces(state), trace), tuple[ActionTrace, ...])
+
+
+def _llm_diagnostics(state: AgentGraphState) -> tuple[LLMCallRecord, ...]:
+    raw = state.get("llm_diagnostics")
+    return (
+        load_contract(raw, tuple[LLMCallRecord, ...])
+        if raw is not None
+        else ()
+    )
+
+
+def _append_llm_diagnostics(
+    state: AgentGraphState, records: tuple[LLMCallRecord, ...]
+) -> CheckpointValue:
+    return dump_contract(
+        (*_llm_diagnostics(state), *records), tuple[LLMCallRecord, ...]
+    )
+
+
+def _guard_rejection_record(
+    tracker: BudgetAndGuardTracker, *, can_retry: bool
+) -> LLMCallRecord:
+    """把确定性 Guard 拒绝与模型/Schema 失败区分开。"""
+    return LLMCallRecord(
+        node="validate_action",
+        attempt=max(1, tracker.iterations),
+        success=False,
+        error_stage="guard_rejection",
+        recovery_action="replan_action" if can_retry else None,
+    )
 
 
 def _partial_or_no_evidence(registry: EvidenceRegistry) -> ResearchRunStatus:

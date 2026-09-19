@@ -34,6 +34,7 @@ from paperbase.agentic.scope_resolver import ScopeResolver
 from paperbase.agentic.service import AgenticResearchBusyError, AgenticResearchService
 from paperbase.config import AgenticResearchSettings
 from paperbase.generation.answer_generator import AnswerGenerationOutcome
+from paperbase.llm.client import LLMCompletion
 from paperbase.retrieval.contracts import (
     EvidenceSourceType,
     PaperSearchOutcome,
@@ -237,7 +238,51 @@ class _FailingAnswerGenerator:
         raise RuntimeError("answer provider unavailable")
 
 
+class _InvalidUnderstandingClient:
+    def complete_json_diagnostic(self, **kwargs):
+        return LLMCompletion(
+            "{invalid-json",
+            finish_reason="stop",
+            prompt_tokens=31,
+            completion_tokens=7,
+            reasoning_chars=13,
+        )
+
+
 class AgenticLangGraphTests(unittest.TestCase):
+    def test_safe_llm_diagnostics_survive_checkpoint_and_final_result(self) -> None:
+        resolver, _, planner = _components()
+        workflow = LangGraphResearchWorkflow(
+            scope_resolver=resolver,
+            query_understanding=QueryUnderstandingService(
+                _InvalidUnderstandingClient()
+            ),
+            planner=planner,
+            decision_agent=ScriptedDecisionAgent(
+                (_action("A", "A method", "S1"), FinishAction("covered"))
+            ),
+            evidence_analyzer=_SupportingEvidenceAnalyzer(),
+            tool_executor=_Executor(),
+            settings=AgenticResearchSettings(),
+        )
+
+        result = workflow.run(
+            "A 的方法是什么？",
+            selected_paper_ids=("A",),
+            thread_id="safe-diagnostics",
+        )
+        inspected = workflow.inspect("safe-diagnostics")
+
+        self.assertEqual(len(result.llm_diagnostics), 1)
+        record = result.llm_diagnostics[0]
+        self.assertEqual(record.node, "understand_query")
+        self.assertEqual(record.error_stage, "invalid_json")
+        self.assertEqual(record.prompt_tokens, 31)
+        self.assertEqual(record.reasoning_chars, 13)
+        raw_record = inspected.state["llm_diagnostics"][0]
+        self.assertNotIn("content", raw_record)
+        self.assertNotIn("reasoning_content", raw_record)
+
     def test_knowledge_base_candidate_selection_blocks_excluded_body_search(self) -> None:
         executor = _Executor()
         result = _workflow(
@@ -444,6 +489,10 @@ class AgenticLangGraphTests(unittest.TestCase):
         self.assertEqual(result.status, ResearchRunStatus.COMPLETED)
         self.assertIn("CoverageIncomplete", result.traces[0].detail)
         self.assertFalse(result.traces[0].accepted)
+        self.assertIn(
+            "guard_rejection",
+            [item.error_stage for item in result.llm_diagnostics],
+        )
         self.assertEqual(len(executor.calls), 2)
 
     def test_evidence_analysis_is_checkpointed_before_coverage_assessment(self) -> None:
