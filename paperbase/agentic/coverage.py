@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .contracts import (
+    CandidateAssessment,
+    CandidateDisposition,
+    CandidateSelection,
     CorpusScopeSnapshot,
     CoverageState,
     CoverageStrategy,
@@ -43,6 +46,7 @@ class CoverageManager:
         *,
         context: QueryContext,
         corpus_snapshot: CorpusScopeSnapshot | None,
+        candidate_selection: CandidateSelection | None = None,
         evidence: tuple[EvidenceRecord, ...],
         observations: tuple[ResearchObservation, ...],
     ) -> CoverageState:
@@ -52,20 +56,15 @@ class CoverageManager:
             else CoverageStrategy.CANDIDATE_VERIFICATION
         )
         scope_ids = self._scope_ids(context, corpus_snapshot)
-        discovery_completed = (
-            context.scope is not QueryScope.KNOWLEDGE_BASE
-            or any(item.action_name == "search_knowledge_base" for item in observations)
-        )
-        candidate_ids = (
-            scope_ids
-            if context.scope is not QueryScope.KNOWLEDGE_BASE
-            else self._knowledge_base_candidates(evidence, scope_ids)
-        )
-        required_ids = scope_ids if strategy is CoverageStrategy.EXHAUSTIVE else candidate_ids
+        selection = self._selection(context, scope_ids, candidate_selection)
+        candidate_ids = selection.candidate_paper_ids if selection is not None else ()
+        uncertain_ids = selection.uncertain_paper_ids if selection is not None else ()
+        required_ids = tuple(dict.fromkeys((*candidate_ids, *uncertain_ids)))
         assessments = tuple(
             self._assess_paper(
                 paper_id,
                 strategy=strategy,
+                shallow=paper_id in set(uncertain_ids),
                 evidence=evidence,
                 observations=observations,
             )
@@ -76,7 +75,13 @@ class CoverageManager:
             assessments=assessments,
             strategy=strategy,
             candidate_paper_ids=candidate_ids,
-            discovery_completed=discovery_completed,
+            screened_paper_ids=(selection.screened_paper_ids if selection else ()),
+            uncertain_paper_ids=uncertain_ids,
+            excluded_paper_ids=(selection.excluded_paper_ids if selection else ()),
+            discovery_completed=(
+                selection is not None
+                and set(selection.screened_paper_ids) == set(scope_ids)
+            ),
         )
 
     @staticmethod
@@ -90,17 +95,27 @@ class CoverageManager:
         return context.target_paper_ids
 
     @staticmethod
-    def _knowledge_base_candidates(
-        evidence: tuple[EvidenceRecord, ...], scope_ids: tuple[str, ...]
-    ) -> tuple[str, ...]:
-        allowed = set(scope_ids)
-        return tuple(
-            dict.fromkeys(
-                record.evidence.paper_id
-                for record in evidence
-                if record.evidence.paper_id in allowed
-                and "search_knowledge_base" in record.originating_tools
-            )
+    def _selection(
+        context: QueryContext,
+        scope_ids: tuple[str, ...],
+        selection: CandidateSelection | None,
+    ) -> CandidateSelection | None:
+        if selection is not None:
+            if selection.scope_paper_ids != scope_ids:
+                raise ValueError("Candidate Selection 与当前冻结 Scope 不一致。")
+            return selection
+        if context.scope is QueryScope.KNOWLEDGE_BASE:
+            return None
+        return CandidateSelection(
+            scope_paper_ids=scope_ids,
+            assessments=tuple(
+                CandidateAssessment(
+                    paper_id,
+                    CandidateDisposition.CANDIDATE,
+                    "用户显式选择的论文直接进入正文验证。",
+                )
+                for paper_id in scope_ids
+            ),
         )
 
     def _assess_paper(
@@ -108,6 +123,7 @@ class CoverageManager:
         paper_id: str,
         *,
         strategy: CoverageStrategy,
+        shallow: bool,
         evidence: tuple[EvidenceRecord, ...],
         observations: tuple[ResearchObservation, ...],
     ) -> PaperAssessment:
@@ -132,9 +148,13 @@ class CoverageManager:
             )
         )
         minimum = (
-            self._policy.exhaustive_min_queries_per_paper
-            if strategy is CoverageStrategy.EXHAUSTIVE
-            else self._policy.candidate_min_queries_per_paper
+            1
+            if shallow
+            else (
+                self._policy.exhaustive_min_queries_per_paper
+                if strategy is CoverageStrategy.EXHAUSTIVE
+                else self._policy.candidate_min_queries_per_paper
+            )
         )
         direct_verified_outside_discovery = any(
             any(tool != "search_knowledge_base" for tool in record.originating_tools)

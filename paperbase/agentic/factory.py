@@ -21,6 +21,7 @@ from paperbase.retrieval.hybrid_retriever import HybridRetriever
 from paperbase.retrieval.service import create_hybrid_retriever
 
 from .decision import LLMDecisionAgent
+from .candidate_selection import FormalPaperMetadataRepository, LLMCandidateSelector
 from .evidence_analysis import LLMEvidenceAnalyzer
 from .graph import LangGraphResearchWorkflow
 from .persistence import SQLiteCheckpointStore
@@ -93,14 +94,15 @@ def create_agentic_research_service(
             expander=expander,
         )
     )
+    overview_repository = FormalOverviewRepository(
+        settings.storage.papers_dir.parent / "paper_overviews"
+    )
     tool_executor = ResearchToolExecutor(
         retrieval_service=retrieval_service,
         database=active_database,
         global_retriever=active_retriever,
         top_k_per_paper=settings.agentic_research.top_k_per_paper,
-        formal_overview_repository=FormalOverviewRepository(
-            settings.storage.papers_dir.parent / "paper_overviews"
-        ),
+        formal_overview_repository=overview_repository,
     )
     checkpoint_store = None
     active_checkpointer = checkpointer
@@ -118,6 +120,13 @@ def create_agentic_research_service(
         query_understanding=QueryUnderstandingService(active_client),
         planner=ResearchPlanner(active_client),
         decision_agent=LLMDecisionAgent(active_client),
+        candidate_selector=LLMCandidateSelector(
+            active_client,
+            FormalPaperMetadataRepository(
+                database=active_database,
+                overview_repository=overview_repository,
+            ),
+        ),
         evidence_analyzer=LLMEvidenceAnalyzer(evidence_analysis_client),
         tool_executor=tool_executor,
         settings=settings.agentic_research,

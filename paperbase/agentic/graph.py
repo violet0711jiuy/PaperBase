@@ -18,6 +18,7 @@ from paperbase.retrieval.contracts import ToolResult
 from .contracts import (
     ActionTrace,
     AgentAction,
+    CandidateSelection,
     CorpusScopeSnapshot,
     CoverageState,
     EvidenceAnalysis,
@@ -26,6 +27,7 @@ from .contracts import (
     FinishAction,
     GuardState,
     QueryContext,
+    QueryScope,
     RegistryState,
     ResearchAnswer,
     ResearchObservation,
@@ -37,6 +39,7 @@ from .contracts import (
     StopReason,
 )
 from .answering import AgenticAnswerGenerator, generate_agentic_answer
+from .candidate_selection import CandidateSelector
 from .checkpoint_serde import CheckpointValue, dump_contract, load_contract
 from .coverage import CoverageManager, CoveragePolicy
 from .decision import DecisionAgent, DecisionError, DecisionState
@@ -59,6 +62,7 @@ from .transitions import finish_plan, mark_subtasks_started
 
 NextNode = Literal[
     "understand_query",
+    "select_candidates",
     "build_plan",
     "decide_action",
     "assess_action",
@@ -82,6 +86,7 @@ class AgentGraphState(TypedDict, total=False):
     scope_resolution: CheckpointValue
     corpus_snapshot: CheckpointValue
     query_context: CheckpointValue
+    candidate_selection: CheckpointValue
     plan: CheckpointValue
     action: CheckpointValue
     action_fingerprint: str
@@ -108,6 +113,7 @@ class AgentGraphContext:
     query_understanding: QueryUnderstandingService
     planner: ResearchPlanner
     decision_agent: DecisionAgent
+    candidate_selector: CandidateSelector | None
     evidence_analyzer: EvidenceAnalyzer
     tool_executor: ToolExecutor
     answer_generator: AgenticAnswerGenerator | None
@@ -136,6 +142,7 @@ class LangGraphResearchWorkflow:
         evidence_analyzer: EvidenceAnalyzer,
         tool_executor: ToolExecutor,
         settings: AgenticResearchSettings,
+        candidate_selector: CandidateSelector | None = None,
         answer_generator: AgenticAnswerGenerator | None = None,
         checkpointer: BaseCheckpointSaver | None = None,
     ) -> None:
@@ -144,6 +151,7 @@ class LangGraphResearchWorkflow:
             query_understanding=query_understanding,
             planner=planner,
             decision_agent=decision_agent,
+            candidate_selector=candidate_selector,
             evidence_analyzer=evidence_analyzer,
             tool_executor=tool_executor,
             answer_generator=answer_generator,
@@ -387,6 +395,7 @@ def build_agentic_research_graph() -> StateGraph:
     graph = StateGraph(AgentGraphState, context_schema=AgentGraphContext)
     graph.add_node("resolve_scope", _resolve_scope)
     graph.add_node("understand_query", _understand_query)
+    graph.add_node("select_candidates", _select_candidates)
     graph.add_node("build_plan", _build_plan)
     graph.add_node("decide_action", _decide_action)
     graph.add_node("assess_action", _assess_action)
@@ -405,6 +414,15 @@ def build_agentic_research_graph() -> StateGraph:
     )
     graph.add_conditional_edges(
         "understand_query",
+        _route,
+        {
+            "select_candidates": "select_candidates",
+            "build_plan": "build_plan",
+            "generate_answer": "generate_answer",
+        },
+    )
+    graph.add_conditional_edges(
+        "select_candidates",
         _route,
         {"build_plan": "build_plan", "generate_answer": "generate_answer"},
     )
@@ -509,6 +527,43 @@ def _understand_query(
     return {
         "query_context": dump_contract(understood.context, QueryContext),
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
+        "next_node": (
+            "select_candidates"
+            if understood.context.scope is QueryScope.KNOWLEDGE_BASE
+            else "build_plan"
+        ),
+    }
+
+
+def _select_candidates(
+    state: AgentGraphState, runtime: Runtime[AgentGraphContext]
+) -> AgentGraphState:
+    """全库问题必须先完成元数据筛选，再允许进入正文检索规划。"""
+    selector = runtime.context.candidate_selector
+    if selector is None:
+        return _fatal_update(
+            state,
+            "select_candidates",
+            RuntimeError("Knowledge-base workflow requires CandidateSelector."),
+        )
+    snapshot = load_contract(state["corpus_snapshot"], CorpusScopeSnapshot)
+    context = load_contract(state["query_context"], QueryContext)
+    try:
+        result = selector.select(question=context.resolved_query, snapshot=snapshot)
+    except Exception as error:
+        return _fatal_update(state, "select_candidates", error)
+    tracker = _tracker(state, runtime.context.settings)
+    tracker.record_preparation_llm_calls(result.llm_calls)
+    if tracker.llm_calls + int(runtime.context.answer_generator is not None) > runtime.context.settings.max_llm_calls:
+        return _terminal_update(
+            state,
+            tracker=tracker,
+            status=ResearchRunStatus.NO_EVIDENCE,
+            reason=StopReason.BUDGET_EXHAUSTED,
+        )
+    return {
+        "candidate_selection": dump_contract(result.selection, CandidateSelection),
+        "guard_state": dump_contract(tracker.snapshot(), GuardState),
         "next_node": "build_plan",
     }
 
@@ -553,7 +608,10 @@ def _decide_action(
         context=query_context,
         registry=registry,
     )
-    if tracker.no_available_actions(query_context):
+    candidate_selection = _candidate_selection(state)
+    if tracker.no_available_actions(
+        query_context, candidate_selection=candidate_selection
+    ):
         return _terminal_update(
             state,
             tracker=tracker,
@@ -570,6 +628,7 @@ def _decide_action(
                 budget_usage=tracker.usage(),
                 suppressed_paper_ids=tuple(sorted(tracker.suppressed_papers)),
                 coverage=coverage,
+                candidate_selection=candidate_selection,
             )
         )
     except DecisionError as error:
@@ -727,6 +786,7 @@ def _validate_action(
             if state.get("corpus_snapshot") is not None
             else None
         ),
+        candidate_selection=_candidate_selection(state),
     )
     if guard.accepted:
         return {
@@ -1089,6 +1149,7 @@ def _finish_run(
             if state.get("coverage") is not None
             else None
         ),
+        candidate_selection=_candidate_selection(state),
         selected_evidence=(
             load_contract(state["selected_evidence"], tuple[EvidenceRecord, ...])
             if state.get("selected_evidence") is not None
@@ -1257,6 +1318,16 @@ def _evaluate_coverage(
         ),
         evidence=registry.records,
         observations=_observations(state),
+        candidate_selection=_candidate_selection(state),
+    )
+
+
+def _candidate_selection(state: AgentGraphState) -> CandidateSelection | None:
+    raw = state.get("candidate_selection")
+    return (
+        load_contract(raw, CandidateSelection)
+        if raw is not None
+        else None
     )
 
 

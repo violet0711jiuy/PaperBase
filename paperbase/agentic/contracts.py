@@ -607,19 +607,30 @@ class PaperAssessment:
 
 @dataclass(frozen=True)
 class CoverageState:
-    """由 Scope、检索历史与 Qualification 派生的覆盖状态。"""
+    """由 Scope、Candidate Selection 与正文验证历史派生的覆盖状态。"""
 
     scope_paper_ids: tuple[str, ...]
     assessments: tuple[PaperAssessment, ...]
     strategy: CoverageStrategy
     candidate_paper_ids: tuple[str, ...] = ()
+    screened_paper_ids: tuple[str, ...] = ()
+    uncertain_paper_ids: tuple[str, ...] = ()
+    excluded_paper_ids: tuple[str, ...] = ()
     discovery_completed: bool = False
 
     def __post_init__(self) -> None:
         scope_ids = _unique_texts(self.scope_paper_ids)
         candidate_ids = _unique_texts(self.candidate_paper_ids)
-        if not set(candidate_ids).issubset(set(scope_ids)):
-            raise ValueError("candidate_paper_ids must stay inside scope_paper_ids.")
+        screened_ids = _unique_texts(self.screened_paper_ids)
+        uncertain_ids = _unique_texts(self.uncertain_paper_ids)
+        excluded_ids = _unique_texts(self.excluded_paper_ids)
+        partitions = (set(candidate_ids), set(uncertain_ids), set(excluded_ids))
+        if any(not values.issubset(set(scope_ids)) for values in partitions):
+            raise ValueError("Coverage screening partitions must stay inside Scope.")
+        if any(partitions[i].intersection(partitions[j]) for i in range(3) for j in range(i + 1, 3)):
+            raise ValueError("Coverage screening partitions must be mutually exclusive.")
+        if set(screened_ids) != set().union(*partitions):
+            raise ValueError("screened_paper_ids must equal all screening partitions.")
         assessment_ids = tuple(item.paper_id for item in self.assessments)
         if len(set(assessment_ids)) != len(assessment_ids):
             raise ValueError("Coverage assessments must not contain duplicate paper IDs.")
@@ -627,6 +638,9 @@ class CoverageState:
             raise ValueError("Coverage assessments must stay inside scope_paper_ids.")
         object.__setattr__(self, "scope_paper_ids", scope_ids)
         object.__setattr__(self, "candidate_paper_ids", candidate_ids)
+        object.__setattr__(self, "screened_paper_ids", screened_ids)
+        object.__setattr__(self, "uncertain_paper_ids", uncertain_ids)
+        object.__setattr__(self, "excluded_paper_ids", excluded_ids)
         object.__setattr__(self, "strategy", CoverageStrategy(self.strategy))
 
     @property
@@ -650,9 +664,11 @@ class CoverageState:
 
     @property
     def required_paper_ids(self) -> tuple[str, ...]:
-        if self.strategy is CoverageStrategy.EXHAUSTIVE:
-            return self.scope_paper_ids
-        return self.candidate_paper_ids
+        return tuple(dict.fromkeys((*self.candidate_paper_ids, *self.uncertain_paper_ids)))
+
+    @property
+    def verified_paper_ids(self) -> tuple[str, ...]:
+        return self.checked_paper_ids
 
     @property
     def remaining_paper_ids(self) -> tuple[str, ...]:
@@ -663,10 +679,7 @@ class CoverageState:
 
     @property
     def coverage_complete(self) -> bool:
-        if (
-            self.strategy is CoverageStrategy.CANDIDATE_VERIFICATION
-            and not self.discovery_completed
-        ):
+        if set(self.screened_paper_ids) != set(self.scope_paper_ids):
             return False
         return not self.remaining_paper_ids
 
@@ -682,6 +695,7 @@ class ResearchRunResult:
     traces: tuple[ActionTrace, ...]
     budget_usage: BudgetUsage
     coverage: CoverageState | None = None
+    candidate_selection: CandidateSelection | None = None
     selected_evidence: tuple[EvidenceRecord, ...] = ()
     answer: ResearchAnswer | None = None
     thread_id: str | None = None

@@ -15,6 +15,7 @@ from paperbase.retrieval.contracts import PaperSearchSpec
 from .contracts import (
     AgentAction,
     BudgetUsage,
+    CandidateSelection,
     CoverageState,
     EvidenceQualification,
     EvidenceRecord,
@@ -54,6 +55,7 @@ class DecisionState:
     budget_usage: BudgetUsage
     suppressed_paper_ids: tuple[str, ...] = ()
     coverage: CoverageState | None = None
+    candidate_selection: CandidateSelection | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +209,10 @@ def _state_prompt(state: DecisionState, errors: list[str]) -> str:
                 "complete": state.coverage.coverage_complete,
                 "required_paper_ids": state.coverage.required_paper_ids,
                 "remaining_paper_ids": state.coverage.remaining_paper_ids,
+                "screened_paper_ids": state.coverage.screened_paper_ids,
+                "candidate_paper_ids": state.coverage.candidate_paper_ids,
+                "uncertain_paper_ids": state.coverage.uncertain_paper_ids,
+                "excluded_paper_ids": state.coverage.excluded_paper_ids,
                 "assessments": [
                     {
                         "paper_id": item.paper_id,
@@ -218,6 +224,18 @@ def _state_prompt(state: DecisionState, errors: list[str]) -> str:
                 ],
             }
             if state.coverage is not None
+            else None
+        ),
+        "candidate_selection": (
+            [
+                {
+                    "paper_id": item.paper_id,
+                    "disposition": item.disposition.value,
+                    "reason": item.reason,
+                }
+                for item in state.candidate_selection.assessments
+            ]
+            if state.candidate_selection is not None
             else None
         ),
         "previous_validation_errors": errors[-1:],

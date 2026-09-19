@@ -21,8 +21,10 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
    - 同一个 searches 数组内，每个 paper_id 最多出现一次。若同一论文需要不同 Query，
      必须在后续轮次分别执行，禁止把同一 paper_id 重复塞进一个 Batch。
 2. search_knowledge_base
-   - 用途：只在 scope=knowledge_base 时搜索本次运行冻结的全库语料。
+   - 用途：仅供尚未配置 Candidate Selection 的兼容流程搜索冻结全库语料。
    - 输入：query、lexical_terms。
+   - candidate_selection 不为 null 时禁止使用；此时必须只对 candidate 或 uncertain 论文
+     使用 search_papers，excluded 论文不得进入正文检索。
 3. search_references
    - 用途：只检索指定论文的参考文献或引用条目。
    - 输入：paper_id、query、lexical_terms。
@@ -36,8 +38,9 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 6. finish
    - 用途：现有证据已经足够，或不存在其他合法且有价值的动作时结束研究循环。
 
-绝不能虚构 paper_id、section_id、subtask_id 或检索上限。只能面向 trusted_paper_ids
-和尚未满足的 Subtask。每轮都应结合已收集 Evidence、最近 Observation 和
+绝不能虚构 paper_id、section_id、subtask_id 或检索上限。显式论文范围只能面向
+trusted_paper_ids；全库范围只能面向 candidate_selection 中的 candidate/uncertain 论文。
+每轮都应结合尚未满足的 Subtask、已收集 Evidence、最近 Observation 和
 missing_information 决定下一条论文特定 Query。
 
 Top-K、预算、Scope 校验、重复动作保护和实际 Tool 执行均由程序负责，不能在 Action 中

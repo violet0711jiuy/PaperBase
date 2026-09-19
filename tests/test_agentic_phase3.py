@@ -7,6 +7,9 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from paperbase.agentic.contracts import (
+    CandidateAssessment,
+    CandidateDisposition,
+    CandidateSelection,
     CoverageStrategy,
     CorpusScopeSnapshot,
     EvidenceOwnership,
@@ -189,7 +192,7 @@ class AgenticPhase3Tests(unittest.TestCase):
         )
         self.assertTrue(second.coverage_complete)
 
-    def test_global_discovery_does_not_count_as_candidate_verification(self) -> None:
+    def test_candidate_selection_does_not_count_as_body_verification(self) -> None:
         context = QueryContext(
             original_query="哪些论文支持该方法？",
             resolved_query="哪些论文支持该方法？",
@@ -204,6 +207,13 @@ class AgenticPhase3Tests(unittest.TestCase):
             _record("E1", "A"), originating_tools=("search_knowledge_base",)
         )
         snapshot = CorpusScopeSnapshot.create(("A", "B"))
+        selection = CandidateSelection(
+            scope_paper_ids=("A", "B"),
+            assessments=(
+                CandidateAssessment("A", CandidateDisposition.CANDIDATE, "元数据直接相关"),
+                CandidateAssessment("B", CandidateDisposition.EXCLUDED, "元数据明确无关"),
+            ),
+        )
         manager = CoverageManager()
         first = manager.evaluate(
             context=context,
@@ -219,6 +229,7 @@ class AgenticPhase3Tests(unittest.TestCase):
                     queries_by_paper=(("A", "global query"),),
                 ),
             ),
+            candidate_selection=selection,
         )
         self.assertFalse(first.coverage_complete)
         self.assertEqual(first.remaining_paper_ids, ("A",))
@@ -237,11 +248,46 @@ class AgenticPhase3Tests(unittest.TestCase):
                 ),
                 _observation(("A", "paper-specific query")),
             ),
+            candidate_selection=selection,
         )
         self.assertTrue(verified.coverage_complete)
         self.assertEqual(
             verified.assessments[0].status, PaperAssessmentStatus.UNCERTAIN
         )
+
+    def test_uncertain_paper_uses_one_shallow_query_in_exhaustive_scope(self) -> None:
+        context = QueryContext(
+            original_query="完整列出风速预测方法",
+            resolved_query="完整列出风速预测方法",
+            intent=Intent.SYNTHESIZE,
+            scope=QueryScope.KNOWLEDGE_BASE,
+            target_paper_ids=(),
+            scope_source=ScopeSource.KNOWLEDGE_BASE_ALL,
+            retrieval_goal=ResearchGoal.EXHAUSTIVE_ENUMERATION,
+            default_evidence_targets=frozenset({EvidenceTarget.METHOD}),
+            requires_complete_coverage=True,
+        )
+        snapshot = CorpusScopeSnapshot.create(("A", "B"))
+        selection = CandidateSelection(
+            scope_paper_ids=("A", "B"),
+            assessments=(
+                CandidateAssessment("A", CandidateDisposition.UNCERTAIN, "元数据不足"),
+                CandidateAssessment("B", CandidateDisposition.EXCLUDED, "主题无关"),
+            ),
+        )
+        coverage = CoverageManager(
+            CoveragePolicy(exhaustive_min_queries_per_paper=2)
+        ).evaluate(
+            context=context,
+            corpus_snapshot=snapshot,
+            candidate_selection=selection,
+            evidence=(),
+            observations=(_observation(("A", "shallow verification")),),
+        )
+        self.assertTrue(coverage.coverage_complete)
+        self.assertEqual(coverage.screened_paper_ids, ("A", "B"))
+        self.assertEqual(coverage.verified_paper_ids, ("A",))
+        self.assertEqual(coverage.excluded_paper_ids, ("B",))
 
     def test_selector_balances_positive_papers_and_filters_background(self) -> None:
         coverage = CoverageManager().evaluate(

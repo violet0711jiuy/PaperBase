@@ -157,6 +157,7 @@ class AgenticLLMContractTests(unittest.TestCase):
         self.assertIs(context.query_understanding._client, shared_client)
         self.assertIs(context.planner._client, shared_client)
         self.assertIs(context.decision_agent._client, shared_client)
+        self.assertIs(context.candidate_selector._client, shared_client)
         self.assertIs(context.evidence_analyzer._client, shared_client)
         self.assertIs(context.answer_generator._client, shared_client)
 

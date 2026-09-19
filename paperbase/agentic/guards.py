@@ -9,6 +9,7 @@ from paperbase.config import AgenticResearchSettings
 
 from .contracts import (
     AgentAction,
+    CandidateSelection,
     BudgetUsage,
     CorpusScopeSnapshot,
     FinishAction,
@@ -87,6 +88,7 @@ class BudgetAndGuardTracker:
         context: QueryContext,
         plan: ResearchPlan,
         snapshot: CorpusScopeSnapshot | None,
+        candidate_selection: CandidateSelection | None = None,
     ) -> GuardDecision:
         if isinstance(action, FinishAction):
             return GuardDecision(True, "OK", "")
@@ -109,10 +111,21 @@ class BudgetAndGuardTracker:
             else set(context.target_paper_ids)
         )
         if isinstance(action, SearchKnowledgeBaseAction):
+            if candidate_selection is not None:
+                return GuardDecision(
+                    False,
+                    "CandidateScopeLocked",
+                    "Candidate Selection 完成后必须按候选论文执行 paper-scoped 检索。",
+                )
             if context.scope is not QueryScope.KNOWLEDGE_BASE or snapshot is None:
                 return GuardDecision(False, "InvalidScope", "Global search requires a corpus snapshot.")
-        elif not set(target_ids).issubset(allowed):
-            return GuardDecision(False, "InvalidScope", "Action targets papers outside trusted scope.")
+        else:
+            if candidate_selection is not None:
+                allowed = set(
+                    (*candidate_selection.candidate_paper_ids, *candidate_selection.uncertain_paper_ids)
+                )
+            if not set(target_ids).issubset(allowed):
+                return GuardDecision(False, "InvalidScope", "Action targets papers outside trusted candidate scope.")
         if any(paper_id in self.suppressed_papers for paper_id in target_ids):
             return GuardDecision(False, "NoNewEvidenceSuppressed", "Paper has reached the no-new-evidence limit.")
         fingerprint = action_fingerprint(action)
@@ -159,9 +172,18 @@ class BudgetAndGuardTracker:
                 if count >= self.settings.max_no_new_evidence_per_paper:
                     self.suppressed_papers.add(paper_id)
 
-    def no_available_actions(self, context: QueryContext) -> bool:
+    def no_available_actions(
+        self,
+        context: QueryContext,
+        *,
+        candidate_selection: CandidateSelection | None = None,
+    ) -> bool:
         required = (
-            {"__knowledge_base__"}
+            set(
+                (*candidate_selection.candidate_paper_ids, *candidate_selection.uncertain_paper_ids)
+            )
+            if candidate_selection is not None
+            else {"__knowledge_base__"}
             if context.scope is QueryScope.KNOWLEDGE_BASE
             else set(context.target_paper_ids)
         )

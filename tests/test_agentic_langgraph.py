@@ -7,6 +7,9 @@ from tempfile import TemporaryDirectory
 from langgraph.checkpoint.memory import InMemorySaver
 
 from paperbase.agentic.contracts import (
+    CandidateAssessment,
+    CandidateDisposition,
+    CandidateSelection,
     EvidenceAnalysis,
     EvidenceAnalysisStatus,
     EvidenceClaim,
@@ -19,6 +22,7 @@ from paperbase.agentic.contracts import (
     StopReason,
 )
 from paperbase.agentic.decision import DecisionResult, ScriptedDecisionAgent
+from paperbase.agentic.candidate_selection import CandidateSelectionResult
 from paperbase.agentic.evidence_analysis import EvidenceAnalysisResult
 from paperbase.agentic.graph import LangGraphResearchWorkflow
 from paperbase.agentic.evaluation import evaluate_research_result
@@ -145,6 +149,28 @@ class _SupportingEvidenceAnalyzer:
         return EvidenceAnalysisResult(analyses=analyses, llm_calls=0)
 
 
+class _StaticCandidateSelector:
+    def select(self, *, question, snapshot):
+        return CandidateSelectionResult(
+            CandidateSelection(
+                scope_paper_ids=snapshot.paper_ids,
+                assessments=tuple(
+                    CandidateAssessment(
+                        paper_id,
+                        (
+                            CandidateDisposition.CANDIDATE
+                            if paper_id == "A"
+                            else CandidateDisposition.EXCLUDED
+                        ),
+                        "A 与问题相关" if paper_id == "A" else "B 与问题无关",
+                    )
+                    for paper_id in snapshot.paper_ids
+                ),
+            ),
+            llm_calls=1,
+        )
+
+
 def _action(paper_id: str, query: str, subtask_id: str) -> SearchPapersAction:
     return SearchPapersAction(
         searches=(
@@ -174,6 +200,7 @@ def _workflow(
     checkpointer=None,
     answer_generator=None,
     evidence_analyzer=None,
+    candidate_selector=None,
 ):
     resolver, understanding, planner = _components()
     return LangGraphResearchWorkflow(
@@ -182,6 +209,7 @@ def _workflow(
         planner=planner,
         decision_agent=decision_agent,
         evidence_analyzer=evidence_analyzer or _SupportingEvidenceAnalyzer(),
+        candidate_selector=candidate_selector,
         tool_executor=executor,
         settings=settings or AgenticResearchSettings(),
         answer_generator=answer_generator,
@@ -210,6 +238,33 @@ class _FailingAnswerGenerator:
 
 
 class AgenticLangGraphTests(unittest.TestCase):
+    def test_knowledge_base_candidate_selection_blocks_excluded_body_search(self) -> None:
+        executor = _Executor()
+        result = _workflow(
+            ScriptedDecisionAgent(
+                (
+                    _action("B", "irrelevant deep search", "S1"),
+                    _action("A", "wind forecasting method", "S1"),
+                    FinishAction("candidate verified"),
+                )
+            ),
+            executor,
+            candidate_selector=_StaticCandidateSelector(),
+        ).run(
+            "查找风速预测方法相关论文",
+            knowledge_base_all=True,
+            thread_id="candidate-selection",
+        )
+        self.assertEqual(result.status, ResearchRunStatus.COMPLETED)
+        self.assertEqual(
+            [action.searches[0].paper_id for action in executor.calls], ["A"]
+        )
+        self.assertEqual(result.budget_usage.invalid_actions, 1)
+        self.assertEqual(result.candidate_selection.candidate_paper_ids, ("A",))
+        self.assertEqual(result.coverage.screened_paper_ids, ("A", "B"))
+        self.assertEqual(result.coverage.excluded_paper_ids, ("B",))
+        self.assertEqual(result.coverage.verified_paper_ids, ("A",))
+
     def test_final_answer_reuses_selected_evidence_ids(self) -> None:
         generator = _AnswerGenerator()
         result = _workflow(

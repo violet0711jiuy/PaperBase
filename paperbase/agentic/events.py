@@ -26,6 +26,7 @@ class ResearchProgressEvent:
 _NODE_MESSAGES: dict[str, tuple[str, str]] = {
     "resolve_scope": ("scope", "正在确认论文范围"),
     "understand_query": ("understanding", "正在理解研究问题"),
+    "select_candidates": ("candidate_selection", "正在根据论文元数据筛选候选范围"),
     "build_plan": ("planning", "正在拆分研究任务"),
     "decide_action": ("decision", "正在决定下一步检索动作"),
     "assess_action": ("assessment", "正在评估论文覆盖度"),
