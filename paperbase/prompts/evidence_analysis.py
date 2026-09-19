@@ -6,6 +6,9 @@ import json
 from typing import Mapping
 
 
+EVIDENCE_ANALYSIS_PROMPT_VERSION = "p3-claim-coverage-v1"
+
+
 EVIDENCE_ANALYSIS_SYSTEM_PROMPT = """\
 你是学术证据系统的 Evidence Analysis 阶段。你不选择下一步 Tool，也不撰写最终回答；
 你只分析输入中真实存在的 Evidence，并为每条 Evidence 输出一个结构化结果。

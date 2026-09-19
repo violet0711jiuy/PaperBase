@@ -1,6 +1,6 @@
 # Agentic RAG v1 真实运行发现与修订计划
 
-> 状态：`P0-P2_IMPLEMENTED / P3-P4_PLANNED`
+> 状态：`P0-P3_IMPLEMENTED / P4_PLANNED`
 > 记录日期：2026-09-19
 > 文档性质：Phase 4 首个真实闭环后的问题记录、架构修订建议与实施优先级。
 > 基线关系：本文不直接覆盖《Agentic RAG v1 冻结架构》；涉及冻结语义的修改，应在实现前形成明确契约和迁移测试。
@@ -354,6 +354,8 @@ Answer Generator 应接收 Claim、Relation、Ownership 和原始 Evidence 映�
 
 ### P3：检索质量与效率
 
+> 实施状态：`COMPLETED`（2026-09-19）。
+
 1. 根据每篇论文的 Digest 和缺口生成动态 Query。
 2. 过滤低相关度结果、表格碎片和重复内容。
 3. 保持每篇论文 Evidence 多样性。
@@ -473,6 +475,41 @@ P1 完成后的全量验证结果：`284 passed, 15 subtests passed`。
 - Coverage/Scope Guard 拒绝形成独立的 `guard_rejection` 记录。
 
 P2 完成后的全量验证结果：`291 passed, 15 subtests passed`。
+
+### 8.0.3 P3 实施记录（2026-09-19）
+
+本轮完成了动态检索反馈、自动 Evidence 治理与分析缓存闭环：
+
+- `evidence_targets`、`missing_information`、`target_subtask_id` 从 SearchSpec 贯穿
+  ToolResult、Observation、Registry 与 checkpoint；成功、空结果和错误查询均保留完整意图；
+- 每条 Evidence 使用来源类型、论文、Source Chunk、Overview 字段和规范化正文生成稳定
+  SHA-256 指纹，不依赖运行期 E#/R#、排序分数或本轮 Query；
+- Evidence Analysis 输出新增 `covered_targets` 与 `addressed_information`，程序强制它们只能
+  取自原请求；`irrelevant / failed` 不能携带虚假覆盖；
+- `PaperResearchProfile` 每轮从 Registry、Observation 和 Plan 重算逐论文已尝试 Query、已覆盖
+  与剩余目标、已回答与剩余信息、已见章节及合格 Claim；不新增第二份可漂移持久化状态；
+- Decision 可同时看到 A 的已发现比较维度与 B 的剩余缺口，从而先查 A、再为 B 生成论文特定
+  Query；Guard 使用独立的 `paper_id + normalized query` 指纹，改变 Batch 组成也不能重复查询；
+- Tool 与 Registry 之间新增强制 `filter_evidence` 节点。只有 reranker 成功时才应用最低分阈值，
+  高重叠来源窗口保留较强项；非结果目标的表格碎片降权审计，结果目标无替代时保守救援最强表格；
+- 准入审计只保存 Evidence 指纹、Chunk ID、分数、决策和原因，不复制正文；过滤异常 fail-open；
+- Registry 跨轮复用同章节高度重叠窗口的稳定 E#；Decision 可见 Evidence 与 Final Selector 均
+  先保证论文平衡和章节多样性，再允许同章节证据补位；
+- Evidence Analysis 使用独立 SQLite 缓存。Key 包含 Evidence 指纹、规范化问题、目标/缺口、
+  Schema 版本和提示词版本；只缓存 `qualified / irrelevant`，命中后重绑 E#:C# 并重新验证原文锚点；
+  损坏条目自动删除并回退 LLM，hit/miss/write/error 随 Observation 进入 checkpoint。
+
+新增回归覆盖：
+
+- A/B 使用不同 Query，A 的 Claim 可作为 B 的下一轮比较维度；
+- 同篇相同 Query 在不同 Batch 和 checkpoint 恢复后均被拒绝；
+- 低分准入只作用于成功 rerank，fallback 分数不误删；
+- 结果表格救援、非结果表格降权、高重叠窗口去重和章节多样性；
+- 相同证据/问题二次分析 0 次 LLM，问题或提示词版本变化强制 miss；
+- 缓存 JSON 或原文锚点损坏时删除并安全回退；
+- 普通快速 RAG 与 Phase 1～4 既有回归保持通过。
+
+P3 完成后的全量验证结果：`310 passed, 15 subtests passed`。
 
 ### 8.1 全库方法归纳
 

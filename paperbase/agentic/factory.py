@@ -23,6 +23,7 @@ from paperbase.retrieval.service import create_hybrid_retriever
 from .decision import LLMDecisionAgent
 from .candidate_selection import FormalPaperMetadataRepository, LLMCandidateSelector
 from .evidence_analysis import LLMEvidenceAnalyzer
+from .evidence_analysis_cache import SQLiteEvidenceAnalysisCache
 from .graph import LangGraphResearchWorkflow
 from .persistence import SQLiteCheckpointStore
 from .planner import ResearchPlanner
@@ -134,7 +135,12 @@ def create_agentic_research_service(
                 overview_repository=overview_repository,
             ),
         ),
-        evidence_analyzer=LLMEvidenceAnalyzer(evidence_analysis_client),
+        evidence_analyzer=LLMEvidenceAnalyzer(
+            evidence_analysis_client,
+            cache=SQLiteEvidenceAnalysisCache(
+                settings.agentic_research.evidence_analysis_cache_path
+            ),
+        ),
         tool_executor=tool_executor,
         settings=settings.agentic_research,
         answer_generator=(

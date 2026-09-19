@@ -329,6 +329,9 @@ class AgenticResearchSettings(BaseModel):
 
     enabled: bool = True
     checkpoint_path: Path = Path("storage/agentic_checkpoints.sqlite3")
+    evidence_analysis_cache_path: Path = Path(
+        "storage/evidence_analysis_cache.sqlite3"
+    )
     checkpoint_retention_days: int = Field(default=30, ge=1, le=3650)
     max_concurrent_runs: int = Field(default=1, ge=1, le=32)
     max_agent_iterations: int = Field(default=8, ge=1, le=50)
@@ -354,10 +357,12 @@ class AgenticResearchSettings(BaseModel):
     decision_max_output_tokens: int = Field(default=2_400, ge=400, le=8_000)
     evidence_analysis_max_output_tokens: int = Field(default=3_000, ge=400, le=8_000)
 
-    @field_validator("checkpoint_path", mode="after")
+    @field_validator(
+        "checkpoint_path", "evidence_analysis_cache_path", mode="after"
+    )
     @classmethod
     def resolve_checkpoint_path(cls, value: Path, info: ValidationInfo) -> Path:
-        """将 Agent checkpoint 固定到项目配置目录下的绝对路径。"""
+        """将 Agent checkpoint 与分析缓存固定到配置目录下的绝对路径。"""
         return _resolve_path(value, info)
 
 
@@ -428,6 +433,16 @@ def load_settings(config_path: Path | str | None = None) -> AppSettings:
         raise ConfigurationError(
             "Configuration root must be a YAML mapping, for example 'parsing: ...'."
         )
+
+    # Pydantic 不会为嵌套模型的默认 Path 继承顶层 validation context；在进入
+    # 类型校验前补成显式配置，确保旧 config.yaml 也按配置文件目录解析新路径。
+    agentic_config = raw_config.setdefault("agentic_research", {})
+    if not isinstance(agentic_config, dict):
+        raise ConfigurationError("agentic_research must be a YAML mapping.")
+    agentic_config.setdefault(
+        "evidence_analysis_cache_path",
+        "storage/evidence_analysis_cache.sqlite3",
+    )
 
     try:
         settings = AppSettings.model_validate(

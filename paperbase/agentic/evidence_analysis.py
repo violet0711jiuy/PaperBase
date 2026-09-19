@@ -17,11 +17,13 @@ from paperbase.prompts.evidence_analysis import (
 
 from .contracts import (
     EvidenceAnalysis,
+    EvidenceAnalysisCacheStats,
     EvidenceAnalysisStatus,
     EvidenceClaim,
     EvidenceRecord,
     LLMCallRecord,
 )
+from .evidence_analysis_cache import SQLiteEvidenceAnalysisCache
 from paperbase.llm.diagnostics import failure_record, repair_hint, success_record
 from .schemas import EvidenceAnalysisBatchDraft
 
@@ -31,6 +33,7 @@ class EvidenceAnalysisResult:
     analyses: tuple[EvidenceAnalysis, ...]
     llm_calls: int
     llm_diagnostics: tuple[LLMCallRecord, ...] = ()
+    cache_stats: EvidenceAnalysisCacheStats = EvidenceAnalysisCacheStats()
 
 
 class EvidenceAnalyzer(Protocol):
@@ -49,6 +52,7 @@ class LLMEvidenceAnalyzer:
         batch_size: int = 4,
         max_content_chars: int = 1_200,
         max_attempts: int = 2,
+        cache: SQLiteEvidenceAnalysisCache | None = None,
     ) -> None:
         if batch_size < 1 or max_content_chars < 100 or max_attempts < 1:
             raise ValueError("Evidence Analysis limits must be positive.")
@@ -56,6 +60,7 @@ class LLMEvidenceAnalyzer:
         self._batch_size = batch_size
         self._max_content_chars = max_content_chars
         self._max_attempts = max_attempts
+        self._cache = cache
 
     def analyze(
         self, *, question: str, evidence: tuple[EvidenceRecord, ...]
@@ -65,11 +70,27 @@ class LLMEvidenceAnalyzer:
             for item in evidence
             if item.analysis_status is EvidenceAnalysisStatus.PENDING
         )
-        analyses: list[EvidenceAnalysis] = []
+        analyses_by_id: dict[str, EvidenceAnalysis] = {}
         llm_calls = 0
         diagnostics: list[LLMCallRecord] = []
-        for offset in range(0, len(pending), self._batch_size):
-            batch = pending[offset : offset + self._batch_size]
+        cache_stats = EvidenceAnalysisCacheStats()
+        uncached: list[EvidenceRecord] = []
+        for item in pending:
+            if self._cache is None:
+                uncached.append(item)
+                continue
+            lookup = self._cache.lookup(question=question, record=item)
+            if lookup.analysis is not None:
+                analyses_by_id[item.evidence_id] = lookup.analysis
+                cache_stats = cache_stats + EvidenceAnalysisCacheStats(hits=1)
+            else:
+                uncached.append(item)
+                cache_stats = cache_stats + EvidenceAnalysisCacheStats(
+                    misses=1, errors=int(lookup.error)
+                )
+        uncached_tuple = tuple(uncached)
+        for offset in range(0, len(uncached_tuple), self._batch_size):
+            batch = uncached_tuple[offset : offset + self._batch_size]
             errors: list[str] = []
             accepted: tuple[EvidenceAnalysis, ...] | None = None
             content_limit = self._max_content_chars
@@ -117,21 +138,37 @@ class LLMEvidenceAnalyzer:
                     if record.recovery_action == "compact_context":
                         content_limit = max(100, content_limit // 2)
             if accepted is not None:
-                analyses.extend(accepted)
+                for analysis in accepted:
+                    analyses_by_id[analysis.evidence_id] = analysis
+                    if self._cache is not None:
+                        record = next(
+                            item
+                            for item in batch
+                            if item.evidence_id == analysis.evidence_id
+                        )
+                        wrote = self._cache.put(
+                            question=question,
+                            record=record,
+                            analysis=analysis,
+                        )
+                        cache_stats = cache_stats + EvidenceAnalysisCacheStats(
+                            writes=int(wrote), errors=int(not wrote)
+                        )
             else:
                 error_code = (
                     diagnostics[-1].error_stage if diagnostics else None
                 ) or "EvidenceAnalysisFailed"
-                analyses.extend(
-                    EvidenceAnalysis(
+                for item in batch:
+                    analyses_by_id[item.evidence_id] = EvidenceAnalysis(
                         evidence_id=item.evidence_id,
                         status=EvidenceAnalysisStatus.FAILED,
                         error_code=error_code,
                     )
-                    for item in batch
-                )
         return EvidenceAnalysisResult(
-            tuple(analyses), llm_calls, tuple(diagnostics)
+            tuple(analyses_by_id[item.evidence_id] for item in pending),
+            llm_calls,
+            tuple(diagnostics),
+            cache_stats,
         )
 
 

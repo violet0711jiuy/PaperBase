@@ -648,6 +648,11 @@ Phase 2.5 的退出条件：
 - [x] Exhaustive / Candidate Verification 策略：穷举默认要求直接查询与替代表达；全库发现查询不计作候选论文验证。
 - [x] Final Evidence Selector：过滤 background-only，优先本文直接证据，并保证多篇 positive 论文至少各有一条核心证据。
 - [x] 接入 Phase 2.5 Graph：Coverage 进入 Decision State 与 checkpoint，`finish` 受 Coverage Gate 约束，终态输出 selected evidence。
+- [x] 搜索意图与缺口贯穿 Tool、Registry、Observation 和 checkpoint，并派生逐论文 Research Profile。
+- [x] Decision 支持基于已有论文 Claim 与剩余缺口生成动态逐论文 Query；Guard 跨 Batch 去重。
+- [x] Tool 后强制执行可审计 Evidence Admission Filter，并保守处理结果表格。
+- [x] Registry 跨轮重叠去重，Decision 与 Final Selector 优先论文/章节多样性。
+- [x] 独立 SQLite Evidence Analysis Cache，按指纹、问题、目标/缺口和版本隔离。
 
 Phase 3 的各项能力继续实现为框架无关的领域组件，再作为明确的治理或收尾步骤接入 Phase 2.5 建立的 Graph；不得把 Qualification、Coverage 或 Selector 逻辑直接写死在路由表达式中。
 
@@ -718,6 +723,10 @@ LangGraph 在 Phase 2 领域契约稳定后、Phase 3 证据治理前引入。�
 - 正式 Overview 缺失时 Tool 返回 `unavailable`，不能在读取路径隐式调用 LLM 生成。
 - Qualification、Coverage、Registry 和稳定 Evidence ID 在 checkpoint/resume 后保持一致。
 - Phase 3 专项测试和此前全部回归测试同时通过。
+- 同一论文的相同规范化 Query 即使改变 Batch 组成或恢复 checkpoint 也必须拒绝。
+- Evidence Analysis 覆盖目标与已回答信息只能来自原始 SearchSpec，不能由模型扩张。
+- 低分过滤只能在 reranker 成功时生效；结果型表格无替代候选时不得被全部删除。
+- 相同 Evidence/问题/分析上下文二次执行必须命中缓存且不调用 LLM；问题或版本变化必须 miss。
 
 ### 17.5 Phase 4
 

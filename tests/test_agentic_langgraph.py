@@ -289,6 +289,7 @@ class AgenticLangGraphTests(unittest.TestCase):
         self.assertFalse(
             hasattr(report.decisions[0], "content")  # type: ignore[union-attr]
         )
+        self.assertIsNotNone(result.observations[0].evidence_analysis_cache)
 
     def test_knowledge_base_candidate_selection_blocks_excluded_body_search(self) -> None:
         executor = _Executor()

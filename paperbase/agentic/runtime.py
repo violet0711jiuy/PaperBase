@@ -364,6 +364,7 @@ class ResearchRuntime:
                 iteration=tracker.iterations,
                 target_subtask_ids=action_subtask_ids(decision.action),
             )
+            cache_stats = None
             if self._evidence_analyzer is not None and delta.added_ids:
                 pending = tuple(
                     record
@@ -376,6 +377,7 @@ class ResearchRuntime:
                 )
                 registry.apply_analyses(analysis.analyses)
                 tracker.record_preparation_llm_calls(analysis.llm_calls)
+                cache_stats = analysis.cache_stats
             added_paper_ids = {
                 record.evidence.paper_id
                 for evidence_id in delta.added_ids
@@ -391,6 +393,7 @@ class ResearchRuntime:
                     delta=delta,
                     remaining_budget=tracker.remaining(),
                     evidence_filter_report=admission.report,
+                    evidence_analysis_cache=cache_stats,
                 )
             )
             traces.append(

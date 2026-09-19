@@ -9,6 +9,7 @@ from .contracts import (
     CoverageState,
     CoverageStrategy,
     EvidenceAnalysis,
+    EvidenceAnalysisCacheStats,
     EvidenceAnalysisStatus,
     EvidenceClaim,
     EvidenceOwnership,
@@ -49,6 +50,7 @@ from .decision import LLMDecisionAgent, ScriptedDecisionAgent
 from .coverage import CoverageManager, CoveragePolicy
 from .evidence_registry import EvidenceRegistry
 from .evidence_analysis import EvidenceAnalysisResult, LLMEvidenceAnalyzer
+from .evidence_analysis_cache import SQLiteEvidenceAnalysisCache
 from .evaluation import AgenticEvaluationReport, evaluate_research_result
 from .events import ResearchProgressEvent
 from .factory import AgenticResearchConfigurationError, create_agentic_research_service
@@ -80,6 +82,7 @@ __all__ = [
     "CoverageState",
     "CoverageStrategy",
     "EvidenceAnalysis",
+    "EvidenceAnalysisCacheStats",
     "EvidenceAnalysisResult",
     "EvidenceAnalysisStatus",
     "EvidenceClaim",
@@ -125,6 +128,7 @@ __all__ = [
     "LLMDecisionAgent",
     "LLMCandidateSelector",
     "LLMEvidenceAnalyzer",
+    "SQLiteEvidenceAnalysisCache",
     "PaperMetadata",
     "QueryUnderstandingService",
     "ResearchPlanner",

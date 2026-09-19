@@ -632,6 +632,24 @@ class EvidenceFilterReport:
 
 
 @dataclass(frozen=True)
+class EvidenceAnalysisCacheStats:
+    hits: int = 0
+    misses: int = 0
+    writes: int = 0
+    errors: int = 0
+
+    def __add__(
+        self, other: "EvidenceAnalysisCacheStats"
+    ) -> "EvidenceAnalysisCacheStats":
+        return EvidenceAnalysisCacheStats(
+            hits=self.hits + other.hits,
+            misses=self.misses + other.misses,
+            writes=self.writes + other.writes,
+            errors=self.errors + other.errors,
+        )
+
+
+@dataclass(frozen=True)
 class PaperSearchAttempt:
     """一次逐论文搜索的完整意图与结果摘要。"""
 
@@ -659,6 +677,7 @@ class ResearchObservation:
     remaining_budget: dict[str, int] = field(default_factory=dict)
     search_attempts: tuple[PaperSearchAttempt, ...] = ()
     evidence_filter_report: EvidenceFilterReport | None = None
+    evidence_analysis_cache: EvidenceAnalysisCacheStats | None = None
 
 
 @dataclass(frozen=True)

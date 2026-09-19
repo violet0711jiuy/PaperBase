@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Iterator
 from typing import Any, Literal, TypedDict
 from uuid import uuid4
@@ -1052,6 +1052,7 @@ def _analyze_evidence(
         analyses = result.analyses
         llm_calls = result.llm_calls
         llm_diagnostics = result.llm_diagnostics
+        cache_stats = result.cache_stats
     except Exception as error:
         analyses = tuple(
             EvidenceAnalysis(
@@ -1063,6 +1064,7 @@ def _analyze_evidence(
         )
         llm_calls = 0
         llm_diagnostics = ()
+        cache_stats = None
     try:
         registry.apply_analyses(analyses)
     except ValueError as error:
@@ -1077,6 +1079,18 @@ def _analyze_evidence(
             state, llm_diagnostics
         ),
     }
+    observations = _observations(state)
+    if observations and cache_stats is not None:
+        update["observations"] = dump_contract(
+            (
+                *observations[:-1],
+                replace(
+                    observations[-1],
+                    evidence_analysis_cache=cache_stats,
+                ),
+            ),
+            tuple[ResearchObservation, ...],
+        )
     if tracker.llm_calls + int(runtime.context.answer_generator is not None) > runtime.context.settings.max_llm_calls:
         update.update(
             _terminal_update(

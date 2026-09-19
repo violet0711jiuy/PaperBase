@@ -198,6 +198,8 @@ agentic_research:
   enabled: true
   # Phase 4：本地 SQLite checkpoint 支持应用重启后继续任务。
   checkpoint_path: storage/agentic_checkpoints.sqlite3
+  # Evidence Analysis 使用独立 SQLite，不与正式 KB 或 checkpoint 混表。
+  evidence_analysis_cache_path: storage/evidence_analysis_cache.sqlite3
   checkpoint_retention_days: 30
   # 桌面版默认串行执行，避免本地模型、SQLite 与向量检索争抢资源。
   max_concurrent_runs: 1

@@ -61,6 +61,8 @@ P2 新增的节点输出预算包括：
 - `candidate_selection_max_output_tokens`；
 - `decision_max_output_tokens`；
 - `evidence_analysis_max_output_tokens`。
+- `evidence_analysis_cache_path`：Evidence Analysis 独立 SQLite 缓存路径。缓存键同时包含
+  Evidence 指纹、问题、请求目标/信息缺口、Schema 版本和提示词版本；失败分析不会写入。
 
 这些值只控制对应节点的可见输出上限；API Key、Prompt、LLM 原始输出和隐藏推理正文不会
 写入诊断记录。运行记录只持久化 token 数、字符数、`finish_reason`、错误阶段和不含输入值

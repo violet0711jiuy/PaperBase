@@ -50,6 +50,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.agentic_research.planner_max_output_tokens, 1400)
         self.assertEqual(settings.agentic_research.decision_max_output_tokens, 2400)
         self.assertEqual(
+            settings.agentic_research.evidence_analysis_cache_path,
+            project_root / "storage" / "evidence_analysis_cache.sqlite3",
+        )
+        self.assertEqual(
             settings.database.path,
             project_root / "storage" / "paperbase.sqlite3",
         )
