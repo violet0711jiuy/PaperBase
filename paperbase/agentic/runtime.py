@@ -19,6 +19,7 @@ from .contracts import (
 )
 from .decision import DecisionAgent, DecisionError, DecisionState
 from .coverage import CoverageManager, CoveragePolicy
+from .evidence_analysis import EvidenceAnalyzer
 from .evidence_registry import EvidenceRegistry
 from .guards import BudgetAndGuardTracker, action_subtask_ids
 from .observation import build_observation
@@ -41,10 +42,12 @@ class ResearchRuntime:
         self,
         *,
         decision_agent: DecisionAgent,
+        evidence_analyzer: EvidenceAnalyzer | None = None,
         tool_executor: ToolExecutor,
         settings: AgenticResearchSettings,
     ) -> None:
         self._decision_agent = decision_agent
+        self._evidence_analyzer = evidence_analyzer
         self._tool_executor = tool_executor
         self._settings = settings
 
@@ -347,6 +350,18 @@ class ResearchRuntime:
                 iteration=tracker.iterations,
                 target_subtask_ids=action_subtask_ids(decision.action),
             )
+            if self._evidence_analyzer is not None and delta.added_ids:
+                pending = tuple(
+                    record
+                    for evidence_id in delta.added_ids
+                    if (record := registry.get(evidence_id)) is not None
+                )
+                analysis = self._evidence_analyzer.analyze(
+                    question=context.resolved_query,
+                    evidence=pending,
+                )
+                registry.apply_analyses(analysis.analyses)
+                tracker.record_preparation_llm_calls(analysis.llm_calls)
             added_paper_ids = {
                 record.evidence.paper_id
                 for evidence_id in delta.added_ids

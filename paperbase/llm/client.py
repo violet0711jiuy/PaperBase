@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 import os
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -28,6 +29,7 @@ class LLMRuntimeSettings:
     timeout_seconds: float
     temperature: float
     max_tokens: int
+    structured_output_mode: str = "json_schema"
 
 
 @runtime_checkable
@@ -75,6 +77,13 @@ def load_llm_runtime_settings(env_path: Path) -> LLMRuntimeSettings:
         ) from error
     if timeout_seconds <= 0 or not 0 <= temperature <= 2 or max_tokens < 1:
         raise LLMConfigurationError("LLM runtime numeric settings are outside valid ranges.")
+    structured_output_mode = os.getenv(
+        "LLM_STRUCTURED_OUTPUT_MODE", "json_schema"
+    ).strip().casefold()
+    if structured_output_mode not in {"json_schema", "json_object"}:
+        raise LLMConfigurationError(
+            "LLM_STRUCTURED_OUTPUT_MODE must be json_schema or json_object."
+        )
     return LLMRuntimeSettings(
         api_key=required["LLM_API_KEY"],
         base_url=required["LLM_BASE_URL"].rstrip("/"),
@@ -82,6 +91,7 @@ def load_llm_runtime_settings(env_path: Path) -> LLMRuntimeSettings:
         timeout_seconds=timeout_seconds,
         temperature=temperature,
         max_tokens=max_tokens,
+        structured_output_mode=structured_output_mode,
     )
 
 
@@ -144,33 +154,43 @@ class OpenAICompatibleChatClient:
         json_schema: dict[str, Any],
         schema_name: str,
     ) -> str:
-        """使用 OpenAI 兼容 ``response_format=json_schema`` 请求原生结构化结果。
+        """按模型能力使用严格 JSON Schema 或兼容 JSON Object 结构化输出。
 
         ``json_schema`` 由 Query Rewrite 的 Pydantic 模型生成；Client 只负责将其交给 API
         并取回最终文本，不在此处解释任何业务字段。即使供应商承诺遵守 Schema，调用方仍会
         再执行 Pydantic 校验，避免把外部响应直接信任为内部业务对象。
         """
+        structured_system_prompt = system_prompt
+        if self._settings.structured_output_mode == "json_object":
+            # 部分 OpenAI 兼容模型不实现 json_schema，但支持 json_object。此时将完整
+            # Schema 注入提示词，返回后仍由调用方的 Pydantic 模型执行确定性校验。
+            structured_system_prompt = (
+                f"{system_prompt}\n\n"
+                "你必须只输出一个 JSON 对象，且严格满足以下 JSON Schema；"
+                "不要输出 Markdown 代码块或额外说明：\n"
+                f"{json.dumps(json_schema, ensure_ascii=False, sort_keys=True)}"
+            )
+            response_format: dict[str, Any] = {"type": "json_object"}
+        else:
+            response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": json_schema,
+                },
+            }
         try:
             response = self._client.chat.completions.create(
                 model=self._settings.model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": structured_system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=self._settings.temperature,
                 max_tokens=self._settings.max_tokens,
                 # 原生结构化输出：API 层先约束字段、类型及禁止额外字段的 JSON Schema。
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        # Schema 名称：仅供 API 标识此结构，不参与模型业务语义。
-                        "name": schema_name,
-                        # strict=True：要求供应商按 JSON Schema 严格生成。
-                        "strict": True,
-                        # Schema 内容：由调用方的 Pydantic 模型导出。
-                        "schema": json_schema,
-                    },
-                },
+                response_format=response_format,
                 stream=False,
             )
             content = _extract_non_stream_content(response)

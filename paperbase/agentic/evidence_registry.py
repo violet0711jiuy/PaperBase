@@ -10,6 +10,7 @@ from paperbase.retrieval.contracts import (
 )
 
 from .contracts import (
+    EvidenceAnalysis,
     EvidenceQualification,
     EvidenceRecord,
     RegistryDelta,
@@ -108,6 +109,38 @@ class EvidenceRegistry:
             current = records_by_id[qualification.evidence_id]
             key = _evidence_key(current.evidence)
             self._records_by_key[key] = replace(current, qualification=qualification)
+        return tuple(evidence_ids)
+
+    def apply_analyses(
+        self, analyses: tuple[EvidenceAnalysis, ...]
+    ) -> tuple[str, ...]:
+        """把独立 Evidence Analysis 原子写回 Registry。"""
+        evidence_ids = [item.evidence_id for item in analyses]
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("同一轮 Evidence Analysis 不能重复处理同一 Evidence。")
+        records_by_id = {
+            record.evidence_id: record for record in self._records_by_key.values()
+        }
+        unknown_ids = tuple(
+            evidence_id
+            for evidence_id in evidence_ids
+            if evidence_id not in records_by_id
+        )
+        if unknown_ids:
+            raise ValueError(
+                "Evidence Analysis 引用了未知 Evidence：" + ", ".join(unknown_ids)
+            )
+        for analysis in analyses:
+            current = records_by_id[analysis.evidence_id]
+            key = _evidence_key(current.evidence)
+            self._records_by_key[key] = replace(
+                current,
+                analysis_status=analysis.status,
+                digest=analysis.digest,
+                claims=analysis.claims,
+                analysis_error=analysis.error_code,
+                qualification=None,
+            )
         return tuple(evidence_ids)
 
     def snapshot(self) -> RegistryState:

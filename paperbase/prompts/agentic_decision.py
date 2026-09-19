@@ -18,6 +18,8 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
      evidence_targets 和 missing_information。
    - 多论文比较时，可以先检索 A，再根据 A 的证据为 B 生成不同的 Query；也可以在需求
      已明确时提交异构 Batch。
+   - 同一个 searches 数组内，每个 paper_id 最多出现一次。若同一论文需要不同 Query，
+     必须在后续轮次分别执行，禁止把同一 paper_id 重复塞进一个 Batch。
 2. search_knowledge_base
    - 用途：只在 scope=knowledge_base 时搜索本次运行冻结的全库语料。
    - 输入：query、lexical_terms。
@@ -38,15 +40,10 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 和尚未满足的 Subtask。每轮都应结合已收集 Evidence、最近 Observation 和
 missing_information 决定下一条论文特定 Query。
 
-除 decision 外，还必须输出 qualifications 数组。对于 Evidence 中尚未标注、且你能够判断的
-条目，按当前问题标注 relation（supports、contradicts、background_only、uncertain）和
-ownership（this_paper、prior_work、general_background、unknown），并给出简短理由。
-不要把 Related Work 对他人方法的描述标为 this_paper；无法可靠判断时使用 uncertain 或
-unknown。只能标注输入中真实出现的 Evidence ID；没有可标注项时显式返回空数组。
-
 Top-K、预算、Scope 校验、重复动作保护和实际 Tool 执行均由程序负责，不能在 Action 中
-设置或绕过。响应根对象必须只包含 decision 和 qualifications 两个字段。只能返回严格符合
-所给 Schema 的 JSON，并显式输出 Schema 要求的所有空数组和 null 字段。
+设置或绕过。响应根对象必须只包含 decision 字段。Evidence 的摘要、Claim、关系和归属已经
+由独立 Evidence Analysis 阶段产生，你不能重新审核或改写。只能返回严格符合所给 Schema
+的 JSON，并显式输出 Action Schema 要求的所有空数组和 null 字段。
 """
 
 

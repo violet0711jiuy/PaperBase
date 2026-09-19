@@ -152,10 +152,53 @@ class _FailingDatabase(_Database):
 
 
 class AgenticDecisionAndToolTests(unittest.TestCase):
+    def test_decision_repair_rejects_duplicate_paper_in_one_batch(self) -> None:
+        def search(query: str) -> dict[str, object]:
+            return {
+                "paper_id": "A",
+                "query": query,
+                "lexical_terms": [],
+                "evidence_targets": ["method"],
+                "missing_information": [],
+            }
+
+        invalid = json.dumps(
+            {
+                "decision": {
+                    "action": "search_papers",
+                    "searches": [search("method"), search("method details")],
+                    "target_subtask_id": "S1",
+                },
+            }
+        )
+        valid = json.dumps(
+            {
+                "decision": {
+                    "action": "search_papers",
+                    "searches": [search("method")],
+                    "target_subtask_id": "S1",
+                },
+            }
+        )
+        plan = ResearchPlan(
+            "method",
+            (
+                ResearchSubtask(
+                    "S1", "find", ("A",), frozenset({EvidenceTarget.METHOD}), "evidence"
+                ),
+            ),
+        )
+
+        decision = LLMDecisionAgent(_QueuedClient((invalid, valid))).decide(
+            DecisionState(_single_context(), plan, (), (), BudgetUsage())
+        )
+
+        self.assertEqual(decision.llm_calls, 2)
+        self.assertEqual(len(decision.action.searches), 1)
+
     def test_decision_repair_rejects_agent_supplied_top_k(self) -> None:
         invalid = json.dumps(
             {
-                "qualifications": [],
                 "decision": {
                     "action": "search_papers",
                     "searches": [
@@ -174,7 +217,6 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
         )
         valid = json.dumps(
             {
-                "qualifications": [],
                 "decision": {
                     "action": "search_papers",
                     "searches": [
@@ -204,7 +246,6 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
     def test_decision_repair_rejects_unknown_section_reference(self) -> None:
         unknown_section = json.dumps(
             {
-                "qualifications": [],
                 "decision": {
                     "action": "get_section_context",
                     "paper_id": "A",
@@ -215,7 +256,6 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
         )
         valid_search = json.dumps(
             {
-                "qualifications": [],
                 "decision": {
                     "action": "search_papers",
                     "searches": [
@@ -248,7 +288,6 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
     def test_decision_accepts_section_id_exposed_by_evidence(self) -> None:
         known_section = json.dumps(
             {
-                "qualifications": [],
                 "decision": {
                     "action": "get_section_context",
                     "paper_id": "A",

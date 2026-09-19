@@ -159,8 +159,8 @@ answer_generation:
   max_evidence_units: 8
   # Reranker 成功但所有正文分数都低于此值时，不让无关 chunk 进入 Answer LLM。
   min_rerank_score: 0.05
-  # 最终阅读式回答的独立输出上限；不再受全局 LLM_MAX_TOKENS=500 限制。
-  max_output_tokens: 1600
+  # 最终阅读式回答的独立输出上限；为带隐藏推理的模型预留充足 JSON 闭合空间。
+  max_output_tokens: 4000
 
 # v0.2 Step 2：单篇临时论文速览。只读取 temporary workspace 的 parsed/chunks 产物，
 # 先按字段选择候选 evidence，再合并、去重并应用全局 token 预算；不执行 FAISS 检索。
@@ -216,6 +216,7 @@ agentic_research:
   # 最终送入答案阶段的 Evidence 总数和单篇论文上限。
   final_evidence_max_units: 8
   final_evidence_max_per_paper: 4
+  evidence_analysis_max_output_tokens: 3000
 
 # Step 6：Query Planning、Dense 和 FTS5/BM25 混合检索配置。
 retrieval:

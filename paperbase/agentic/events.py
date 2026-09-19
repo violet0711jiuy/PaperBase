@@ -28,10 +28,11 @@ _NODE_MESSAGES: dict[str, tuple[str, str]] = {
     "understand_query": ("understanding", "正在理解研究问题"),
     "build_plan": ("planning", "正在拆分研究任务"),
     "decide_action": ("decision", "正在决定下一步检索动作"),
-    "qualify_and_assess": ("assessment", "正在评估证据与论文覆盖度"),
+    "assess_action": ("assessment", "正在评估论文覆盖度"),
     "validate_action": ("validation", "正在校验检索动作"),
     "execute_tool": ("retrieval", "正在检索论文证据"),
     "register_and_observe": ("evidence", "正在登记并去重证据"),
+    "analyze_evidence": ("evidence_analysis", "正在提取证据摘要、Claim 与归属"),
     "generate_answer": ("answer", "正在基于证据生成回答"),
     "finish_run": ("finish", "正在整理最终结果"),
 }

@@ -60,6 +60,7 @@ class DecisionState:
 class DecisionResult:
     action: AgentAction
     llm_calls: int
+    # 兼容旧的 ScriptedDecisionAgent / ResearchRuntime；生产 LLM Decision 不再生成此字段。
     qualifications: tuple[EvidenceQualification, ...] = ()
 
 
@@ -85,17 +86,7 @@ class LLMDecisionAgent:
                 draft = AGENT_DECISION_ADAPTER.validate_json(raw)
                 action = _to_action(draft.decision)
                 _validate_action_references(action, state)
-                qualifications = tuple(
-                    EvidenceQualification(
-                        evidence_id=item.evidence_id,
-                        relation=item.relation,
-                        ownership=item.ownership,
-                        rationale=item.rationale,
-                    )
-                    for item in draft.qualifications
-                )
-                _validate_qualifications(qualifications, state)
-                return DecisionResult(action, attempt, qualifications)
+                return DecisionResult(action, attempt)
             except Exception as error:
                 errors.append(f"{type(error).__name__}: {error}")
         raise DecisionError("Decision output remained invalid after repair.", llm_calls=self._max_attempts)
@@ -115,6 +106,11 @@ class ScriptedDecisionAgent:
 
 def _to_action(draft: ActionDraft) -> AgentAction:
     if isinstance(draft, SearchPapersDraft):
+        paper_ids = [item.paper_id for item in draft.searches]
+        if len(paper_ids) != len(set(paper_ids)):
+            raise ValueError(
+                "searches 内不能重复 paper_id；同一论文的不同 Query 必须分轮执行。"
+            )
         return SearchPapersAction(
             searches=tuple(
                 PaperSearchSpec(
@@ -152,9 +148,8 @@ def _to_action(draft: ActionDraft) -> AgentAction:
 
 
 def _state_prompt(state: DecisionState, errors: list[str]) -> str:
-    # Decision 只需要近期、有界的证据摘要来形成下一条动态 Query；完整原文继续保留在
-    # Registry，不把无界检索上下文塞进每次模型调用。
-    visible_evidence = state.evidence[-12:]
+    # Decision 只读取 Evidence Analysis 产生的短摘要与 Claim；完整原文保留在 Registry。
+    visible_evidence = _visible_evidence(state.evidence)
     summary = {
         "question": state.context.resolved_query,
         "scope": state.context.scope.value,
@@ -175,18 +170,19 @@ def _state_prompt(state: DecisionState, errors: list[str]) -> str:
                 "source_type": record.evidence.source_type.value,
                 "section_id": record.evidence.section_id,
                 "section": record.evidence.section,
-                "excerpt": record.evidence.content[:800],
+                "analysis_status": record.analysis_status.value,
+                "digest": record.digest,
+                "claims": [
+                    {
+                        "claim_id": claim.claim_id,
+                        "statement": claim.statement,
+                        "relation": claim.relation.value,
+                        "ownership": claim.ownership.value,
+                    }
+                    for claim in record.claims
+                ],
                 "supporting_queries": record.supporting_queries[-3:],
                 "target_subtask_ids": record.target_subtask_ids,
-                "qualification": (
-                    {
-                        "relation": record.qualification.relation.value,
-                        "ownership": record.qualification.ownership.value,
-                        "rationale": record.qualification.rationale,
-                    }
-                    if record.qualification is not None
-                    else None
-                ),
             }
             for record in visible_evidence
         ],
@@ -244,13 +240,30 @@ def _validate_action_references(action: AgentAction, state: DecisionState) -> No
         )
 
 
-def _validate_qualifications(
-    qualifications: tuple[EvidenceQualification, ...], state: DecisionState
-) -> None:
-    known_ids = {record.evidence_id for record in state.evidence}
-    ids = [item.evidence_id for item in qualifications]
-    if len(ids) != len(set(ids)):
-        raise ValueError("qualifications 不能重复引用同一 Evidence ID。")
-    unknown_ids = tuple(evidence_id for evidence_id in ids if evidence_id not in known_ids)
-    if unknown_ids:
-        raise ValueError("qualifications 引用了不可见 Evidence：" + ", ".join(unknown_ids))
+def _visible_evidence(
+    evidence: tuple[EvidenceRecord, ...], *, limit: int = 12
+) -> tuple[EvidenceRecord, ...]:
+    """优先给 Decision 展示已分析、可支持结论且跨论文分布的短摘要。"""
+    ranked = sorted(
+        evidence,
+        key=lambda record: (
+            bool(record.claims),
+            any(
+                claim.relation.value in {"supports", "contradicts"}
+                for claim in record.claims
+            ),
+            record.evidence.score or 0.0,
+        ),
+        reverse=True,
+    )
+    selected: list[EvidenceRecord] = []
+    counts: dict[str, int] = {}
+    for record in ranked:
+        paper_id = record.evidence.paper_id
+        if counts.get(paper_id, 0) >= 3:
+            continue
+        selected.append(record)
+        counts[paper_id] = counts.get(paper_id, 0) + 1
+        if len(selected) >= limit:
+            break
+    return tuple(selected)

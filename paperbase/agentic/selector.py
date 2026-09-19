@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .contracts import (
     CoverageState,
+    EvidenceAnalysisStatus,
     EvidenceOwnership,
     EvidenceRecord,
     EvidenceRelation,
@@ -58,25 +59,31 @@ class FinalEvidenceSelector:
 
     @staticmethod
     def _eligible(record: EvidenceRecord) -> bool:
-        qualification = record.qualification
-        if qualification is None:
-            return True
-        return (
-            qualification.relation is not EvidenceRelation.BACKGROUND_ONLY
-            and qualification.ownership is not EvidenceOwnership.GENERAL_BACKGROUND
+        if record.analysis_status is not EvidenceAnalysisStatus.QUALIFIED:
+            return False
+        return any(
+            claim.relation in {EvidenceRelation.SUPPORTS, EvidenceRelation.CONTRADICTS}
+            and claim.ownership
+            not in {EvidenceOwnership.GENERAL_BACKGROUND, EvidenceOwnership.UNKNOWN}
+            for claim in record.claims
         )
 
     @staticmethod
     def _rank(record: EvidenceRecord, plan: ResearchPlan) -> tuple[float, ...]:
-        qualification = record.qualification
         direct = float(
-            qualification is not None
-            and qualification.ownership is EvidenceOwnership.THIS_PAPER
+            any(
+                claim.ownership is EvidenceOwnership.THIS_PAPER
+                and claim.relation
+                in {EvidenceRelation.SUPPORTS, EvidenceRelation.CONTRADICTS}
+                for claim in record.claims
+            )
         )
         relation = float(
-            qualification is not None
-            and qualification.relation
-            in {EvidenceRelation.SUPPORTS, EvidenceRelation.CONTRADICTS}
+            any(
+                claim.relation
+                in {EvidenceRelation.SUPPORTS, EvidenceRelation.CONTRADICTS}
+                for claim in record.claims
+            )
         )
         subtask_match = float(
             bool(set(record.target_subtask_ids).intersection(

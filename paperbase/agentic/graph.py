@@ -18,10 +18,10 @@ from paperbase.retrieval.contracts import ToolResult
 from .contracts import (
     ActionTrace,
     AgentAction,
-    BudgetUsage,
     CorpusScopeSnapshot,
     CoverageState,
-    EvidenceQualification,
+    EvidenceAnalysis,
+    EvidenceAnalysisStatus,
     EvidenceRecord,
     FinishAction,
     GuardState,
@@ -40,6 +40,7 @@ from .answering import AgenticAnswerGenerator, generate_agentic_answer
 from .checkpoint_serde import CheckpointValue, dump_contract, load_contract
 from .coverage import CoverageManager, CoveragePolicy
 from .decision import DecisionAgent, DecisionError, DecisionState
+from .evidence_analysis import EvidenceAnalyzer
 from .evidence_registry import EvidenceRegistry
 from .events import ResearchProgressEvent, progress_event_for_node
 from .guards import (
@@ -60,10 +61,11 @@ NextNode = Literal[
     "understand_query",
     "build_plan",
     "decide_action",
-    "qualify_and_assess",
+    "assess_action",
     "validate_action",
     "execute_tool",
     "register_and_observe",
+    "analyze_evidence",
     "generate_answer",
     "finish_run",
 ]
@@ -82,9 +84,9 @@ class AgentGraphState(TypedDict, total=False):
     query_context: CheckpointValue
     plan: CheckpointValue
     action: CheckpointValue
-    qualifications: CheckpointValue
     action_fingerprint: str
     tool_result: CheckpointValue
+    pending_analysis_ids: list[str]
     registry_state: CheckpointValue
     guard_state: CheckpointValue
     coverage: CheckpointValue
@@ -106,6 +108,7 @@ class AgentGraphContext:
     query_understanding: QueryUnderstandingService
     planner: ResearchPlanner
     decision_agent: DecisionAgent
+    evidence_analyzer: EvidenceAnalyzer
     tool_executor: ToolExecutor
     answer_generator: AgenticAnswerGenerator | None
     settings: AgenticResearchSettings
@@ -130,6 +133,7 @@ class LangGraphResearchWorkflow:
         query_understanding: QueryUnderstandingService,
         planner: ResearchPlanner,
         decision_agent: DecisionAgent,
+        evidence_analyzer: EvidenceAnalyzer,
         tool_executor: ToolExecutor,
         settings: AgenticResearchSettings,
         answer_generator: AgenticAnswerGenerator | None = None,
@@ -140,6 +144,7 @@ class LangGraphResearchWorkflow:
             query_understanding=query_understanding,
             planner=planner,
             decision_agent=decision_agent,
+            evidence_analyzer=evidence_analyzer,
             tool_executor=tool_executor,
             answer_generator=answer_generator,
             settings=settings,
@@ -384,10 +389,11 @@ def build_agentic_research_graph() -> StateGraph:
     graph.add_node("understand_query", _understand_query)
     graph.add_node("build_plan", _build_plan)
     graph.add_node("decide_action", _decide_action)
-    graph.add_node("qualify_and_assess", _qualify_and_assess)
+    graph.add_node("assess_action", _assess_action)
     graph.add_node("validate_action", _validate_action)
     graph.add_node("execute_tool", _execute_tool)
     graph.add_node("register_and_observe", _register_and_observe)
+    graph.add_node("analyze_evidence", _analyze_evidence)
     graph.add_node("generate_answer", _generate_answer)
     graph.add_node("finish_run", _finish_run)
 
@@ -412,18 +418,24 @@ def build_agentic_research_graph() -> StateGraph:
         _route,
         {
             "decide_action": "decide_action",
-            "qualify_and_assess": "qualify_and_assess",
+            "assess_action": "assess_action",
             "generate_answer": "generate_answer",
         },
     )
     graph.add_conditional_edges(
-        "qualify_and_assess",
+        "assess_action",
         _route,
         {
             "decide_action": "decide_action",
             "validate_action": "validate_action",
             "generate_answer": "generate_answer",
         },
+    )
+    graph.add_edge("register_and_observe", "analyze_evidence")
+    graph.add_conditional_edges(
+        "analyze_evidence",
+        _route,
+        {"decide_action": "decide_action", "generate_answer": "generate_answer"},
     )
     graph.add_conditional_edges(
         "validate_action",
@@ -442,7 +454,6 @@ def build_agentic_research_graph() -> StateGraph:
             "generate_answer": "generate_answer",
         },
     )
-    graph.add_edge("register_and_observe", "decide_action")
     graph.add_edge("generate_answer", "finish_run")
     graph.add_edge("finish_run", END)
     return graph
@@ -622,50 +633,19 @@ def _decide_action(
         )
     return {
         "action": dump_contract(decision.action, AgentAction),
-        "qualifications": dump_contract(
-            decision.qualifications, tuple[EvidenceQualification, ...]
-        ),
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
-        "next_node": "qualify_and_assess",
+        "next_node": "assess_action",
     }
 
 
-def _qualify_and_assess(
+def _assess_action(
     state: AgentGraphState, runtime: Runtime[AgentGraphContext]
 ) -> AgentGraphState:
     tracker = _tracker(state, runtime.context.settings)
     registry = _registry(state)
     action = load_contract(state["action"], AgentAction)
-    qualifications = load_contract(
-        state["qualifications"], tuple[EvidenceQualification, ...]
-    )
     query_context = load_contract(state["query_context"], QueryContext)
     plan = load_contract(state["plan"], ResearchPlan)
-    try:
-        registry.apply_qualifications(qualifications)
-    except ValueError as error:
-        traces = _append_trace(
-            state,
-            ActionTrace(
-                tracker.iterations,
-                action.action_name,
-                False,
-                f"InvalidQualification: {error}",
-            ),
-        )
-        if tracker.record_invalid_action():
-            return _terminal_update(
-                state,
-                tracker=tracker,
-                traces=traces,
-                status=(ResearchRunStatus.PARTIAL if registry.records else ResearchRunStatus.FAILED),
-                reason=StopReason.INVALID_ACTION_LIMIT,
-            )
-        return {
-            "guard_state": dump_contract(tracker.snapshot(), GuardState),
-            "traces": traces,
-            "next_node": "decide_action",
-        }
     coverage = _evaluate_coverage(
         state,
         settings=runtime.context.settings,
@@ -727,7 +707,6 @@ def _qualify_and_assess(
         update["coverage"] = dump_contract(coverage, CoverageState)
         return update
     return {
-        "registry_state": dump_contract(registry.snapshot(), RegistryState),
         "coverage": dump_contract(coverage, CoverageState),
         "next_node": "validate_action",
     }
@@ -887,8 +866,64 @@ def _register_and_observe(
             ),
             ResearchPlan,
         ),
+        "pending_analysis_ids": list(delta.added_ids),
+        "next_node": "analyze_evidence",
+    }
+
+
+def _analyze_evidence(
+    state: AgentGraphState, runtime: Runtime[AgentGraphContext]
+) -> AgentGraphState:
+    """自动把新登记 Evidence 转成 Claim 级分析结果；失败时保持 fail-closed。"""
+    registry = _registry(state)
+    pending_ids = tuple(state.get("pending_analysis_ids", []))
+    pending = tuple(
+        record
+        for evidence_id in pending_ids
+        if (record := registry.get(evidence_id)) is not None
+        and record.analysis_status is EvidenceAnalysisStatus.PENDING
+    )
+    if not pending:
+        return {"pending_analysis_ids": [], "next_node": "decide_action"}
+    tracker = _tracker(state, runtime.context.settings)
+    try:
+        result = runtime.context.evidence_analyzer.analyze(
+            question=load_contract(state["query_context"], QueryContext).resolved_query,
+            evidence=pending,
+        )
+        analyses = result.analyses
+        llm_calls = result.llm_calls
+    except Exception as error:
+        analyses = tuple(
+            EvidenceAnalysis(
+                evidence_id=record.evidence_id,
+                status=EvidenceAnalysisStatus.FAILED,
+                error_code=f"{type(error).__name__}: {error}"[:300],
+            )
+            for record in pending
+        )
+        llm_calls = 0
+    try:
+        registry.apply_analyses(analyses)
+    except ValueError as error:
+        return _fatal_update(state, "analyze_evidence", error)
+    tracker.record_preparation_llm_calls(llm_calls)
+    update: AgentGraphState = {
+        "registry_state": dump_contract(registry.snapshot(), RegistryState),
+        "guard_state": dump_contract(tracker.snapshot(), GuardState),
+        "pending_analysis_ids": [],
         "next_node": "decide_action",
     }
+    if tracker.llm_calls + int(runtime.context.answer_generator is not None) > runtime.context.settings.max_llm_calls:
+        update.update(
+            _terminal_update(
+                state,
+                tracker=tracker,
+                status=_partial_or_no_evidence(registry),
+                reason=StopReason.BUDGET_EXHAUSTED,
+            )
+        )
+    return update
 
 
 def _generate_answer(

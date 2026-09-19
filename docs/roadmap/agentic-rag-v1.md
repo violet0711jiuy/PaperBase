@@ -4,6 +4,7 @@
 > 文档性质：目标架构与实现契约，不代表功能已经全部完成。  
 > 当前实施状态：Phase 1 至 Phase 4 已完成首个可运行闭环；Agentic Answer、SQLite 恢复、业务事件流和 Knowledge Base UI 已接通，PostgreSQL 与更高并发优化保留为部署演进项。
 > 冻结原则：核心边界、数据契约和状态语义冻结；配额、阈值与排序权重保留为配置项。
+> Phase 4 真实运行后的问题复现与修订优先级见 [`agentic-rag-v1-runtime-findings.md`](agentic-rag-v1-runtime-findings.md)。其中涉及 Candidate Selection、Action-only Decision 和 Claim 级 Evidence Analysis 的内容当前标记为 `PLANNED`，实现前需补充契约与迁移测试。
 
 ## 1. 结论
 

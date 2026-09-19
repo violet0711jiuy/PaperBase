@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from paperbase.agentic.factory import create_agentic_research_service
 from paperbase.agentic.schemas import (
     AGENT_DECISION_ADAPTER,
+    EvidenceAnalysisBatchDraft,
     QueryUnderstandingDraft,
     ResearchPlanDraft,
 )
@@ -91,11 +92,12 @@ class AgenticLLMContractTests(unittest.TestCase):
             QueryUnderstandingDraft.model_json_schema(),
             ResearchPlanDraft.model_json_schema(),
             AGENT_DECISION_ADAPTER.json_schema(),
+            EvidenceAnalysisBatchDraft.model_json_schema(),
         ):
             _assert_all_properties_required(self, schema)
         decision_schema = AGENT_DECISION_ADAPTER.json_schema()
         self.assertEqual(decision_schema["type"], "object")
-        self.assertEqual(decision_schema["required"], ["decision", "qualifications"])
+        self.assertEqual(decision_schema["required"], ["decision"])
 
     def test_local_schema_validation_rejects_missing_and_extra_fields(self) -> None:
         with self.assertRaises(ValidationError):
@@ -153,6 +155,7 @@ class AgenticLLMContractTests(unittest.TestCase):
         self.assertIs(context.query_understanding._client, shared_client)
         self.assertIs(context.planner._client, shared_client)
         self.assertIs(context.decision_agent._client, shared_client)
+        self.assertIs(context.evidence_analyzer._client, shared_client)
         self.assertIs(context.answer_generator._client, shared_client)
 
 

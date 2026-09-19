@@ -8,6 +8,7 @@ from .contracts import (
     CorpusScopeSnapshot,
     CoverageState,
     CoverageStrategy,
+    EvidenceAnalysisStatus,
     EvidenceOwnership,
     EvidenceRecord,
     EvidenceRelation,
@@ -123,10 +124,12 @@ class CoverageManager:
         direct = tuple(
             record
             for record in records
-            if record.qualification is not None
-            and record.qualification.ownership is EvidenceOwnership.THIS_PAPER
-            and record.qualification.relation
-            in {EvidenceRelation.SUPPORTS, EvidenceRelation.CONTRADICTS}
+            if any(
+                claim.ownership is EvidenceOwnership.THIS_PAPER
+                and claim.relation
+                in {EvidenceRelation.SUPPORTS, EvidenceRelation.CONTRADICTS}
+                for claim in record.claims
+            )
         )
         minimum = (
             self._policy.exhaustive_min_queries_per_paper
@@ -163,9 +166,13 @@ class CoverageManager:
                 rationale=f"尚未达到当前策略要求的 {minimum} 次论文级查询。",
             )
         uncertain = any(
-            record.qualification is None
-            or record.qualification.relation is EvidenceRelation.UNCERTAIN
-            or record.qualification.ownership is EvidenceOwnership.UNKNOWN
+            record.analysis_status
+            in {EvidenceAnalysisStatus.PENDING, EvidenceAnalysisStatus.FAILED}
+            or any(
+                claim.relation is EvidenceRelation.UNCERTAIN
+                or claim.ownership is EvidenceOwnership.UNKNOWN
+                for claim in record.claims
+            )
             for record in records
         )
         if uncertain:

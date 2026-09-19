@@ -134,7 +134,33 @@ class AgentDecisionDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     decision: ActionDraft
-    qualifications: list[EvidenceQualificationDraft] = Field(max_length=12)
 
 
 AGENT_DECISION_ADAPTER = TypeAdapter(AgentDecisionDraft)
+
+
+class EvidenceClaimDraft(BaseModel):
+    """模型提取的 Claim；claim_id 由程序按 Evidence ID 稳定分配。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    statement: NonEmptyText = Field(max_length=500)
+    relation: EvidenceRelation
+    ownership: EvidenceOwnership
+    rationale: NonEmptyText = Field(max_length=300)
+    source_excerpt: NonEmptyText = Field(max_length=300)
+
+
+class EvidenceAnalysisItemDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    evidence_id: NonEmptyText
+    status: Literal["qualified", "irrelevant"]
+    digest: NonEmptyText = Field(max_length=500)
+    claims: list[EvidenceClaimDraft] = Field(max_length=6)
+
+
+class EvidenceAnalysisBatchDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    analyses: list[EvidenceAnalysisItemDraft] = Field(min_length=1, max_length=4)

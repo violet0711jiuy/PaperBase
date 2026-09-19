@@ -95,6 +95,14 @@ class BudgetAndGuardTracker:
             if subtask_id not in known_subtasks:
                 return GuardDecision(False, "UnknownSubtask", f"Unknown subtask: {subtask_id}")
         target_ids = affected_paper_ids(action)
+        if isinstance(action, SearchPapersAction) and len(target_ids) != len(
+            set(target_ids)
+        ):
+            return GuardDecision(
+                False,
+                "DuplicatePaperSearch",
+                "A search_papers batch may contain each paper_id only once.",
+            )
         allowed = (
             set(snapshot.paper_ids)
             if context.scope is QueryScope.KNOWLEDGE_BASE and snapshot is not None

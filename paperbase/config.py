@@ -268,7 +268,7 @@ class AnswerGenerationSettings(BaseModel):
     # Reranker 已成功时，最高正文分低于该阈值即视为没有可用论文证据；0 表示关闭该保护。
     min_rerank_score: float = Field(default=0.05, ge=0.0, le=1.0)
     # 回答需要解释论文证据，单独覆盖全局 LLM_MAX_TOKENS；不影响短小的 Query Rewrite。
-    max_output_tokens: int = Field(default=1_600, ge=400, le=8_000)
+    max_output_tokens: int = Field(default=4_000, ge=400, le=8_000)
 
 
 class PaperOverviewSettings(BaseModel):
@@ -343,6 +343,7 @@ class AgenticResearchSettings(BaseModel):
     coverage_exhaustive_min_queries_per_paper: int = Field(default=2, ge=1, le=10)
     final_evidence_max_units: int = Field(default=8, ge=1, le=50)
     final_evidence_max_per_paper: int = Field(default=4, ge=1, le=20)
+    evidence_analysis_max_output_tokens: int = Field(default=3_000, ge=400, le=8_000)
 
     @field_validator("checkpoint_path", mode="after")
     @classmethod

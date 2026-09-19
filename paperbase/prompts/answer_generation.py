@@ -43,6 +43,13 @@ ANSWER_GENERATION_SYSTEM_PROMPT = """
    “为什么引用、如何借鉴、与本文有什么关系”等问题必须有 E# 正文证据支持，
    不能仅根据 R# 推断。
 
+6. 如果 Evidence 提供了 Claim 标注，必须遵守 ownership：
+   - this_paper 才能表述为“本文提出、实现或验证”；
+   - prior_work 只能表述为“论文回顾、引用或比较的已有工作”；
+   - general_background 只能作为背景，不得归因给本文；
+   - unknown 不得形成确定的贡献归因。
+   Claim 标注帮助控制归属，但事实引用仍必须落到对应的 E# 原始证据。
+
 【阅读式解释深度】
 当问题涉及方法、公式、复杂度、实验设置、结果或比较，且证据足以支持展开时，
 必须分别填写下面三部分的内容，不能把它们压缩为单一段落；程序会按对应的小标题展示：
@@ -162,10 +169,24 @@ def build_answer_generation_user_prompt(
 def _render_evidence(item: "EvidenceUnit") -> str:
     """在 Prompt 中保留来源、章节与原文，不把检索分数伪装成论文事实。"""
     page_text = _page_text(item.page_start, item.page_end)
+    analysis = ""
+    if item.evidence_digest or item.claim_annotations:
+        claims = "\n".join(
+            "- "
+            f"statement={claim.statement}; relation={claim.relation}; "
+            f"ownership={claim.ownership}; source_excerpt={claim.source_excerpt}"
+            for claim in item.claim_annotations
+        ) or "- (none)"
+        analysis = (
+            "\n<evidence_analysis>\n"
+            f"digest={item.evidence_digest or '(none)'}\n"
+            f"claims:\n{claims}\n"
+            "</evidence_analysis>\n"
+        )
     return (
         f"[{item.evidence_id}] kind={item.kind}; paper={item.paper_title}; "
         f"section={item.section}; pages={page_text}; chunks={','.join(item.chunk_ids)}\n"
-        f"{item.text}"
+        f"{analysis}{item.text}"
     )
 
 

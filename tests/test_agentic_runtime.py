@@ -3,6 +3,11 @@ from __future__ import annotations
 import unittest
 
 from paperbase.agentic.contracts import (
+    EvidenceAnalysis,
+    EvidenceAnalysisStatus,
+    EvidenceClaim,
+    EvidenceOwnership,
+    EvidenceRelation,
     EvidenceTarget,
     FinishAction,
     Intent,
@@ -17,6 +22,7 @@ from paperbase.agentic.contracts import (
     StopReason,
 )
 from paperbase.agentic.decision import ScriptedDecisionAgent
+from paperbase.agentic.evidence_analysis import EvidenceAnalysisResult
 from paperbase.agentic.runtime import ResearchRuntime
 from paperbase.config import AgenticResearchSettings
 from paperbase.retrieval.contracts import (
@@ -97,10 +103,46 @@ class _Executor:
         )
 
 
+class _SupportingEvidenceAnalyzer:
+    """旧循环测试也使用与 LangGraph 相同的 Evidence Analysis 契约。"""
+
+    def analyze(self, *, question, evidence):
+        return EvidenceAnalysisResult(
+            analyses=tuple(
+                EvidenceAnalysis(
+                    evidence_id=record.evidence_id,
+                    status=EvidenceAnalysisStatus.QUALIFIED,
+                    digest=f"{record.evidence.paper_id} 的方法证据",
+                    claims=(
+                        EvidenceClaim(
+                            claim_id=f"{record.evidence_id}:C1",
+                            statement=f"{record.evidence.paper_id} 描述了自己的方法",
+                            relation=EvidenceRelation.SUPPORTS,
+                            ownership=EvidenceOwnership.THIS_PAPER,
+                            rationale="该片段直接描述本文方法。",
+                            source_excerpt=record.evidence.content,
+                        ),
+                    ),
+                )
+                for record in evidence
+            ),
+            llm_calls=0,
+        )
+
+
+def _runtime(*, decision_agent, tool_executor, settings):
+    return ResearchRuntime(
+        decision_agent=decision_agent,
+        evidence_analyzer=_SupportingEvidenceAnalyzer(),
+        tool_executor=tool_executor,
+        settings=settings,
+    )
+
+
 class AgenticRuntimeTests(unittest.TestCase):
     def test_comparison_can_query_a_then_dynamically_query_b(self) -> None:
         executor = _Executor()
-        runtime = ResearchRuntime(
+        runtime = _runtime(
             decision_agent=ScriptedDecisionAgent(
                 (
                     _action("A", "A method mechanism", "S1"),
@@ -119,7 +161,7 @@ class AgenticRuntimeTests(unittest.TestCase):
 
     def test_no_new_evidence_suppresses_only_that_paper(self) -> None:
         executor = _Executor(empty_queries={"A attempt 1", "A attempt 2"})
-        runtime = ResearchRuntime(
+        runtime = _runtime(
             decision_agent=ScriptedDecisionAgent(
                 (
                     _action("A", "A attempt 1", "S1"),
@@ -144,7 +186,7 @@ class AgenticRuntimeTests(unittest.TestCase):
             )
         )
         executor = _Executor(empty_queries={"A miss 1", "A miss 2", "A should be suppressed"})
-        runtime = ResearchRuntime(
+        runtime = _runtime(
             decision_agent=ScriptedDecisionAgent(
                 (
                     first_batch,
@@ -166,7 +208,7 @@ class AgenticRuntimeTests(unittest.TestCase):
     def test_duplicate_action_is_rejected_before_tool_execution(self) -> None:
         action = _action("A", "same query", "S1")
         executor = _Executor()
-        runtime = ResearchRuntime(
+        runtime = _runtime(
             decision_agent=ScriptedDecisionAgent((action, action, FinishAction("done"))),
             tool_executor=executor,
             settings=AgenticResearchSettings(max_invalid_actions=0),
@@ -178,7 +220,7 @@ class AgenticRuntimeTests(unittest.TestCase):
 
     def test_iteration_budget_stops_loop_without_hanging(self) -> None:
         executor = _Executor(empty_queries={"q1", "q2", "q3"})
-        runtime = ResearchRuntime(
+        runtime = _runtime(
             decision_agent=ScriptedDecisionAgent(
                 (_action("A", "q1", "S1"), _action("A", "q2", "S1"), _action("B", "q3", "S2"))
             ),

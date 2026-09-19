@@ -7,8 +7,10 @@ from tempfile import TemporaryDirectory
 from langgraph.checkpoint.memory import InMemorySaver
 
 from paperbase.agentic.contracts import (
+    EvidenceAnalysis,
+    EvidenceAnalysisStatus,
+    EvidenceClaim,
     EvidenceOwnership,
-    EvidenceQualification,
     EvidenceRelation,
     EvidenceTarget,
     FinishAction,
@@ -17,6 +19,7 @@ from paperbase.agentic.contracts import (
     StopReason,
 )
 from paperbase.agentic.decision import DecisionResult, ScriptedDecisionAgent
+from paperbase.agentic.evidence_analysis import EvidenceAnalysisResult
 from paperbase.agentic.graph import LangGraphResearchWorkflow
 from paperbase.agentic.evaluation import evaluate_research_result
 from paperbase.agentic.persistence import SQLiteCheckpointStore
@@ -106,25 +109,40 @@ class _EvidenceAwareDecisionAgent:
 
 
 class _QualifyingDecisionAgent:
-    """在选择下一步动作的同一次语义调用中标注上一轮证据。"""
+    """Decision 只选择动作，不再负责证据分析。"""
 
     def decide(self, state):
-        qualifications = tuple(
-            EvidenceQualification(
-                record.evidence_id,
-                EvidenceRelation.SUPPORTS,
-                EvidenceOwnership.THIS_PAPER,
-                "该片段直接描述本文方法。",
-            )
-            for record in state.evidence
-            if record.qualification is None
-        )
         paper_ids = {record.evidence.paper_id for record in state.evidence}
         if "A" not in paper_ids:
-            return DecisionResult(_action("A", "A method", "S1"), 1, qualifications)
+            return DecisionResult(_action("A", "A method", "S1"), 1)
         if "B" not in paper_ids:
-            return DecisionResult(_action("B", "B method", "S2"), 1, qualifications)
-        return DecisionResult(FinishAction("qualified"), 1, qualifications)
+            return DecisionResult(_action("B", "B method", "S2"), 1)
+        return DecisionResult(FinishAction("qualified"), 1)
+
+
+class _SupportingEvidenceAnalyzer:
+    """测试替身：把每条新证据标为本文直接支持证据。"""
+
+    def analyze(self, *, question, evidence):
+        analyses = tuple(
+            EvidenceAnalysis(
+                evidence_id=record.evidence_id,
+                status=EvidenceAnalysisStatus.QUALIFIED,
+                digest=f"{record.evidence.paper_id} 的方法证据",
+                claims=(
+                    EvidenceClaim(
+                        claim_id=f"{record.evidence_id}:C1",
+                        statement=f"{record.evidence.paper_id} 描述了自己的方法",
+                        relation=EvidenceRelation.SUPPORTS,
+                        ownership=EvidenceOwnership.THIS_PAPER,
+                        rationale="该片段直接描述本文方法。",
+                        source_excerpt=record.evidence.content,
+                    ),
+                ),
+            )
+            for record in evidence
+        )
+        return EvidenceAnalysisResult(analyses=analyses, llm_calls=0)
 
 
 def _action(paper_id: str, query: str, subtask_id: str) -> SearchPapersAction:
@@ -155,6 +173,7 @@ def _workflow(
     settings=None,
     checkpointer=None,
     answer_generator=None,
+    evidence_analyzer=None,
 ):
     resolver, understanding, planner = _components()
     return LangGraphResearchWorkflow(
@@ -162,6 +181,7 @@ def _workflow(
         query_understanding=understanding,
         planner=planner,
         decision_agent=decision_agent,
+        evidence_analyzer=evidence_analyzer or _SupportingEvidenceAnalyzer(),
         tool_executor=executor,
         settings=settings or AgenticResearchSettings(),
         answer_generator=answer_generator,
@@ -371,14 +391,20 @@ class AgenticLangGraphTests(unittest.TestCase):
         self.assertFalse(result.traces[0].accepted)
         self.assertEqual(len(executor.calls), 2)
 
-    def test_qualification_is_checkpointed_before_coverage_assessment(self) -> None:
+    def test_evidence_analysis_is_checkpointed_before_coverage_assessment(self) -> None:
         result = _workflow(_QualifyingDecisionAgent(), _Executor()).run(
             "A 和 B 的方法有什么区别？",
             selected_paper_ids=("A", "B"),
-            thread_id="qualification-coverage",
+            thread_id="evidence-analysis-coverage",
         )
         self.assertEqual(result.status, ResearchRunStatus.COMPLETED)
-        self.assertTrue(all(record.qualification is not None for record in result.evidence))
+        self.assertTrue(
+            all(
+                record.analysis_status is EvidenceAnalysisStatus.QUALIFIED
+                and record.claims
+                for record in result.evidence
+            )
+        )
         self.assertEqual(set(result.coverage.positive_paper_ids), {"A", "B"})
 
     def test_graph_and_legacy_loop_have_equivalent_domain_results(self) -> None:
@@ -404,6 +430,7 @@ class AgenticLangGraphTests(unittest.TestCase):
         planned = planner.plan(understood.context)
         legacy_result = ResearchRuntime(
             decision_agent=ScriptedDecisionAgent(actions),
+            evidence_analyzer=_SupportingEvidenceAnalyzer(),
             tool_executor=_Executor(),
             settings=AgenticResearchSettings(),
         ).run(

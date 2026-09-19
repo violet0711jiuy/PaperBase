@@ -21,6 +21,7 @@ from paperbase.retrieval.hybrid_retriever import HybridRetriever
 from paperbase.retrieval.service import create_hybrid_retriever
 
 from .decision import LLMDecisionAgent
+from .evidence_analysis import LLMEvidenceAnalyzer
 from .graph import LangGraphResearchWorkflow
 from .persistence import SQLiteCheckpointStore
 from .planner import ResearchPlanner
@@ -75,6 +76,11 @@ def create_agentic_research_service(
     with_max_tokens = getattr(active_client, "with_max_tokens", None)
     if callable(with_max_tokens):
         answer_client = with_max_tokens(settings.answer_generation.max_output_tokens)
+    evidence_analysis_client = active_client
+    if callable(with_max_tokens):
+        evidence_analysis_client = with_max_tokens(
+            settings.agentic_research.evidence_analysis_max_output_tokens
+        )
 
     expander = SectionAwareNeighborExpander(
         database=active_database,
@@ -112,6 +118,7 @@ def create_agentic_research_service(
         query_understanding=QueryUnderstandingService(active_client),
         planner=ResearchPlanner(active_client),
         decision_agent=LLMDecisionAgent(active_client),
+        evidence_analyzer=LLMEvidenceAnalyzer(evidence_analysis_client),
         tool_executor=tool_executor,
         settings=settings.agentic_research,
         answer_generator=(

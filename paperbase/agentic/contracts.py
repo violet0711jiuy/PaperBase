@@ -57,6 +57,7 @@ class EvidenceRelation(str, Enum):
     CONTRADICTS = "contradicts"
     BACKGROUND_ONLY = "background_only"
     UNCERTAIN = "uncertain"
+    IRRELEVANT = "irrelevant"
 
 
 class EvidenceOwnership(str, Enum):
@@ -66,6 +67,15 @@ class EvidenceOwnership(str, Enum):
     PRIOR_WORK = "prior_work"
     GENERAL_BACKGROUND = "general_background"
     UNKNOWN = "unknown"
+
+
+class EvidenceAnalysisStatus(str, Enum):
+    """原始 Evidence 在自动证据分析流水线中的状态。"""
+
+    PENDING = "pending"
+    QUALIFIED = "qualified"
+    IRRELEVANT = "irrelevant"
+    FAILED = "failed"
 
 
 class PaperAssessmentStatus(str, Enum):
@@ -327,6 +337,66 @@ class EvidenceQualification:
 
 
 @dataclass(frozen=True)
+class EvidenceClaim:
+    """从一条 Evidence 中提取的原子事实及其关系、归属与原文锚点。"""
+
+    claim_id: str
+    statement: str
+    relation: EvidenceRelation
+    ownership: EvidenceOwnership
+    rationale: str
+    source_excerpt: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "claim_id", _text(self.claim_id, "claim_id"))
+        object.__setattr__(self, "statement", _text(self.statement, "statement"))
+        object.__setattr__(self, "relation", EvidenceRelation(self.relation))
+        object.__setattr__(self, "ownership", EvidenceOwnership(self.ownership))
+        object.__setattr__(self, "rationale", _text(self.rationale, "rationale"))
+        object.__setattr__(
+            self, "source_excerpt", _text(self.source_excerpt, "source_excerpt")
+        )
+
+
+@dataclass(frozen=True)
+class EvidenceAnalysis:
+    """Evidence Analysis 节点对一条已登记 Evidence 的完整处理结果。"""
+
+    evidence_id: str
+    status: EvidenceAnalysisStatus
+    digest: str | None = None
+    claims: tuple[EvidenceClaim, ...] = ()
+    error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_id", _text(self.evidence_id, "evidence_id"))
+        status = EvidenceAnalysisStatus(self.status)
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "claims", tuple(self.claims))
+        if self.digest is not None:
+            object.__setattr__(self, "digest", _text(self.digest, "digest"))
+        if self.error_code is not None:
+            object.__setattr__(
+                self, "error_code", _text(self.error_code, "error_code")
+            )
+        if status is EvidenceAnalysisStatus.QUALIFIED:
+            if self.digest is None or not self.claims:
+                raise ValueError("qualified evidence requires digest and claims.")
+            if self.error_code is not None:
+                raise ValueError("qualified evidence cannot contain error_code.")
+        elif status is EvidenceAnalysisStatus.IRRELEVANT:
+            if self.digest is None or self.claims:
+                raise ValueError("irrelevant evidence requires digest and no claims.")
+            if self.error_code is not None:
+                raise ValueError("irrelevant evidence cannot contain error_code.")
+        elif status is EvidenceAnalysisStatus.FAILED:
+            if self.error_code is None or self.claims:
+                raise ValueError("failed evidence requires error_code and no claims.")
+        elif self.digest is not None or self.claims or self.error_code is not None:
+            raise ValueError("pending evidence cannot contain analysis output.")
+
+
+@dataclass(frozen=True)
 class EvidenceRecord:
     evidence_id: str
     evidence: RetrievedEvidence
@@ -335,7 +405,50 @@ class EvidenceRecord:
     last_seen_iteration: int
     originating_tools: tuple[str, ...] = ()
     target_subtask_ids: tuple[str, ...] = ()
+    analysis_status: EvidenceAnalysisStatus = EvidenceAnalysisStatus.PENDING
+    digest: str | None = None
+    claims: tuple[EvidenceClaim, ...] = ()
+    analysis_error: str | None = None
+    # Phase 3 旧 checkpoint 的兼容字段；新链路只写入 Claim 级分析结果。
     qualification: EvidenceQualification | None = None
+
+    def __post_init__(self) -> None:
+        status = EvidenceAnalysisStatus(self.analysis_status)
+        claims = tuple(self.claims)
+        digest = self.digest
+        error = self.analysis_error
+        # 旧测试与 checkpoint 可能只有 Evidence 级 Qualification。加载时把它提升为
+        # 单 Claim，避免历史数据在新 fail-closed Selector 中被静默丢弃。
+        if self.qualification is not None and status is EvidenceAnalysisStatus.PENDING:
+            legacy = self.qualification
+            status = (
+                EvidenceAnalysisStatus.IRRELEVANT
+                if legacy.relation is EvidenceRelation.IRRELEVANT
+                else EvidenceAnalysisStatus.QUALIFIED
+            )
+            digest = self.evidence.content[:500]
+            if status is EvidenceAnalysisStatus.QUALIFIED:
+                claims = (
+                    EvidenceClaim(
+                        claim_id=f"{self.evidence_id}:C1",
+                        statement=self.evidence.content[:500],
+                        relation=legacy.relation,
+                        ownership=legacy.ownership,
+                        rationale=legacy.rationale,
+                        source_excerpt=self.evidence.content[:300],
+                    ),
+                )
+        object.__setattr__(self, "analysis_status", status)
+        object.__setattr__(self, "claims", claims)
+        object.__setattr__(self, "digest", digest)
+        object.__setattr__(self, "analysis_error", error)
+        EvidenceAnalysis(
+            evidence_id=self.evidence_id,
+            status=status,
+            digest=digest,
+            claims=claims,
+            error_code=error,
+        )
 
 
 @dataclass(frozen=True)

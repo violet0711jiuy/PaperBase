@@ -5,6 +5,9 @@ from .contracts import (
     CorpusScopeSnapshot,
     CoverageState,
     CoverageStrategy,
+    EvidenceAnalysis,
+    EvidenceAnalysisStatus,
+    EvidenceClaim,
     EvidenceOwnership,
     EvidenceQualification,
     EvidenceRelation,
@@ -35,6 +38,7 @@ from .contracts import (
 from .decision import LLMDecisionAgent, ScriptedDecisionAgent
 from .coverage import CoverageManager, CoveragePolicy
 from .evidence_registry import EvidenceRegistry
+from .evidence_analysis import EvidenceAnalysisResult, LLMEvidenceAnalyzer
 from .evaluation import AgenticEvaluationReport, evaluate_research_result
 from .events import ResearchProgressEvent
 from .factory import AgenticResearchConfigurationError, create_agentic_research_service
@@ -61,6 +65,10 @@ __all__ = [
     "CoveragePolicy",
     "CoverageState",
     "CoverageStrategy",
+    "EvidenceAnalysis",
+    "EvidenceAnalysisResult",
+    "EvidenceAnalysisStatus",
+    "EvidenceClaim",
     "EvidenceOwnership",
     "EvidenceQualification",
     "EvidenceQualificationManager",
@@ -99,6 +107,7 @@ __all__ = [
     "GraphExecution",
     "LangGraphResearchWorkflow",
     "LLMDecisionAgent",
+    "LLMEvidenceAnalyzer",
     "QueryUnderstandingService",
     "ResearchPlanner",
     "ResearchRuntime",

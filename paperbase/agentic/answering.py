@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Protocol, Sequence
 
 from paperbase.generation.answer_generator import AnswerGenerationOutcome
-from paperbase.generation.section_expander import EvidenceUnit
+from paperbase.generation.section_expander import EvidenceClaimContext, EvidenceUnit
 
 from .contracts import EvidenceRecord, ResearchAnswer
 
@@ -57,4 +57,14 @@ def _to_evidence_unit(record: EvidenceRecord) -> EvidenceUnit:
         text=source.content,
         token_count=max(1, (len(source.content) + 3) // 4),
         section_id=source.section_id,
+        evidence_digest=record.digest,
+        claim_annotations=tuple(
+            EvidenceClaimContext(
+                statement=claim.statement,
+                relation=claim.relation.value,
+                ownership=claim.ownership.value,
+                source_excerpt=claim.source_excerpt,
+            )
+            for claim in record.claims
+        ),
     )
