@@ -181,6 +181,57 @@ class EvidenceRegistryTests(unittest.TestCase):
         self.assertEqual(record.covered_targets, frozenset({EvidenceTarget.METHOD}))
         self.assertEqual(record.addressed_information, ("核心机制",))
 
+    def test_highly_overlapping_windows_reuse_stable_evidence_id_across_rounds(self) -> None:
+        def result_for(evidence, query):
+            return ToolResult(
+                status=ToolStatus.OK,
+                tool_name=ToolName.SEARCH_PAPERS,
+                payload=SearchPapersPayload(
+                    (
+                        PaperSearchOutcome(
+                            paper_id="paper_a",
+                            status=PaperSearchStatus.OK,
+                            query=query,
+                            lexical_terms=(),
+                            evidence_candidates=(evidence,),
+                        ),
+                    )
+                ),
+            )
+
+        first = RetrievedEvidence(
+            source_type=EvidenceSourceType.CONTENT,
+            paper_id="paper_a",
+            seed_chunk_ids=("c1",),
+            source_chunk_ids=("c1", "c2", "c3"),
+            section_id="method",
+            content="method window one",
+        )
+        expanded = RetrievedEvidence(
+            source_type=EvidenceSourceType.CONTENT,
+            paper_id="paper_a",
+            seed_chunk_ids=("c1",),
+            source_chunk_ids=("c1", "c2", "c3", "c4"),
+            section_id="method",
+            content="method window one plus neighbor",
+        )
+        registry = EvidenceRegistry()
+
+        added = registry.register_tool_result(
+            result_for(first, "method"), iteration=1
+        )
+        reused = registry.register_tool_result(
+            result_for(expanded, "method details"), iteration=2
+        )
+
+        self.assertEqual(added.added_ids, ("E1",))
+        self.assertEqual(reused.reused_ids, ("E1",))
+        self.assertEqual(len(registry.records), 1)
+        self.assertEqual(
+            registry.records[0].supporting_queries,
+            ("method", "method details"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

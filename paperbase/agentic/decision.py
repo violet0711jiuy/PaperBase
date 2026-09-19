@@ -392,6 +392,7 @@ def _visible_evidence(
     )
     selected: list[EvidenceRecord] = []
     counts: dict[str, int] = {}
+    seen_sections: dict[str, set[tuple[object, ...]]] = {}
     # 第一轮每篇只取最高相关的一条，避免 limit 较小时被单篇高分 Evidence 吞没。
     for record in ranked:
         paper_id = record.evidence.paper_id
@@ -399,9 +400,25 @@ def _visible_evidence(
             continue
         selected.append(record)
         counts[paper_id] = 1
+        seen_sections.setdefault(paper_id, set()).add(
+            _evidence_section_identity(record)
+        )
         if len(selected) >= limit:
             return tuple(selected)
-    # 第二轮再按全局相关性补齐，同时保留单篇上限。
+    # 第二轮优先展示不同章节，保证 Decision 看到的是互补证据而非相邻重复窗口。
+    for record in ranked:
+        paper_id = record.evidence.paper_id
+        if record in selected or counts.get(paper_id, 0) >= 3:
+            continue
+        section = _evidence_section_identity(record)
+        if section in seen_sections.get(paper_id, set()):
+            continue
+        selected.append(record)
+        counts[paper_id] = counts.get(paper_id, 0) + 1
+        seen_sections.setdefault(paper_id, set()).add(section)
+        if len(selected) >= limit:
+            return tuple(selected)
+    # 第三轮才按全局相关性用同章节证据补齐，同时保留单篇上限。
     for record in ranked:
         paper_id = record.evidence.paper_id
         if record in selected:
@@ -413,6 +430,23 @@ def _visible_evidence(
         if len(selected) >= limit:
             break
     return tuple(selected)
+
+
+def _evidence_section_identity(record: EvidenceRecord) -> tuple[object, ...]:
+    evidence = record.evidence
+    if evidence.section_id:
+        return (evidence.source_type.value, "section_id", evidence.section_id)
+    if evidence.section:
+        return (
+            evidence.source_type.value,
+            "section",
+            " ".join(evidence.section.casefold().split()),
+        )
+    return (
+        evidence.source_type.value,
+        "chunks",
+        tuple(sorted(evidence.source_chunk_ids)),
+    )
 
 
 def _query_terms(context: QueryContext) -> tuple[str, ...]:

@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from paperbase.agentic.contracts import (
+    BudgetUsage,
     CandidateAssessment,
     CandidateDisposition,
     CandidateSelection,
@@ -29,6 +30,7 @@ from paperbase.agentic.contracts import (
     ScopeSource,
 )
 from paperbase.agentic.coverage import CoverageManager, CoveragePolicy
+from paperbase.agentic.decision import DecisionState, _visible_evidence
 from paperbase.agentic.evidence_registry import EvidenceRegistry
 from paperbase.agentic.selector import FinalEvidenceSelector
 from paperbase.agentic.tools import ResearchToolExecutor
@@ -67,6 +69,7 @@ def _record(
     relation: EvidenceRelation | None = None,
     ownership: EvidenceOwnership = EvidenceOwnership.THIS_PAPER,
     score: float = 0.5,
+    section_id: str | None = None,
 ) -> EvidenceRecord:
     qualification = (
         EvidenceQualification(evidence_id, relation, ownership, "测试标注")
@@ -78,6 +81,8 @@ def _record(
         evidence=RetrievedEvidence(
             source_type=EvidenceSourceType.CONTENT,
             paper_id=paper_id,
+            section_id=section_id,
+            section=section_id,
             seed_chunk_ids=(f"{paper_id}-{evidence_id}",),
             source_chunk_ids=(f"{paper_id}-{evidence_id}",),
             content=f"{paper_id} evidence",
@@ -332,6 +337,77 @@ class AgenticPhase3Tests(unittest.TestCase):
         )
         self.assertEqual({item.evidence.paper_id for item in selected}, {"A", "B"})
         self.assertNotIn("E4", {item.evidence_id for item in selected})
+
+    def test_selector_prefers_different_sections_before_same_section_fill(self) -> None:
+        method_high = _record(
+            "E1", "A", relation=EvidenceRelation.SUPPORTS,
+            score=0.9, section_id="method",
+        )
+        method_medium = _record(
+            "E2", "A", relation=EvidenceRelation.SUPPORTS,
+            score=0.8, section_id="method",
+        )
+        results_low = _record(
+            "E3", "A", relation=EvidenceRelation.SUPPORTS,
+            score=0.3, section_id="results",
+        )
+        coverage = CoverageManager().evaluate(
+            context=_context(),
+            corpus_snapshot=None,
+            evidence=(method_high, method_medium, results_low),
+            observations=(_observation(("A", "method"), ("B", "method")),),
+        )
+        plan = ResearchPlan(
+            "collect complementary evidence",
+            (
+                ResearchSubtask(
+                    "SA", "A", ("A",), frozenset({EvidenceTarget.METHOD}), "A"
+                ),
+            ),
+        )
+
+        selected = FinalEvidenceSelector(max_units=2, max_per_paper=2).select(
+            plan=plan,
+            coverage=coverage,
+            evidence=(method_high, method_medium, results_low),
+        )
+
+        self.assertEqual([item.evidence_id for item in selected], ["E1", "E3"])
+
+    def test_decision_visibility_uses_same_section_diversity_rule(self) -> None:
+        method_high = _record(
+            "E1", "A", relation=EvidenceRelation.SUPPORTS,
+            score=0.9, section_id="method",
+        )
+        method_medium = _record(
+            "E2", "A", relation=EvidenceRelation.SUPPORTS,
+            score=0.8, section_id="method",
+        )
+        results_low = _record(
+            "E3", "A", relation=EvidenceRelation.SUPPORTS,
+            score=0.3, section_id="results",
+        )
+        plan = ResearchPlan(
+            "inspect sections",
+            (
+                ResearchSubtask(
+                    "SA", "A", ("A",), frozenset({EvidenceTarget.METHOD}), "A"
+                ),
+            ),
+        )
+
+        visible = _visible_evidence(
+            DecisionState(
+                _context(),
+                plan,
+                (method_high, method_medium, results_low),
+                (),
+                BudgetUsage(),
+            ),
+            limit=2,
+        )
+
+        self.assertEqual([item.evidence_id for item in visible], ["E1", "E3"])
 
     def test_formal_overview_generation_is_explicit_and_tool_is_read_only(self) -> None:
         with TemporaryDirectory() as directory:

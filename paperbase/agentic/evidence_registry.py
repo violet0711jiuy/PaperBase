@@ -19,7 +19,7 @@ from .contracts import (
 
 
 class EvidenceRegistry:
-    """按来源、论文和 source chunk 集合做 exact dedup。"""
+    """按来源身份精确去重，并跨轮复用高度重叠的扩展窗口。"""
 
     def __init__(self, state: RegistryState | None = None) -> None:
         snapshot = state or RegistryState()
@@ -47,7 +47,12 @@ class EvidenceRegistry:
             result, supporting_queries
         ):
             key = _evidence_key(evidence)
+            storage_key = key
             current = self._records_by_key.get(key)
+            if current is None:
+                overlapping = self._find_overlapping_record(evidence)
+                if overlapping is not None:
+                    storage_key, current = overlapping
             query_values = tuple(
                 dict.fromkeys(
                     value.strip()
@@ -57,7 +62,7 @@ class EvidenceRegistry:
             )
             if current is not None:
                 merged_queries = tuple(dict.fromkeys((*current.supporting_queries, *query_values)))
-                self._records_by_key[key] = replace(
+                self._records_by_key[storage_key] = replace(
                     current,
                     supporting_queries=merged_queries,
                     last_seen_iteration=iteration,
@@ -110,7 +115,21 @@ class EvidenceRegistry:
                     ),
                 )
             added.append(evidence_id)
-        return RegistryDelta(tuple(added), tuple(reused))
+        return RegistryDelta(
+            tuple(dict.fromkeys(added)), tuple(dict.fromkeys(reused))
+        )
+
+    def _find_overlapping_record(
+        self, evidence: object
+    ) -> tuple[tuple[object, ...], EvidenceRecord] | None:
+        return next(
+            (
+                (key, record)
+                for key, record in self._records_by_key.items()
+                if _same_evidence_window(record.evidence, evidence)
+            ),
+            None,
+        )
 
     def get(self, evidence_id: str) -> EvidenceRecord | None:
         return next(
@@ -214,3 +233,24 @@ def _evidence_key(evidence: object) -> tuple[object, ...]:
     if evidence.source_type.value == "overview":
         return (*base, evidence.retrieval_metadata.get("overview_field"))
     return base
+
+
+def _same_evidence_window(left: object, right: object) -> bool:
+    if (
+        left.source_type != right.source_type
+        or left.paper_id != right.paper_id
+        or (
+            left.section_id
+            and right.section_id
+            and left.section_id != right.section_id
+        )
+    ):
+        return False
+    left_ids = set(left.source_chunk_ids)
+    right_ids = set(right.source_chunk_ids)
+    if not left_ids or not right_ids:
+        return False
+    intersection = len(left_ids & right_ids)
+    containment = intersection / min(len(left_ids), len(right_ids))
+    jaccard = intersection / len(left_ids | right_ids)
+    return containment >= 0.8 and jaccard >= 0.5

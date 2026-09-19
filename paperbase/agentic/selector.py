@@ -31,6 +31,7 @@ class FinalEvidenceSelector:
         ranked = sorted(eligible, key=lambda record: self._rank(record, plan), reverse=True)
         selected: list[EvidenceRecord] = []
         counts: dict[str, int] = {}
+        seen_sections: dict[str, set[tuple[object, ...]]] = {}
 
         # 先为每篇 positive 论文保留一条核心证据，避免多论文比较被高分单篇吞没。
         positive_ids = tuple(
@@ -45,6 +46,25 @@ class FinalEvidenceSelector:
             if candidate is not None:
                 selected.append(candidate)
                 counts[paper_id] = 1
+                seen_sections.setdefault(paper_id, set()).add(
+                    _section_identity(candidate)
+                )
+        # 第二轮优先补齐每篇论文的不同章节或来源窗口，避免最终上下文被同一段吞没。
+        for record in ranked:
+            if len(selected) >= self._max_units:
+                break
+            if record in selected:
+                continue
+            paper_id = record.evidence.paper_id
+            if counts.get(paper_id, 0) >= self._max_per_paper:
+                continue
+            section = _section_identity(record)
+            if section in seen_sections.get(paper_id, set()):
+                continue
+            selected.append(record)
+            counts[paper_id] = counts.get(paper_id, 0) + 1
+            seen_sections.setdefault(paper_id, set()).add(section)
+        # 最后一轮才允许同章节的次级证据按相关性补位。
         for record in ranked:
             if len(selected) >= self._max_units:
                 break
@@ -95,3 +115,20 @@ class FinalEvidenceSelector:
         )
         score = record.evidence.score if record.evidence.score is not None else 0.0
         return (direct, relation, subtask_match, source_priority, float(score))
+
+
+def _section_identity(record: EvidenceRecord) -> tuple[object, ...]:
+    evidence = record.evidence
+    if evidence.section_id:
+        return (evidence.source_type.value, "section_id", evidence.section_id)
+    if evidence.section:
+        return (
+            evidence.source_type.value,
+            "section",
+            " ".join(evidence.section.casefold().split()),
+        )
+    return (
+        evidence.source_type.value,
+        "chunks",
+        tuple(sorted(evidence.source_chunk_ids)),
+    )
