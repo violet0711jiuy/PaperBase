@@ -430,6 +430,8 @@ class EvidenceAnalysis:
     status: EvidenceAnalysisStatus
     digest: str | None = None
     claims: tuple[EvidenceClaim, ...] = ()
+    covered_targets: frozenset[EvidenceTarget] = frozenset()
+    addressed_information: tuple[str, ...] = ()
     error_code: str | None = None
 
     def __post_init__(self) -> None:
@@ -437,6 +439,21 @@ class EvidenceAnalysis:
         status = EvidenceAnalysisStatus(self.status)
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "claims", tuple(self.claims))
+        object.__setattr__(
+            self,
+            "covered_targets",
+            frozenset(EvidenceTarget(value) for value in self.covered_targets),
+        )
+        object.__setattr__(
+            self,
+            "addressed_information",
+            tuple(
+                dict.fromkeys(
+                    _text(value, "addressed_information")
+                    for value in self.addressed_information
+                )
+            ),
+        )
         if self.digest is not None:
             object.__setattr__(self, "digest", _text(self.digest, "digest"))
         if self.error_code is not None:
@@ -449,14 +466,34 @@ class EvidenceAnalysis:
             if self.error_code is not None:
                 raise ValueError("qualified evidence cannot contain error_code.")
         elif status is EvidenceAnalysisStatus.IRRELEVANT:
-            if self.digest is None or self.claims:
-                raise ValueError("irrelevant evidence requires digest and no claims.")
+            if (
+                self.digest is None
+                or self.claims
+                or self.covered_targets
+                or self.addressed_information
+            ):
+                raise ValueError(
+                    "irrelevant evidence requires digest and empty coverage fields."
+                )
             if self.error_code is not None:
                 raise ValueError("irrelevant evidence cannot contain error_code.")
         elif status is EvidenceAnalysisStatus.FAILED:
-            if self.error_code is None or self.claims:
-                raise ValueError("failed evidence requires error_code and no claims.")
-        elif self.digest is not None or self.claims or self.error_code is not None:
+            if (
+                self.error_code is None
+                or self.claims
+                or self.covered_targets
+                or self.addressed_information
+            ):
+                raise ValueError(
+                    "failed evidence requires error_code and empty analysis output."
+                )
+        elif (
+            self.digest is not None
+            or self.claims
+            or self.covered_targets
+            or self.addressed_information
+            or self.error_code is not None
+        ):
             raise ValueError("pending evidence cannot contain analysis output.")
 
 
@@ -475,6 +512,8 @@ class EvidenceRecord:
     analysis_status: EvidenceAnalysisStatus = EvidenceAnalysisStatus.PENDING
     digest: str | None = None
     claims: tuple[EvidenceClaim, ...] = ()
+    covered_targets: frozenset[EvidenceTarget] = frozenset()
+    addressed_information: tuple[str, ...] = ()
     analysis_error: str | None = None
     # Phase 3 旧 checkpoint 的兼容字段；新链路只写入 Claim 级分析结果。
     qualification: EvidenceQualification | None = None
@@ -528,6 +567,21 @@ class EvidenceRecord:
                 )
         object.__setattr__(self, "analysis_status", status)
         object.__setattr__(self, "claims", claims)
+        object.__setattr__(
+            self,
+            "covered_targets",
+            frozenset(EvidenceTarget(value) for value in self.covered_targets),
+        )
+        object.__setattr__(
+            self,
+            "addressed_information",
+            tuple(
+                dict.fromkeys(
+                    _text(value, "addressed_information")
+                    for value in self.addressed_information
+                )
+            ),
+        )
         object.__setattr__(self, "digest", digest)
         object.__setattr__(self, "analysis_error", error)
         EvidenceAnalysis(
@@ -535,6 +589,8 @@ class EvidenceRecord:
             status=status,
             digest=digest,
             claims=claims,
+            covered_targets=self.covered_targets,
+            addressed_information=self.addressed_information,
             error_code=error,
         )
 

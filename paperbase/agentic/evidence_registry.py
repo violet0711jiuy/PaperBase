@@ -164,6 +164,8 @@ class EvidenceRegistry:
                 analysis_status=analysis.status,
                 digest=analysis.digest,
                 claims=analysis.claims,
+                covered_targets=analysis.covered_targets,
+                addressed_information=analysis.addressed_information,
                 analysis_error=analysis.error_code,
                 qualification=None,
             )

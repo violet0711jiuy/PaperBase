@@ -147,6 +147,8 @@ class AgenticP2RecoveryTests(unittest.TestCase):
                         "evidence_id": "E1",
                         "status": "qualified",
                         "digest": "方法证据",
+                        "covered_targets": [],
+                        "addressed_information": [],
                         "claims": [
                             {
                                 "statement": "原文给出方法锚点。",
@@ -197,6 +199,8 @@ class AgenticP2RecoveryTests(unittest.TestCase):
                         "evidence_id": "E1",
                         "status": "irrelevant",
                         "digest": "与问题无关",
+                        "covered_targets": [],
+                        "addressed_information": [],
                         "claims": [],
                     }
                 ]

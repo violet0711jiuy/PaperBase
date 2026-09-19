@@ -51,6 +51,8 @@ def _record(content: str = "Existing studies use ARIMA. We propose EMVE.") -> Ev
         first_seen_iteration=1,
         last_seen_iteration=1,
         target_subtask_ids=("S1",),
+        requested_evidence_targets=frozenset({EvidenceTarget.METHOD}),
+        requested_missing_information=("本文提出了什么方法",),
     )
 
 
@@ -127,6 +129,8 @@ class EvidenceAnalysisTests(unittest.TestCase):
                         "evidence_id": "E1",
                         "status": "qualified",
                         "digest": "该片段先介绍既有方法，再陈述本文方法。",
+                        "covered_targets": ["method"],
+                        "addressed_information": ["本文提出了什么方法"],
                         "claims": [
                             {
                                 "statement": "既有研究使用 ARIMA。",
@@ -164,6 +168,23 @@ class EvidenceAnalysisTests(unittest.TestCase):
             [claim.ownership for claim in result.analyses[0].claims],
             [EvidenceOwnership.PRIOR_WORK, EvidenceOwnership.THIS_PAPER],
         )
+        self.assertEqual(
+            result.analyses[0].covered_targets,
+            frozenset({EvidenceTarget.METHOD}),
+        )
+        self.assertEqual(
+            result.analyses[0].addressed_information,
+            ("本文提出了什么方法",),
+        )
+        prompt_payload = json.loads(client.calls[0]["user_prompt"])
+        self.assertEqual(
+            prompt_payload["evidence"][0]["requested_evidence_targets"],
+            ["method"],
+        )
+        self.assertEqual(
+            prompt_payload["evidence"][0]["requested_missing_information"],
+            ["本文提出了什么方法"],
+        )
 
     def test_invalid_source_excerpt_retries_then_fails_closed(self) -> None:
         invalid = json.dumps(
@@ -173,6 +194,8 @@ class EvidenceAnalysisTests(unittest.TestCase):
                         "evidence_id": "E1",
                         "status": "qualified",
                         "digest": "看似相关。",
+                        "covered_targets": ["method"],
+                        "addressed_information": ["本文提出了什么方法"],
                         "claims": [
                             {
                                 "statement": "本文提出不存在的方法。",
@@ -195,6 +218,36 @@ class EvidenceAnalysisTests(unittest.TestCase):
         self.assertEqual(result.analyses[0].status, EvidenceAnalysisStatus.FAILED)
         self.assertEqual(result.analyses[0].claims, ())
         self.assertFalse(FinalEvidenceSelector._eligible(_record()))
+
+    def test_analysis_rejects_coverage_not_requested_by_search(self) -> None:
+        response = json.dumps(
+            {
+                "analyses": [
+                    {
+                        "evidence_id": "E1",
+                        "status": "qualified",
+                        "digest": "错误地声明覆盖结果目标。",
+                        "covered_targets": ["result"],
+                        "addressed_information": ["本文提出了什么方法"],
+                        "claims": [
+                            {
+                                "statement": "本文提出 EMVE。",
+                                "relation": "supports",
+                                "ownership": "this_paper",
+                                "rationale": "原文直接陈述。",
+                                "source_excerpt": "We propose EMVE.",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+
+        result = LLMEvidenceAnalyzer(
+            _QueuedClient((response,)), max_attempts=1
+        ).analyze(question="方法是什么？", evidence=(_record(),))
+
+        self.assertEqual(result.analyses[0].status, EvidenceAnalysisStatus.FAILED)
 
     def test_decision_receives_digest_and_claims_but_not_raw_excerpt(self) -> None:
         raw_marker = "RAW_EVIDENCE_MUST_NOT_ENTER_DECISION"

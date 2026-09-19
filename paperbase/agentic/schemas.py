@@ -173,6 +173,8 @@ class EvidenceAnalysisItemDraft(BaseModel):
     status: Literal["qualified", "irrelevant"]
     digest: NonEmptyText = Field(max_length=500)
     claims: list[EvidenceClaimDraft] = Field(max_length=6)
+    covered_targets: list[EvidenceTarget] = Field(max_length=8)
+    addressed_information: list[NonEmptyText] = Field(max_length=12)
 
 
 class EvidenceAnalysisBatchDraft(BaseModel):

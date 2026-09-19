@@ -2,6 +2,14 @@ from __future__ import annotations
 
 import unittest
 
+from paperbase.agentic.contracts import (
+    EvidenceAnalysis,
+    EvidenceAnalysisStatus,
+    EvidenceClaim,
+    EvidenceOwnership,
+    EvidenceRelation,
+    EvidenceTarget,
+)
 from paperbase.agentic.evidence_registry import EvidenceRegistry
 from paperbase.retrieval.contracts import (
     EvidenceSourceType,
@@ -126,6 +134,52 @@ class EvidenceRegistryTests(unittest.TestCase):
         )
         delta = EvidenceRegistry().register_tool_result(result, iteration=1)
         self.assertEqual(delta.added_ids, ("R1",))
+
+    def test_analysis_coverage_is_persisted_on_record(self) -> None:
+        result = ToolResult(
+            status=ToolStatus.OK,
+            tool_name=ToolName.SEARCH_PAPERS,
+            payload=SearchPapersPayload(
+                (
+                    PaperSearchOutcome(
+                        paper_id="paper_a",
+                        status=PaperSearchStatus.OK,
+                        query="方法",
+                        lexical_terms=(),
+                        evidence_targets=frozenset({"method"}),
+                        missing_information=("核心机制",),
+                        evidence_candidates=(_evidence(),),
+                    ),
+                )
+            ),
+        )
+        registry = EvidenceRegistry()
+        registry.register_tool_result(result, iteration=1)
+        registry.apply_analyses(
+            (
+                EvidenceAnalysis(
+                    evidence_id="E1",
+                    status=EvidenceAnalysisStatus.QUALIFIED,
+                    digest="方法摘要",
+                    covered_targets=frozenset({EvidenceTarget.METHOD}),
+                    addressed_information=("核心机制",),
+                    claims=(
+                        EvidenceClaim(
+                            "E1:C1",
+                            "该方法使用编码器。",
+                            EvidenceRelation.SUPPORTS,
+                            EvidenceOwnership.THIS_PAPER,
+                            "原文直接陈述。",
+                            "evidence text",
+                        ),
+                    ),
+                ),
+            )
+        )
+
+        record = registry.records[0]
+        self.assertEqual(record.covered_targets, frozenset({EvidenceTarget.METHOD}))
+        self.assertEqual(record.addressed_information, ("核心机制",))
 
 
 if __name__ == "__main__":

@@ -143,6 +143,12 @@ def _payload(record: EvidenceRecord, max_content_chars: int) -> dict[str, object
         "paper_title": source.paper_title,
         "section": source.section,
         "pages": [source.page_start, source.page_end],
+        "requested_evidence_targets": sorted(
+            target.value for target in record.requested_evidence_targets
+        ),
+        "requested_missing_information": list(
+            record.requested_missing_information
+        ),
         "content": source.content[:max_content_chars],
     }
 
@@ -158,9 +164,23 @@ def _convert_and_validate(
     converted: list[EvidenceAnalysis] = []
     for item in draft.analyses:
         record = by_id[item.evidence_id]
+        covered_targets = frozenset(item.covered_targets)
+        addressed_information = tuple(dict.fromkeys(item.addressed_information))
+        if not covered_targets.issubset(record.requested_evidence_targets):
+            raise ValueError(
+                f"{item.evidence_id} 的 covered_targets 只能来自 requested_evidence_targets。"
+            )
+        if not set(addressed_information).issubset(
+            set(record.requested_missing_information)
+        ):
+            raise ValueError(
+                f"{item.evidence_id} 的 addressed_information 只能逐项复制 requested_missing_information。"
+            )
         if item.status == "irrelevant":
-            if item.claims:
-                raise ValueError("irrelevant Evidence 的 claims 必须为空。")
+            if item.claims or covered_targets or addressed_information:
+                raise ValueError(
+                    "irrelevant Evidence 的 claims 与覆盖字段必须为空。"
+                )
             converted.append(
                 EvidenceAnalysis(
                     evidence_id=item.evidence_id,
@@ -192,6 +212,8 @@ def _convert_and_validate(
                 evidence_id=item.evidence_id,
                 status=EvidenceAnalysisStatus.QUALIFIED,
                 digest=item.digest,
+                covered_targets=covered_targets,
+                addressed_information=addressed_information,
                 claims=tuple(claims),
             )
         )
