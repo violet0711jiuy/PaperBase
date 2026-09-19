@@ -97,6 +97,14 @@ class ScopeResolutionStatus(str, Enum):
     NOT_FOUND = "not_found"
 
 
+class CandidateDisposition(str, Enum):
+    """元数据筛选后论文进入正文检索的处置结果。"""
+
+    CANDIDATE = "candidate"
+    UNCERTAIN = "uncertain"
+    EXCLUDED = "excluded"
+
+
 class SubtaskStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -157,6 +165,60 @@ class ScopeResolution:
                 raise ValueError("A resolved scope requires scope and scope_source.")
             object.__setattr__(self, "scope", QueryScope(self.scope))
             object.__setattr__(self, "scope_source", ScopeSource(self.scope_source))
+
+
+@dataclass(frozen=True)
+class CandidateAssessment:
+    paper_id: str
+    disposition: CandidateDisposition
+    reason: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "paper_id", _text(self.paper_id, "paper_id"))
+        object.__setattr__(self, "disposition", CandidateDisposition(self.disposition))
+        object.__setattr__(self, "reason", _text(self.reason, "reason"))
+
+
+@dataclass(frozen=True)
+class CandidateSelection:
+    """冻结 Scope 内完整、互斥且可审计的论文元数据筛选结果。"""
+
+    scope_paper_ids: tuple[str, ...]
+    assessments: tuple[CandidateAssessment, ...]
+
+    def __post_init__(self) -> None:
+        scope_ids = _unique_texts(self.scope_paper_ids)
+        assessments = tuple(self.assessments)
+        assessment_ids = tuple(item.paper_id for item in assessments)
+        if len(assessment_ids) != len(set(assessment_ids)):
+            raise ValueError("Candidate Selection 不能重复处理同一 paper_id。")
+        if set(assessment_ids) != set(scope_ids):
+            raise ValueError("Candidate Selection 必须完整覆盖冻结 Scope。")
+        object.__setattr__(self, "scope_paper_ids", scope_ids)
+        object.__setattr__(self, "assessments", assessments)
+
+    def paper_ids_for(self, disposition: CandidateDisposition) -> tuple[str, ...]:
+        return tuple(
+            item.paper_id
+            for item in self.assessments
+            if item.disposition is disposition
+        )
+
+    @property
+    def screened_paper_ids(self) -> tuple[str, ...]:
+        return tuple(item.paper_id for item in self.assessments)
+
+    @property
+    def candidate_paper_ids(self) -> tuple[str, ...]:
+        return self.paper_ids_for(CandidateDisposition.CANDIDATE)
+
+    @property
+    def uncertain_paper_ids(self) -> tuple[str, ...]:
+        return self.paper_ids_for(CandidateDisposition.UNCERTAIN)
+
+    @property
+    def excluded_paper_ids(self) -> tuple[str, ...]:
+        return self.paper_ids_for(CandidateDisposition.EXCLUDED)
 
 
 @dataclass(frozen=True)

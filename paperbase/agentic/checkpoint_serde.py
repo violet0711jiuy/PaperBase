@@ -11,6 +11,7 @@ from paperbase.retrieval.contracts import ToolResult
 from .contracts import (
     ActionTrace,
     AgentAction,
+    CandidateSelection,
     CorpusScopeSnapshot,
     CoverageState,
     EvidenceQualification,
@@ -34,6 +35,7 @@ T = TypeVar("T")
 _ADAPTERS: dict[object, TypeAdapter[Any]] = {
     TrustedWorkspaceScope: TypeAdapter(TrustedWorkspaceScope),
     ScopeResolution: TypeAdapter(ScopeResolution),
+    CandidateSelection: TypeAdapter(CandidateSelection),
     CorpusScopeSnapshot: TypeAdapter(CorpusScopeSnapshot),
     CoverageState: TypeAdapter(CoverageState),
     tuple[EvidenceQualification, ...]: TypeAdapter(tuple[EvidenceQualification, ...]),

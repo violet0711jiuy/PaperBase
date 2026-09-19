@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from paperbase.agentic.factory import create_agentic_research_service
 from paperbase.agentic.schemas import (
     AGENT_DECISION_ADAPTER,
+    CandidateSelectionDraft,
     EvidenceAnalysisBatchDraft,
     QueryUnderstandingDraft,
     ResearchPlanDraft,
@@ -92,6 +93,7 @@ class AgenticLLMContractTests(unittest.TestCase):
             QueryUnderstandingDraft.model_json_schema(),
             ResearchPlanDraft.model_json_schema(),
             AGENT_DECISION_ADAPTER.json_schema(),
+            CandidateSelectionDraft.model_json_schema(),
             EvidenceAnalysisBatchDraft.model_json_schema(),
         ):
             _assert_all_properties_required(self, schema)

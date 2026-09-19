@@ -6,6 +6,9 @@ from paperbase.agentic.checkpoint_serde import dump_contract, load_contract
 from paperbase.agentic.contracts import (
     AgentAction,
     BudgetUsage,
+    CandidateAssessment,
+    CandidateDisposition,
+    CandidateSelection,
     FinishAction,
     GetSectionContextAction,
     GuardState,
@@ -86,6 +89,19 @@ class AgenticCheckpointSerdeTests(unittest.TestCase):
         dto = dump_contract(RegistryState(), RegistryState)
         self.assertTrue(_is_json_compatible(dto))
         self.assertEqual(load_contract(dto, RegistryState), RegistryState())
+
+    def test_candidate_selection_round_trips_as_checkpoint_dto(self) -> None:
+        selection = CandidateSelection(
+            scope_paper_ids=("A", "B", "C"),
+            assessments=(
+                CandidateAssessment("A", CandidateDisposition.CANDIDATE, "直接相关"),
+                CandidateAssessment("B", CandidateDisposition.UNCERTAIN, "摘要不足"),
+                CandidateAssessment("C", CandidateDisposition.EXCLUDED, "任务无关"),
+            ),
+        )
+        dto = dump_contract(selection, CandidateSelection)
+        self.assertTrue(_is_json_compatible(dto))
+        self.assertEqual(load_contract(dto, CandidateSelection), selection)
 
 
 def _is_json_compatible(value) -> bool:

@@ -7,6 +7,7 @@ from typing import Annotated, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter
 
 from .contracts import (
+    CandidateDisposition,
     EvidenceOwnership,
     EvidenceRelation,
     EvidenceTarget,
@@ -44,7 +45,21 @@ class ResearchPlanDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     goal: NonEmptyText
-    subtasks: list[ResearchSubtaskDraft] = Field(min_length=1, max_length=12)
+    subtasks: list[ResearchSubtaskDraft] = Field(min_length=1, max_length=4)
+
+
+class CandidateAssessmentDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    paper_id: NonEmptyText
+    disposition: CandidateDisposition
+    reason: NonEmptyText = Field(max_length=300)
+
+
+class CandidateSelectionDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    assessments: list[CandidateAssessmentDraft] = Field(min_length=1)
 
 
 class SearchSpecDraft(BaseModel):

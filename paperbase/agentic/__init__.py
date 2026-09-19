@@ -2,6 +2,9 @@
 
 from .contracts import (
     AgentAction,
+    CandidateAssessment,
+    CandidateDisposition,
+    CandidateSelection,
     CorpusScopeSnapshot,
     CoverageState,
     CoverageStrategy,
@@ -35,6 +38,12 @@ from .contracts import (
     SearchReferencesAction,
     StopReason,
 )
+from .candidate_selection import (
+    CandidateSelectionResult,
+    FormalPaperMetadataRepository,
+    LLMCandidateSelector,
+    PaperMetadata,
+)
 from .decision import LLMDecisionAgent, ScriptedDecisionAgent
 from .coverage import CoverageManager, CoveragePolicy
 from .evidence_registry import EvidenceRegistry
@@ -60,6 +69,10 @@ from .tools import ResearchToolExecutor
 
 __all__ = [
     "AgentAction",
+    "CandidateAssessment",
+    "CandidateDisposition",
+    "CandidateSelection",
+    "CandidateSelectionResult",
     "CorpusScopeSnapshot",
     "CoverageManager",
     "CoveragePolicy",
@@ -77,6 +90,7 @@ __all__ = [
     "EvidenceTarget",
     "FinishAction",
     "FinalEvidenceSelector",
+    "FormalPaperMetadataRepository",
     "GetPaperOverviewAction",
     "GetSectionContextAction",
     "Intent",
@@ -107,7 +121,9 @@ __all__ = [
     "GraphExecution",
     "LangGraphResearchWorkflow",
     "LLMDecisionAgent",
+    "LLMCandidateSelector",
     "LLMEvidenceAnalyzer",
+    "PaperMetadata",
     "QueryUnderstandingService",
     "ResearchPlanner",
     "ResearchRuntime",
