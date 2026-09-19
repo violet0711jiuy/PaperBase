@@ -657,6 +657,7 @@ class GuardState:
     no_new_per_paper: tuple[tuple[str, int], ...] = ()
     suppressed_paper_ids: tuple[str, ...] = ()
     executed_action_fingerprints: tuple[str, ...] = ()
+    executed_paper_query_fingerprints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

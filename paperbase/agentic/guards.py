@@ -54,6 +54,9 @@ class BudgetAndGuardTracker:
         self.no_new_per_paper = dict(snapshot.no_new_per_paper)
         self.suppressed_papers = set(snapshot.suppressed_paper_ids)
         self._fingerprints = set(snapshot.executed_action_fingerprints)
+        self._paper_query_fingerprints = set(
+            snapshot.executed_paper_query_fingerprints
+        )
 
     def can_decide(self, *, reserved_llm_calls: int = 0) -> GuardDecision:
         if reserved_llm_calls < 0:
@@ -131,6 +134,18 @@ class BudgetAndGuardTracker:
         fingerprint = action_fingerprint(action)
         if fingerprint in self._fingerprints:
             return GuardDecision(False, "DuplicateAction", "The same action was already executed.")
+        paper_query_fingerprints = paper_query_fingerprints_for_action(action)
+        repeated_queries = tuple(
+            value
+            for value in paper_query_fingerprints
+            if value in self._paper_query_fingerprints
+        )
+        if repeated_queries:
+            return GuardDecision(
+                False,
+                "DuplicatePaperQuery",
+                "同一论文的规范化 Query 已执行过，必须根据剩余缺口改写 Query。",
+            )
         queries = retrieval_query_count(action)
         if self.tool_calls + 1 > self.settings.max_tool_calls:
             return GuardDecision(False, "ToolBudget", "Tool call budget exhausted.", True)
@@ -140,6 +155,7 @@ class BudgetAndGuardTracker:
             if self.queries_per_paper.get(paper_id, 0) + queries_for_paper(action, paper_id) > self.settings.max_queries_per_paper:
                 return GuardDecision(False, "PerPaperBudget", f"Query budget exhausted for {paper_id}.", True)
         self._fingerprints.add(fingerprint)
+        self._paper_query_fingerprints.update(paper_query_fingerprints)
         return GuardDecision(True, "OK", "")
 
     def record_tool_call(self, action: AgentAction) -> None:
@@ -213,6 +229,9 @@ class BudgetAndGuardTracker:
             no_new_per_paper=tuple(sorted(self.no_new_per_paper.items())),
             suppressed_paper_ids=tuple(sorted(self.suppressed_papers)),
             executed_action_fingerprints=tuple(sorted(self._fingerprints)),
+            executed_paper_query_fingerprints=tuple(
+                sorted(self._paper_query_fingerprints)
+            ),
         )
 
 
@@ -273,3 +292,21 @@ def action_fingerprint(action: AgentAction) -> str:
     else:
         value = [action.action_name, action.reason.casefold()]
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def paper_query_fingerprints_for_action(action: AgentAction) -> tuple[str, ...]:
+    """逐论文记录 Query，避免改变 Batch 组成后绕过整动作去重。"""
+    if not isinstance(action, SearchPapersAction):
+        return ()
+    return tuple(
+        json.dumps(
+            [search.paper_id, _normalize_query(search.query)],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for search in action.searches
+    )
+
+
+def _normalize_query(query: str) -> str:
+    return " ".join(query.casefold().split())

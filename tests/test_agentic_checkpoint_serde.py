@@ -82,6 +82,7 @@ class AgenticCheckpointSerdeTests(unittest.TestCase):
             no_new_per_paper=(("A", 2),),
             suppressed_paper_ids=("A",),
             executed_action_fingerprints=("fingerprint",),
+            executed_paper_query_fingerprints=("paper-query",),
         )
         dto = dump_contract(state, GuardState)
         restored = load_contract(dto, GuardState)
