@@ -32,6 +32,7 @@ _NODE_MESSAGES: dict[str, tuple[str, str]] = {
     "assess_action": ("assessment", "正在评估论文覆盖度"),
     "validate_action": ("validation", "正在校验检索动作"),
     "execute_tool": ("retrieval", "正在检索论文证据"),
+    "filter_evidence": ("evidence_filter", "正在执行证据准入与质量审计"),
     "register_and_observe": ("evidence", "正在登记并去重证据"),
     "analyze_evidence": ("evidence_analysis", "正在提取证据摘要、Claim 与归属"),
     "generate_answer": ("answer", "正在基于证据生成回答"),

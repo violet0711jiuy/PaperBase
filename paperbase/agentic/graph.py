@@ -23,6 +23,7 @@ from .contracts import (
     CoverageState,
     EvidenceAnalysis,
     EvidenceAnalysisStatus,
+    EvidenceFilterReport,
     EvidenceRecord,
     FinishAction,
     GuardState,
@@ -45,6 +46,7 @@ from .checkpoint_serde import CheckpointValue, dump_contract, load_contract
 from .coverage import CoverageManager, CoveragePolicy
 from .decision import DecisionAgent, DecisionError, DecisionState
 from .evidence_analysis import EvidenceAnalyzer
+from .evidence_admission import EvidenceAdmissionFilter, fail_open_admission
 from .evidence_registry import EvidenceRegistry
 from .events import ResearchProgressEvent, progress_event_for_node
 from .guards import (
@@ -69,6 +71,7 @@ NextNode = Literal[
     "assess_action",
     "validate_action",
     "execute_tool",
+    "filter_evidence",
     "register_and_observe",
     "analyze_evidence",
     "generate_answer",
@@ -92,6 +95,7 @@ class AgentGraphState(TypedDict, total=False):
     action: CheckpointValue
     action_fingerprint: str
     tool_result: CheckpointValue
+    evidence_filter_report: CheckpointValue
     pending_analysis_ids: list[str]
     registry_state: CheckpointValue
     guard_state: CheckpointValue
@@ -117,6 +121,7 @@ class AgentGraphContext:
     decision_agent: DecisionAgent
     candidate_selector: CandidateSelector | None
     evidence_analyzer: EvidenceAnalyzer
+    evidence_filter: EvidenceAdmissionFilter
     tool_executor: ToolExecutor
     answer_generator: AgenticAnswerGenerator | None
     settings: AgenticResearchSettings
@@ -142,6 +147,7 @@ class LangGraphResearchWorkflow:
         planner: ResearchPlanner,
         decision_agent: DecisionAgent,
         evidence_analyzer: EvidenceAnalyzer,
+        evidence_filter: EvidenceAdmissionFilter | None = None,
         tool_executor: ToolExecutor,
         settings: AgenticResearchSettings,
         candidate_selector: CandidateSelector | None = None,
@@ -155,6 +161,11 @@ class LangGraphResearchWorkflow:
             decision_agent=decision_agent,
             candidate_selector=candidate_selector,
             evidence_analyzer=evidence_analyzer,
+            evidence_filter=evidence_filter or EvidenceAdmissionFilter(
+                enabled=settings.evidence_admission_enabled,
+                min_rerank_score=settings.evidence_min_rerank_score,
+                source_overlap_threshold=settings.evidence_source_overlap_threshold,
+            ),
             tool_executor=tool_executor,
             answer_generator=answer_generator,
             settings=settings,
@@ -404,6 +415,7 @@ def build_agentic_research_graph() -> StateGraph:
     graph.add_node("assess_action", _assess_action)
     graph.add_node("validate_action", _validate_action)
     graph.add_node("execute_tool", _execute_tool)
+    graph.add_node("filter_evidence", _filter_evidence)
     graph.add_node("register_and_observe", _register_and_observe)
     graph.add_node("analyze_evidence", _analyze_evidence)
     graph.add_node("generate_answer", _generate_answer)
@@ -471,10 +483,11 @@ def build_agentic_research_graph() -> StateGraph:
         "execute_tool",
         _route,
         {
-            "register_and_observe": "register_and_observe",
+            "filter_evidence": "filter_evidence",
             "generate_answer": "generate_answer",
         },
     )
+    graph.add_edge("filter_evidence", "register_and_observe")
     graph.add_edge("generate_answer", "finish_run")
     graph.add_edge("finish_run", END)
     return graph
@@ -931,6 +944,26 @@ def _execute_tool(
     return {
         "tool_result": dump_contract(result, ToolResult),
         "guard_state": dump_contract(tracker.snapshot(), GuardState),
+        "next_node": "filter_evidence",
+    }
+
+
+def _filter_evidence(
+    state: AgentGraphState, runtime: Runtime[AgentGraphContext]
+) -> AgentGraphState:
+    """在 Registry 分配 E#/R# 前执行 Agentic 专用 Evidence 准入。"""
+    tool_result = load_contract(state["tool_result"], ToolResult)
+    try:
+        admission = runtime.context.evidence_filter.apply(tool_result)
+    except Exception as error:
+        admission = fail_open_admission(
+            tool_result, error_code=type(error).__name__
+        )
+    return {
+        "tool_result": dump_contract(admission.tool_result, ToolResult),
+        "evidence_filter_report": dump_contract(
+            admission.report, EvidenceFilterReport
+        ),
         "next_node": "register_and_observe",
     }
 
@@ -942,6 +975,11 @@ def _register_and_observe(
     tracker = _tracker(state, runtime.context.settings)
     action = load_contract(state["action"], AgentAction)
     tool_result = load_contract(state["tool_result"], ToolResult)
+    filter_report = (
+        load_contract(state["evidence_filter_report"], EvidenceFilterReport)
+        if state.get("evidence_filter_report") is not None
+        else None
+    )
     delta = registry.register_tool_result(
         tool_result,
         iteration=tracker.iterations,
@@ -960,6 +998,7 @@ def _register_and_observe(
         result=tool_result,
         delta=delta,
         remaining_budget=tracker.remaining(),
+        evidence_filter_report=filter_report,
     )
     traces = _append_trace(
         state,

@@ -611,6 +611,27 @@ class RegistryState:
 
 
 @dataclass(frozen=True)
+class EvidenceFilterDecision:
+    """Evidence Admission Filter 对单条候选的无正文审计记录。"""
+
+    fingerprint: str
+    paper_id: str
+    source_chunk_ids: tuple[str, ...]
+    decision: str
+    reasons: tuple[str, ...]
+    score: float | None = None
+
+
+@dataclass(frozen=True)
+class EvidenceFilterReport:
+    total_candidates: int = 0
+    accepted_candidates: int = 0
+    rejected_candidates: int = 0
+    deprioritized_candidates: int = 0
+    decisions: tuple[EvidenceFilterDecision, ...] = ()
+
+
+@dataclass(frozen=True)
 class PaperSearchAttempt:
     """一次逐论文搜索的完整意图与结果摘要。"""
 
@@ -637,6 +658,7 @@ class ResearchObservation:
     no_new_evidence: bool = False
     remaining_budget: dict[str, int] = field(default_factory=dict)
     search_attempts: tuple[PaperSearchAttempt, ...] = ()
+    evidence_filter_report: EvidenceFilterReport | None = None
 
 
 @dataclass(frozen=True)

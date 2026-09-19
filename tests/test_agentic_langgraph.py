@@ -282,6 +282,13 @@ class AgenticLangGraphTests(unittest.TestCase):
         raw_record = inspected.state["llm_diagnostics"][0]
         self.assertNotIn("content", raw_record)
         self.assertNotIn("reasoning_content", raw_record)
+        report = result.observations[0].evidence_filter_report
+        self.assertIsNotNone(report)
+        self.assertEqual(report.total_candidates, 1)
+        self.assertEqual(report.accepted_candidates, 1)
+        self.assertFalse(
+            hasattr(report.decisions[0], "content")  # type: ignore[union-attr]
+        )
 
     def test_knowledge_base_candidate_selection_blocks_excluded_body_search(self) -> None:
         executor = _Executor()
@@ -566,7 +573,7 @@ class AgenticLangGraphTests(unittest.TestCase):
             interrupt_after=("execute_tool",),
         )
         self.assertTrue(interrupted.interrupted)
-        self.assertEqual(interrupted.next_nodes, ("register_and_observe",))
+        self.assertEqual(interrupted.next_nodes, ("filter_evidence",))
         self.assertEqual(len(first_executor.calls), 1)
         self.assertEqual(interrupted.state["guard_state"]["usage"]["tool_calls"], 1)
         self.assertEqual(

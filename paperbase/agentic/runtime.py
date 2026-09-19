@@ -20,6 +20,7 @@ from .contracts import (
 from .decision import DecisionAgent, DecisionError, DecisionState
 from .coverage import CoverageManager, CoveragePolicy
 from .evidence_analysis import EvidenceAnalyzer
+from .evidence_admission import EvidenceAdmissionFilter, fail_open_admission
 from .evidence_registry import EvidenceRegistry
 from .guards import BudgetAndGuardTracker, action_subtask_ids
 from .observation import build_observation
@@ -45,11 +46,17 @@ class ResearchRuntime:
         evidence_analyzer: EvidenceAnalyzer | None = None,
         tool_executor: ToolExecutor,
         settings: AgenticResearchSettings,
+        evidence_filter: EvidenceAdmissionFilter | None = None,
     ) -> None:
         self._decision_agent = decision_agent
         self._evidence_analyzer = evidence_analyzer
         self._tool_executor = tool_executor
         self._settings = settings
+        self._evidence_filter = evidence_filter or EvidenceAdmissionFilter(
+            enabled=settings.evidence_admission_enabled,
+            min_rerank_score=settings.evidence_min_rerank_score,
+            source_overlap_threshold=settings.evidence_source_overlap_threshold,
+        )
 
     def run(
         self,
@@ -345,6 +352,13 @@ class ResearchRuntime:
                     corpus_snapshot=corpus_snapshot,
                 )
             tracker.record_tool_call(decision.action)
+            try:
+                admission = self._evidence_filter.apply(tool_result)
+            except Exception as error:
+                admission = fail_open_admission(
+                    tool_result, error_code=type(error).__name__
+                )
+            tool_result = admission.tool_result
             delta = registry.register_tool_result(
                 tool_result,
                 iteration=tracker.iterations,
@@ -376,6 +390,7 @@ class ResearchRuntime:
                     result=tool_result,
                     delta=delta,
                     remaining_budget=tracker.remaining(),
+                    evidence_filter_report=admission.report,
                 )
             )
             traces.append(

@@ -209,6 +209,11 @@ agentic_research:
   max_invalid_actions: 2
   max_no_new_evidence_per_paper: 2
   top_k_per_paper: 5
+  # Agentic 专用 Evidence 准入：只在 reranker 成功时应用分数阈值。
+  evidence_admission_enabled: true
+  evidence_min_rerank_score: 0.05
+  # source chunk 集合达到该 Jaccard 重叠度时只保留更强的一条。
+  evidence_source_overlap_threshold: 0.8
   # 候选验证策略中，一篇候选论文进入终态前至少执行的论文级查询数。
   coverage_candidate_min_queries_per_paper: 1
   # 穷举策略中，每篇论文至少执行“直接查询 + 替代表达”两次查询。

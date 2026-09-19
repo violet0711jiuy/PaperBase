@@ -9,7 +9,13 @@ from paperbase.retrieval.contracts import (
     ToolResult,
 )
 
-from .contracts import EvidenceTarget, PaperSearchAttempt, RegistryDelta, ResearchObservation
+from .contracts import (
+    EvidenceFilterReport,
+    EvidenceTarget,
+    PaperSearchAttempt,
+    RegistryDelta,
+    ResearchObservation,
+)
 
 
 def build_observation(
@@ -18,6 +24,7 @@ def build_observation(
     result: ToolResult,
     delta: RegistryDelta,
     remaining_budget: dict[str, int],
+    evidence_filter_report: EvidenceFilterReport | None = None,
 ) -> ResearchObservation:
     paper_statuses: list[tuple[str, str]] = []
     queries_by_paper: list[tuple[str, str]] = []
@@ -64,4 +71,5 @@ def build_observation(
         no_new_evidence=not delta.added_ids,
         remaining_budget=dict(remaining_budget),
         search_attempts=tuple(search_attempts),
+        evidence_filter_report=evidence_filter_report,
     )

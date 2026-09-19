@@ -49,6 +49,10 @@ Phase 3 新增的 Coverage 与 Selector 配置包括：
 - `coverage_exhaustive_min_queries_per_paper`：穷举任务每篇论文的最少查询数，默认覆盖直接查询和替代表达；
 - `final_evidence_max_units`：最终 Evidence 总上限；
 - `final_evidence_max_per_paper`：单篇论文进入最终 Evidence 的上限。
+- `evidence_admission_enabled`：是否启用 Agentic 专用的自动 Evidence 准入；
+- `evidence_min_rerank_score`：仅在 reranker 成功时生效的最低准入分数；
+- `evidence_source_overlap_threshold`：来源 chunk 集合的重叠去重阈值。结果型表格在
+  没有其他候选时会保守保留，并交给后续 Claim 校验。
 
 P2 新增的节点输出预算包括：
 

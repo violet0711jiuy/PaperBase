@@ -339,6 +339,11 @@ class AgenticResearchSettings(BaseModel):
     max_invalid_actions: int = Field(default=2, ge=0, le=10)
     max_no_new_evidence_per_paper: int = Field(default=2, ge=1, le=10)
     top_k_per_paper: int = Field(default=5, ge=1, le=30)
+    evidence_admission_enabled: bool = True
+    evidence_min_rerank_score: float = Field(default=0.05, ge=0.0, le=1.0)
+    evidence_source_overlap_threshold: float = Field(
+        default=0.8, ge=0.5, le=1.0
+    )
     coverage_candidate_min_queries_per_paper: int = Field(default=1, ge=1, le=10)
     coverage_exhaustive_min_queries_per_paper: int = Field(default=2, ge=1, le=10)
     final_evidence_max_units: int = Field(default=8, ge=1, le=50)
