@@ -94,11 +94,11 @@ class ConversationStoreTests(unittest.TestCase):
                 user_query="问题",
                 assistant_answer="回答 [E1]",
                 evidence_json=snapshot,
+                audit_json=json.dumps({"schema_version": 1}),
             )
-            self.assertEqual(
-                store.get_turns(conversation.conversation_id)[0].evidence_json,
-                snapshot,
-            )
+            saved_turn = store.get_turns(conversation.conversation_id)[0]
+            self.assertEqual(saved_turn.evidence_json, snapshot)
+            self.assertEqual(saved_turn.audit_json, '{"schema_version": 1}')
 
             # 模拟 Frontend Step 2 之前创建的旧 conversations.sqlite3，确认 initialize
             # 只补列而不破坏已经存在的 User/Assistant 历史。
@@ -141,6 +141,32 @@ class ConversationStoreTests(unittest.TestCase):
             old_turn = migrated.get_turns("old-c")[0]
             self.assertEqual(old_turn.assistant_answer, "旧回答")
             self.assertIsNone(old_turn.evidence_json)
+            self.assertIsNone(old_turn.audit_json)
+
+    def test_damaged_audit_json_does_not_hide_answer_history(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "conversations.sqlite3"
+            store = ConversationStore(path)
+            conversation = store.create_conversation("knowledge_base", "default")
+            turn = store.append_turn(
+                conversation.conversation_id,
+                user_query="问题",
+                assistant_answer="仍然可见的回答",
+            )
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "UPDATE conversation_turns SET audit_json = ? WHERE turn_id = ?",
+                    ("{not-json", turn.turn_id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            restored = ConversationStore(path).get_turns(conversation.conversation_id)[0]
+
+            self.assertEqual(restored.assistant_answer, "仍然可见的回答")
+            self.assertIsNone(restored.audit_json)
 
     def test_turns_survive_store_reinstantiation_and_keep_recent_order(self) -> None:
         with TemporaryDirectory() as temporary_directory:

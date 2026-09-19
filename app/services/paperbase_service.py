@@ -36,6 +36,10 @@ from paperbase.conversations import (
     ConversationTurn,
 )
 from paperbase.generation import AnswerServiceResult, create_answer_service
+from paperbase.agentic.audit import (
+    AgenticAuditSnapshot,
+    build_agentic_audit_snapshot,
+)
 # MetadataDatabase 复用后端已有的数据库初始化和单论文读取能力。
 from paperbase.database import MetadataDatabase
 from paperbase.overview.service import (
@@ -722,6 +726,33 @@ class PaperBaseService:
             thread_id=_optional_text(payload.get("thread_id")),
         )
 
+    def get_conversation_turn_audit(
+        self, turn: ConversationTurn
+    ) -> AgenticAuditSnapshot | None:
+        """恢复版本化 Agentic 审计快照；旧回合或损坏数据安全返回空。"""
+        if turn.audit_json:
+            try:
+                return AgenticAuditSnapshot.from_json(turn.audit_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        # P4 之前的 sidecar 没有完整审计字段；只有明确带 audit_snapshot 的
+        # 过渡工件才尝试恢复，绝不通过重新检索补造历史。
+        payload = self._read_answer_artifact(turn)
+        raw_snapshot = payload.get("audit_snapshot") if payload else None
+        if not isinstance(raw_snapshot, dict):
+            return None
+        try:
+            return AgenticAuditSnapshot.from_json(
+                json.dumps(raw_snapshot, ensure_ascii=False)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def export_conversation_turn_audit(self, turn: ConversationTurn) -> str | None:
+        """导出脱敏、带 Schema 版本的审计 JSON，不读取运行时 Graph State。"""
+        snapshot = self.get_conversation_turn_audit(turn)
+        return snapshot.to_json(indent=2) if snapshot is not None else None
+
     def create_workspace_conversation(self, workspace_id: str) -> ConversationRecord:
         """为一个已存在的 staging workspace 创建独立会话。"""
         # 创建前先确认 workspace 存在，避免产生指向不存在论文的会话。
@@ -888,6 +919,10 @@ class PaperBaseService:
             [_agentic_evidence_payload(item) for item in displayed],
             ensure_ascii=False,
         ) if displayed else None
+        audit_snapshot = build_agentic_audit_snapshot(
+            result,
+            paper_titles=self._formal_paper_titles(),
+        )
         turn = self._conversations.append_turn(
             conversation_id,
             user_query=query,
@@ -897,6 +932,7 @@ class PaperBaseService:
             ),
             resolution_status=answer.status,
             evidence_json=evidence_json,
+            audit_json=audit_snapshot.to_json(),
         )
         payload = {
             "conversation_id": conversation_id,
@@ -911,6 +947,7 @@ class PaperBaseService:
             "coverage_note": answer.coverage_note,
             "error_codes": list(result.error_codes),
             "evidence": [_agentic_evidence_payload(item) for item in displayed],
+            "audit_snapshot": audit_snapshot.to_dict(),
         }
         try:
             path = self._answer_artifact_path(conversation_id, turn.turn_index)
@@ -921,6 +958,21 @@ class PaperBaseService:
             )
         except (OSError, TypeError, ValueError):
             return
+
+    def _formal_paper_titles(self) -> dict[str, str]:
+        """读取论文 ID 到标题的稳定映射，审计落盘后不再依赖元数据变化。"""
+        try:
+            rows = self._database.list_documents()
+        except (OSError, sqlite3.Error, ValueError):
+            return {}
+        titles: dict[str, str] = {}
+        for row in rows:
+            paper_id = _optional_text(row["paper_id"])
+            title = _optional_text(row["paper_title"])
+            filename = _optional_text(row["source_filename"])
+            if paper_id:
+                titles[paper_id] = title or filename or paper_id
+        return titles
 
     def _get_paper_ask_service(self, workspace_id: str) -> object:
         """按 workspace 延迟装配并复用现有 Ask This Paper 后端服务。"""

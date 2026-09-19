@@ -107,6 +107,11 @@ def test_agentic_stream_persists_answer_thread_and_evidence(tmp_path) -> None:
     assert metadata is not None
     assert metadata.mode == "agentic"
     assert metadata.thread_id == "research-test"
+    audit = service.get_conversation_turn_audit(turn)
+    assert audit is not None
+    assert audit.thread_id == "research-test"
+    assert audit.schema_version == 1
+    assert service.export_conversation_turn_audit(turn) == audit.to_json(indent=2)
 
 
 class _FakeAnswerService:

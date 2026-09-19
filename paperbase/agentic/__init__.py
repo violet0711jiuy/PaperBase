@@ -53,6 +53,11 @@ from .evidence_analysis import EvidenceAnalysisResult, LLMEvidenceAnalyzer
 from .evidence_analysis_cache import SQLiteEvidenceAnalysisCache
 from .evaluation import AgenticEvaluationReport, evaluate_research_result
 from .events import ResearchProgressEvent
+from .audit import (
+    AUDIT_SCHEMA_VERSION,
+    AgenticAuditSnapshot,
+    build_agentic_audit_snapshot,
+)
 from .factory import AgenticResearchConfigurationError, create_agentic_research_service
 from .graph import (
     AgentGraphContext,
@@ -141,4 +146,7 @@ __all__ = [
     "create_agentic_research_service",
     "evaluate_research_result",
     "ResearchProgressEvent",
+    "AUDIT_SCHEMA_VERSION",
+    "AgenticAuditSnapshot",
+    "build_agentic_audit_snapshot",
 ]

@@ -1,4 +1,4 @@
-"""Conversation Store：保存最终可见回合和可展示的 Evidence 快照。
+"""Conversation Store：保存最终可见回合、Evidence 与 Agentic 审计快照。
 
 Evidence 只保存回答实际使用的用户可见字段，不保存候选集、分数、向量或
 其它检索内部状态，因此不会改变 RAG 链路的审计边界。
@@ -42,8 +42,8 @@ class ConversationRecord:
 class ConversationTurn:
     """一轮用户问题、最终展示答案和可选 Evidence 快照。
 
-    ``evidence_json`` 是 nullable 的 JSON 文本。旧数据库或旧 turn 没有该值
-    时保持 ``None``，页面会正常显示答案但不显示证据入口。
+    ``evidence_json`` 与 ``audit_json`` 都是 nullable 的 JSON 文本。旧数据库或
+    旧 turn 没有这些值时保持 ``None``，页面仍会正常显示答案。
     """
 
     turn_id: str
@@ -56,6 +56,7 @@ class ConversationTurn:
     audit_path: str | None
     created_at: str
     evidence_json: str | None = None
+    audit_json: str | None = None
 
 
 _SCHEMA_SQL = """
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     resolution_status TEXT,
     audit_path TEXT,
     evidence_json TEXT,
+    audit_json TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
     UNIQUE (conversation_id, turn_index),
@@ -119,6 +121,10 @@ class ConversationStore:
             if "evidence_json" not in columns:
                 connection.execute(
                     "ALTER TABLE conversation_turns ADD COLUMN evidence_json TEXT"
+                )
+            if "audit_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN audit_json TEXT"
                 )
 
     def create_conversation(
@@ -216,14 +222,17 @@ class ConversationStore:
         resolution_status: str | None = None,
         audit_path: str | None = None,
         evidence_json: str | None = None,
+        audit_json: str | None = None,
     ) -> ConversationTurn:
         """原子追加回合；turn_index 在同一会话中严格单调递增。
 
-        ``evidence_json`` 只接受合法 JSON 文本；空值会以 SQL NULL 保存。
+        ``evidence_json`` 和 ``audit_json`` 只接受合法 JSON 文本；空值会以
+        SQL NULL 保存，并与答案在同一个事务中写入。
         """
         normalized_user = _required_text(user_query, field_name="user_query")
         normalized_answer = _required_text(assistant_answer, field_name="assistant_answer")
         normalized_evidence = _optional_json_text(evidence_json, field_name="evidence_json")
+        normalized_audit = _optional_json_text(audit_json, field_name="audit_json")
         self.initialize()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -253,13 +262,15 @@ class ConversationStore:
                     audit_path=_optional_text(audit_path),
                     created_at=_utc_now(),
                     evidence_json=normalized_evidence,
+                    audit_json=normalized_audit,
                 )
                 connection.execute(
                     """
                     INSERT INTO conversation_turns (
                         turn_id, conversation_id, turn_index, user_query, assistant_answer,
-                        resolved_query, resolution_status, audit_path, evidence_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        resolved_query, resolution_status, audit_path, evidence_json,
+                        audit_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn.turn_id,
@@ -271,6 +282,7 @@ class ConversationStore:
                         turn.resolution_status,
                         turn.audit_path,
                         turn.evidence_json,
+                        turn.audit_json,
                         turn.created_at,
                     ),
                 )
@@ -298,7 +310,8 @@ class ConversationStore:
             rows = connection.execute(
                 """
                 SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
-                       resolved_query, resolution_status, audit_path, evidence_json, created_at
+                       resolved_query, resolution_status, audit_path, evidence_json,
+                       audit_json, created_at
                 FROM conversation_turns
                 WHERE conversation_id = ?
                 ORDER BY turn_index DESC
@@ -325,7 +338,8 @@ class ConversationStore:
             row = connection.execute(
                 """
                 SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
-                       resolved_query, resolution_status, audit_path, evidence_json, created_at
+                       resolved_query, resolution_status, audit_path, evidence_json,
+                       audit_json, created_at
                 FROM conversation_turns WHERE turn_id = ?
                 """,
                 (turn_id,),
@@ -342,7 +356,8 @@ class ConversationStore:
             rows = connection.execute(
                 """
                 SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
-                       resolved_query, resolution_status, audit_path, evidence_json, created_at
+                       resolved_query, resolution_status, audit_path, evidence_json,
+                       audit_json, created_at
                 FROM conversation_turns
                 WHERE conversation_id = ?
                 ORDER BY turn_index ASC
@@ -390,6 +405,11 @@ def _turn_from_row(row: sqlite3.Row) -> ConversationTurn:
     except ValueError:
         # 外部旧脚本可能写入了损坏的快照；答案历史仍应可读，只跳过这条 Evidence。
         evidence_json = None
+    try:
+        audit_json = _optional_json_text(row["audit_json"], field_name="audit_json")
+    except (IndexError, ValueError):
+        # 旧行或外部脚本写入损坏值时只舍弃审计快照，不影响答案历史。
+        audit_json = None
     return ConversationTurn(
         turn_id=str(row["turn_id"]),
         conversation_id=str(row["conversation_id"]),
@@ -401,6 +421,7 @@ def _turn_from_row(row: sqlite3.Row) -> ConversationTurn:
         audit_path=_optional_text(row["audit_path"]),
         created_at=str(row["created_at"]),
         evidence_json=evidence_json,
+        audit_json=audit_json,
     )
 
 
