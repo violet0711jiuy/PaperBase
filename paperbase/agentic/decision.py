@@ -45,6 +45,7 @@ from .schemas import (
     SearchPapersDraft,
     SearchReferencesDraft,
 )
+from .research_profile import build_research_profiles
 
 
 class DecisionError(RuntimeError):
@@ -196,6 +197,14 @@ def _state_prompt(
 ) -> str:
     # Decision 只读取 Evidence Analysis 产生的短摘要与 Claim；完整原文保留在 Registry。
     visible_evidence = _visible_evidence(state, limit=evidence_limit)
+    profile_paper_ids = _profile_paper_ids(state)
+    research_profiles = build_research_profiles(
+        paper_ids=profile_paper_ids,
+        plan=state.plan,
+        evidence=state.evidence,
+        observations=state.observations,
+        default_targets=state.context.default_evidence_targets,
+    )
     summary = {
         "question": state.context.resolved_query,
         "scope": state.context.scope.value,
@@ -236,6 +245,29 @@ def _state_prompt(
             "shown": len(visible_evidence),
             "total": len(state.evidence),
         },
+        "research_profiles": [
+            {
+                "paper_id": profile.paper_id,
+                "queries_tried": profile.queries_tried,
+                "requested_targets": sorted(
+                    target.value for target in profile.requested_targets
+                ),
+                "covered_targets": sorted(
+                    target.value for target in profile.covered_targets
+                ),
+                "remaining_targets": sorted(
+                    target.value for target in profile.remaining_targets
+                ),
+                "requested_information": profile.requested_information,
+                "addressed_information": profile.addressed_information,
+                "remaining_information": profile.remaining_information,
+                "sections_seen": profile.sections_seen,
+                "qualified_digests": profile.qualified_digests,
+                "qualified_claims": profile.qualified_claims,
+                "empty_search_count": profile.empty_search_count,
+            }
+            for profile in research_profiles
+        ],
         "recent_observations": [
             {
                 "action": item.action_name,
@@ -285,6 +317,28 @@ def _state_prompt(
         "previous_validation_errors": errors[-1:],
     }
     return build_agent_decision_user_prompt(summary)
+
+
+def _profile_paper_ids(state: DecisionState) -> tuple[str, ...]:
+    if state.coverage is not None:
+        return state.coverage.required_paper_ids
+    if state.candidate_selection is not None:
+        return tuple(
+            dict.fromkeys(
+                (
+                    *state.candidate_selection.candidate_paper_ids,
+                    *state.candidate_selection.uncertain_paper_ids,
+                )
+            )
+        )
+    return tuple(
+        dict.fromkeys(
+            (
+                *state.context.target_paper_ids,
+                *(record.evidence.paper_id for record in state.evidence),
+            )
+        )
+    )
 
 
 def _validate_action_references(action: AgentAction, state: DecisionState) -> None:

@@ -42,6 +42,12 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 trusted_paper_ids；全库范围只能面向 candidate_selection 中的 candidate/uncertain 论文。
 每轮都应结合尚未满足的 Subtask、已收集 Evidence、最近 Observation 和
 missing_information 决定下一条论文特定 Query。
+research_profiles 是程序从检索历史与 Evidence Analysis 派生的逐论文研究状态：
+- 优先针对 remaining_targets 与 remaining_information 形成下一条精确 Query；
+- 不得原样重复 queries_tried；
+- 多论文比较时，应利用其他论文 qualified_claims 中已经发现的比较维度，为尚未覆盖的论文
+  生成对应但论文特定的 Query；
+- remaining 为空且现有 Claim 足以支持任务时，不要为了增加数量继续检索。
 
 Top-K、预算、Scope 校验、重复动作保护和实际 Tool 执行均由程序负责，不能在 Action 中
 设置或绕过。响应根对象必须只包含 decision 字段。Evidence 的摘要、Claim、关系和归属已经
