@@ -3,7 +3,7 @@
 
 # 项目的基础标识信息。
 project:
-  # 项目名称：用于日志、检查产物等位置标识当前项目。
+  # 必填项目元数据；当前没有运行时日志标识消费者。
   name: PaperBase
 
 # 项目本地数据的统一存储位置。
@@ -159,8 +159,10 @@ answer_generation:
   max_evidence_units: 8
   # Reranker 成功但所有正文分数都低于此值时，不让无关 chunk 进入 Answer LLM。
   min_rerank_score: 0.05
-  # 最终阅读式回答的独立输出上限；为带隐藏推理的模型预留充足 JSON 闭合空间。
+  # Classic Answer 独立输出上限；Agentic Answer 不发送应用层输出 cap。
   max_output_tokens: 4000
+  timeout_seconds: 60
+  request_error_retries: 1
 
 # v0.2 Step 2：单篇临时论文速览。只读取 temporary workspace 的 parsed/chunks 产物，
 # 先按字段选择候选 evidence，再合并、去重并应用全局 token 预算；不执行 FAISS 检索。
@@ -193,46 +195,59 @@ explain_section:
   max_key_points: 5
   max_output_tokens: 2500
 
-# Phase 2：单 Agent 研究循环。所有数字都是服务端硬上限，不暴露为 Agent Tool 参数。
+# 当前 Agentic Research：Qwen 官方采样配方与原有研究循环边界。
 agentic_research:
+  decision_temperature: 1
+  decision_thinking_enabled: false
+  # 请求恢复由原 node_max_attempts 管理，避免再叠加 SDK 内部重试。
+  decision_timeout_seconds: 60
+  decision_transport_max_retries: 0
+  llm_sampling_profile: qwen38_recommended
   enabled: true
-  # Phase 4：本地 SQLite checkpoint 支持应用重启后继续任务。
+  # 当前 v4 SQLite checkpoint；旧语义版本只读，不执行 resume。
   checkpoint_path: storage/agentic_checkpoints.sqlite3
   # Evidence Analysis 使用独立 SQLite，不与正式 KB 或 checkpoint 混表。
   evidence_analysis_cache_path: storage/evidence_analysis_cache.sqlite3
   checkpoint_retention_days: 30
   # 桌面版默认串行执行，避免本地模型、SQLite 与向量检索争抢资源。
   max_concurrent_runs: 1
+  # 一轮对应一次 Agent 决策，是整个研究循环的最终兜底。
   max_agent_iterations: 8
-  max_tool_calls: 8
-  max_retrieval_queries: 16
   max_queries_per_paper: 4
-  max_llm_calls: 12
-  max_invalid_actions: 2
-  max_no_new_evidence_per_paper: 2
+  # 结构化节点尝试上限，也用于累计非法 iteration 的停止保护。
+  node_max_attempts: 2
+  planner_temperature: 0.7
+  projector_temperature: 0.7
+  answer_temperature: 0.7
+  # Compact / shadow 从同一 Graph State 构建视图，共享当前 System Prompt。
+  decision_view_mode: compact
+  decision_view_support_limit: 6
+  decision_view_recent_observations: 2
+  decision_view_recent_queries: 3
+  decision_view_recent_actions: 3
+  decision_view_sections: 10
+  decision_view_scope_chars: 600
+  decision_view_unresolved_limit: 6
+  decision_view_unresolved_chars: 240
+  decision_view_entity_limit: 12
+  # 当前 ModelScope/Qwen schema-critical 节点使用 json_schema。
+  schema_critical_output_mode: json_schema
+  # Batch execution only; cache/projection/integrity remain per Evidence.
+  evidence_projector_batch_size: 4
+  evidence_analysis_timeout_seconds: 60
+  # Agentic 不发送应用层输出 cap；旧配置兼容字段见 docs/configuration.md。
   top_k_per_paper: 5
   # Agentic 专用 Evidence 准入：只在 reranker 成功时应用分数阈值。
   evidence_admission_enabled: true
   evidence_min_rerank_score: 0.05
   # source chunk 集合达到该 Jaccard 重叠度时只保留更强的一条。
   evidence_source_overlap_threshold: 0.8
-  # 候选验证策略中，一篇候选论文进入终态前至少执行的论文级查询数。
-  coverage_candidate_min_queries_per_paper: 1
-  # 穷举策略中，每篇论文至少执行“直接查询 + 替代表达”两次查询。
-  coverage_exhaustive_min_queries_per_paper: 2
-  # 最终送入答案阶段的 Evidence 总数和单篇论文上限。
+  # 最终送入答案阶段的 Evidence 总数。
   final_evidence_max_units: 8
-  final_evidence_max_per_paper: 4
-  # 各结构化节点使用独立输出预算，避免隐藏推理耗尽全局短输出上限。
-  query_understanding_max_output_tokens: 1000
-  planner_max_output_tokens: 1400
-  candidate_selection_max_output_tokens: 2400
-  decision_max_output_tokens: 2400
-  evidence_analysis_max_output_tokens: 3000
 
 # Step 6：Query Planning、Dense 和 FTS5/BM25 混合检索配置。
 retrieval:
-  # 检索器后端标识。
+  # 兼容后端标识；当前生产工厂固定创建 HybridRetriever。
   backend: hybrid_rrf
   # 每条 Dense 查询路径召回的候选数量。
   dense_top_k_per_query: 20

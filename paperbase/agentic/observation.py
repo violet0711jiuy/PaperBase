@@ -10,13 +10,23 @@ from paperbase.retrieval.contracts import (
 )
 
 from .contracts import (
+    AgentAction,
+    ActionCanonicalization,
     EvidenceFilterReport,
     EvidenceAnalysisCacheStats,
     EvidenceTarget,
     PaperSearchAttempt,
     RegistryDelta,
     ResearchObservation,
+    ResearchPlan,
+    GetPaperOverviewAction,
+    GetSectionContextAction,
+    SearchKnowledgeBaseAction,
+    SearchPapersAction,
+    SearchReferencesAction,
 )
+
+from .requirement_targets import targets_for_requirement_ids, requirement_target_bindings
 
 
 def build_observation(
@@ -24,17 +34,22 @@ def build_observation(
     iteration: int,
     result: ToolResult,
     delta: RegistryDelta,
-    remaining_budget: dict[str, int],
+    action: AgentAction | None = None,
+    plan: ResearchPlan | None = None,
     evidence_filter_report: EvidenceFilterReport | None = None,
     evidence_analysis_cache: EvidenceAnalysisCacheStats | None = None,
+    action_canonicalization: ActionCanonicalization | None = None,
 ) -> ResearchObservation:
-    paper_statuses: list[tuple[str, str]] = []
     queries_by_paper: list[tuple[str, str]] = []
     error_codes: list[str] = []
     search_attempts: list[PaperSearchAttempt] = []
     if isinstance(result.payload, SearchPapersPayload):
-        for outcome in result.payload.paper_results:
-            paper_statuses.append((outcome.paper_id, outcome.status.value))
+        for index, outcome in enumerate(result.payload.paper_results):
+            search = (
+                action.searches[index]
+                if isinstance(action, SearchPapersAction)
+                else outcome.search
+            )
             queries_by_paper.append((outcome.paper_id, outcome.query))
             if outcome.error_code:
                 error_codes.append(outcome.error_code)
@@ -43,11 +58,10 @@ def build_observation(
                     paper_id=outcome.paper_id,
                     query=outcome.query,
                     lexical_terms=outcome.lexical_terms,
-                    evidence_targets=frozenset(
-                        EvidenceTarget(value) for value in outcome.evidence_targets
-                    ),
-                    missing_information=outcome.missing_information,
-                    target_subtask_id=outcome.target_subtask_id,
+                    evidence_targets=(targets_for_requirement_ids(plan, search.requirement_ids)
+                        if plan is not None else frozenset(
+                            EvidenceTarget(value) for value in outcome.evidence_targets)),
+                    requirement_ids=search.requirement_ids,
                     status=outcome.status.value,
                     error_code=outcome.error_code,
                 )
@@ -63,16 +77,66 @@ def build_observation(
         error_codes.append(result.error_code)
     return ResearchObservation(
         iteration=iteration,
+        requirement_target_bindings=(requirement_target_bindings(plan, action)
+            if plan is not None and action is not None else ()),
+        raw_action_arguments=result.metadata.get("raw_action_arguments", _action_arguments(action)),
+        canonical_effective_requests=tuple(result.metadata.get("canonical_effective_requests", ())),
+        request_identities=tuple(item["request_identity"] for item in result.metadata.get("canonical_effective_requests", ())),
+        request_executions=tuple(result.metadata.get("request_executions", ())),
+        request_contract_version=result.metadata.get("request_contract_version", "legacy"),
         action_name=result.tool_name.value,
         tool_status=result.status,
         added_evidence_ids=delta.added_ids,
         reused_evidence_ids=delta.reused_ids,
-        paper_statuses=tuple(paper_statuses),
         queries_by_paper=tuple(dict.fromkeys(queries_by_paper)),
         error_codes=tuple(dict.fromkeys(error_codes)),
-        no_new_evidence=not delta.added_ids,
-        remaining_budget=dict(remaining_budget),
+        action_arguments=_action_arguments(action),
         search_attempts=tuple(search_attempts),
         evidence_filter_report=evidence_filter_report,
         evidence_analysis_cache=evidence_analysis_cache,
+        action_canonicalization=action_canonicalization,
     )
+
+
+def _action_arguments(action: AgentAction | None) -> dict[str, object]:
+    """Expose the chosen Tool parameters without storing internal state."""
+    if action is None:
+        return {}
+    if isinstance(action, SearchPapersAction):
+        return {
+            "searches": [
+                {
+                    "paper_id": search.paper_id,
+                    "query": search.query,
+                    "lexical_terms": list(search.lexical_terms),
+                    "requirement_ids": list(search.requirement_ids),
+                    "evidence_targets": sorted(search.evidence_targets),
+                }
+                for search in action.searches
+            ]
+        }
+    if isinstance(action, SearchKnowledgeBaseAction):
+        return {
+            "query": action.query,
+            "lexical_terms": list(action.lexical_terms),
+            "requirement_ids": list(action.requirement_ids),
+        }
+    if isinstance(action, SearchReferencesAction):
+        return {
+            "paper_id": action.paper_id,
+            "query": action.query,
+            "lexical_terms": list(action.lexical_terms),
+            "requirement_ids": list(action.requirement_ids),
+        }
+    if isinstance(action, GetSectionContextAction):
+        return {
+            "paper_id": action.paper_id,
+            "section_id": action.section_id,
+            "requirement_ids": list(action.requirement_ids),
+        }
+    if isinstance(action, GetPaperOverviewAction):
+        return {
+            "paper_id": action.paper_id,
+            "requirement_ids": list(action.requirement_ids),
+        }
+    return {}

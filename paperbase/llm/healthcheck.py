@@ -9,13 +9,17 @@ from typing import Sequence
 
 from paperbase.config import default_config_path, load_settings
 
-from .client import LLMConfigurationError, load_llm_runtime_settings
+from .client import (
+    LLMConfigurationError,
+    create_chat_completion_client,
+    load_llm_runtime_settings,
+)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """按 ModelScope 官方非流式调用形态发送一条固定健康检查问题。"""
+    """按当前 provider 的正式 Client 发送一条固定非流式健康检查问题。"""
     parser = argparse.ArgumentParser(
-        description="Run a minimal non-streaming ModelScope/OpenAI-compatible LLM health check."
+        description="Run a minimal non-streaming LLM provider health check."
     )
     parser.add_argument(
         "--config",
@@ -28,24 +32,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         app_settings = load_settings(args.config)
         runtime = load_llm_runtime_settings(app_settings.config_path.parent / ".env")
-        from openai import OpenAI
-
-        client = OpenAI(
-            api_key=runtime.api_key,
-            base_url=runtime.base_url,
-            timeout=runtime.timeout_seconds,
-        )
-        # 与 ModelScope 示例一致：单条 user message + stream=False。
         # 不输出模型回答本身，防止健康检查日志混入未来真实用户内容。
-        response = client.chat.completions.create(
-            model=runtime.model,
-            messages=[{"role": "user", "content": "你好"}],
-            stream=False,
+        final_content = create_chat_completion_client(runtime).complete(
+            system_prompt="你是健康检查助手。只需简短回复。",
+            user_prompt="你好",
         )
-        choices = response.choices if isinstance(response.choices, list) else []
-        message = choices[0].message if choices else None
-        final_content = getattr(message, "content", None)
-        reasoning_content = getattr(message, "reasoning_content", None)
     except LLMConfigurationError as error:
         print(json.dumps({"status": "failed", "error": str(error)}, ensure_ascii=False))
         return 2
@@ -67,15 +58,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "status": "ok" if healthy else "failed",
                 # 调用模式：固定非流式，用于核对与正式 LLM 客户端一致。
                 "mode": "non_streaming",
+                "provider": runtime.provider,
                 # 模型名称：仅用于确认当前 .env 选择了哪个模型。
                 "model": runtime.model,
-                # 候选数量：标准响应通常至少为 1。
-                "choices_count": len(choices),
                 # 最终内容状态：是否存在非空 message.content。
                 "final_content_received": healthy,
-                # 推理内容状态：仅作供应商兼容性观测，不读取或输出具体推理文本。
-                "reasoning_content_received": isinstance(reasoning_content, str)
-                and bool(reasoning_content.strip()),
+                # 该字段来自实际请求配置，绝不读取或输出隐藏推理文本。
+                "thinking_enabled": runtime.thinking_enabled,
             },
             ensure_ascii=False,
             indent=2,

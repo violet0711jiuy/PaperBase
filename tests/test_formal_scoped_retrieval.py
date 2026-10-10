@@ -78,6 +78,10 @@ class _Database:
         allowed = set(paper_ids or ("paper-other", "paper-target"))
         return tuple(rows[item] for item in vector_ids if rows[item]["paper_id"] in allowed)
 
+    def search_compiled_lexical(self, query, *, top_k, paper_ids=None, bibliography=False):
+        self.bm25_calls.append((query, paper_ids))
+        return ()
+
     def search_bm25_keyword_group(
         self,
         keywords: tuple[str, ...],
@@ -146,9 +150,9 @@ class FormalScopedRetrievalTests(unittest.TestCase):
 
         self.assertTrue(result.retrieval.chunks)
         self.assertEqual(
-            result.retrieval.rewrite_plan.lexical_keywords_en, ("Graph encoder",)
+            result.retrieval.rewrite_plan.lexical_keywords_en, ("encoder", "graph")
         )
-        self.assertEqual(database.bm25_calls, [(("Graph encoder",), ("paper-target",))])
+        self.assertEqual(database.bm25_calls, [('"encoder" OR "graph"', ("paper-target",))])
 
     def test_scoped_dense_search_scans_index_then_reranks_inside_paper(self) -> None:
         retriever, database, index_store = self._retriever()

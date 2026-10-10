@@ -273,6 +273,12 @@ class HybridRetrieverTests(unittest.TestCase):
         result = retriever.retrieve("任意输入")
 
         self.assertEqual([chunk.chunk_id for chunk in result.chunks], ["chunk_2", "chunk_1", "chunk_3"])
+        from paperbase.agentic.tools import _retrieved_chunk_to_evidence
+        from paperbase.retrieval.contracts import ScoreKind, ScoreDirection
+        evidence = tuple(_retrieved_chunk_to_evidence(c) for c in result.chunks)
+        self.assertEqual([e.retrieval_rank for e in evidence], [1, 2, 3])
+        self.assertTrue(all(e.score_kind is ScoreKind.RRF and e.score_direction is ScoreDirection.HIGHER_IS_BETTER for e in evidence))
+        self.assertEqual([e.raw_score for e in evidence], sorted([e.raw_score for e in evidence], reverse=True))
         second_chunk = result.chunks[0]
         self.assertEqual(
             {source.route for source in second_chunk.source_matches},
@@ -417,6 +423,13 @@ class HybridRetrieverTests(unittest.TestCase):
         self.assertEqual(result.chunks[0].rerank_score, 0.95)
         self.assertEqual(result.chunks[1].pre_rerank_rank, 3)
         self.assertEqual(result.chunks[1].rerank_score, 0.5)
+        from paperbase.agentic.tools import _retrieved_chunk_to_evidence
+        from paperbase.retrieval.contracts import ScoreKind, ScoreDirection
+        evidence = tuple(_retrieved_chunk_to_evidence(c) for c in result.chunks)
+        self.assertEqual([e.raw_score for e in evidence], [0.95, 0.5])
+        self.assertEqual([e.retrieval_rank for e in evidence], [1, 2])
+        self.assertTrue(all(e.score_kind is ScoreKind.RERANKER and e.score_direction is ScoreDirection.HIGHER_IS_BETTER for e in evidence))
+        self.assertTrue(all(e.retrieval_metadata['rerank_score_normalized'] is True for e in evidence))
         self.assertEqual(retriever._reranker.queries, ["已消解问题"])  # type: ignore[attr-defined]
 
     def test_bibliography_is_direct_output_and_not_sent_to_reranker(self) -> None:

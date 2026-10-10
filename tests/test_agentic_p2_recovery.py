@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 
 from paperbase.agentic.contracts import (
     BudgetUsage,
     CorpusScopeSnapshot,
     EvidenceRecord,
+    EvidenceAnalysis,
+    EvidenceAnalysisStatus,
+    MechanismProjection,
+    RequirementSupportAnchor,
     EvidenceTarget,
     FinishAction,
     Intent,
@@ -14,12 +19,11 @@ from paperbase.agentic.contracts import (
     QueryScope,
     ResearchGoal,
     ResearchPlan,
-    ResearchSubtask,
+    ResearchRequirement,
     ScopeSource,
 )
 from paperbase.agentic.candidate_selection import LLMCandidateSelector, PaperMetadata
 from paperbase.agentic.decision import DecisionState, LLMDecisionAgent
-from paperbase.agentic.evidence_analysis import LLMEvidenceAnalyzer
 from paperbase.llm.client import LLMCompletion, LLMRequestError
 from paperbase.retrieval.contracts import EvidenceSourceType, RetrievedEvidence
 
@@ -77,18 +81,31 @@ def _state(evidence: tuple[EvidenceRecord, ...]) -> DecisionState:
         default_evidence_targets=frozenset({EvidenceTarget.METHOD}),
     )
     plan = ResearchPlan(
-        "查找方法",
-        (
-            ResearchSubtask(
-                "S1",
-                "查找方法",
-                paper_ids,
-                frozenset({EvidenceTarget.METHOD}),
-                "找到证据",
+        goal="查找方法",
+        requirements=(
+            ResearchRequirement(
+                "R1", "查找方法",
+                evidence_targets=frozenset({EvidenceTarget.METHOD}),
             ),
         ),
     )
     return DecisionState(context, plan, evidence, (), BudgetUsage())
+
+
+def _supported_records() -> tuple[EvidenceRecord, ...]:
+    records = []
+    for index in range(1, 8):
+        record = _record(index, content=f"evidence {index}", paper_id=f"P{index}")
+        records.append(replace(record, assessment=EvidenceAnalysis(
+            record.evidence_id, EvidenceAnalysisStatus.QUALIFIED,
+            projection=MechanismProjection(record.evidence_id, "mechanism",
+                supported_requirement_ids=("R1",), proposed_requirement_ids=("R1",),
+                support_anchors=(RequirementSupportAnchor(
+                    "R1", record.evidence.content,
+                    f"verified local support {index}", ("other mechanism details",)
+                ),)),
+        )))
+    return tuple(records)
 
 
 class AgenticP2RecoveryTests(unittest.TestCase):
@@ -138,92 +155,8 @@ class AgenticP2RecoveryTests(unittest.TestCase):
         )
         self.assertIn("业务范围", second["previous_validation_errors"][0])
 
-    def test_length_empty_content_compacts_evidence_analysis_retry(self) -> None:
-        content = "ANCHOR " + "x" * 1_400
-        valid = json.dumps(
-            {
-                "analyses": [
-                    {
-                        "evidence_id": "E1",
-                        "status": "qualified",
-                        "digest": "方法证据",
-                        "covered_targets": [],
-                        "addressed_information": [],
-                        "claims": [
-                            {
-                                "statement": "原文给出方法锚点。",
-                                "relation": "supports",
-                                "ownership": "this_paper",
-                                "rationale": "连续原文片段。",
-                                "source_excerpt": "ANCHOR",
-                            }
-                        ],
-                    }
-                ]
-            }
-        )
-        client = _DiagnosticClient(
-            (
-                LLMRequestError(
-                    "没有最终内容",
-                    error_stage="empty_content",
-                    finish_reason="length",
-                    prompt_tokens=900,
-                    completion_tokens=3000,
-                    reasoning_chars=8000,
-                ),
-                LLMCompletion(valid, "stop", 520, 180, 400),
-            )
-        )
 
-        result = LLMEvidenceAnalyzer(
-            client, max_content_chars=1_200, max_attempts=2
-        ).analyze(question="方法是什么？", evidence=(_record(1, content=content),))
-
-        first = json.loads(client.calls[0]["user_prompt"])
-        second = json.loads(client.calls[1]["user_prompt"])
-        self.assertEqual(len(first["evidence"][0]["content"]), 1_200)
-        self.assertEqual(len(second["evidence"][0]["content"]), 600)
-        self.assertEqual(result.llm_diagnostics[0].error_stage, "empty_content")
-        self.assertEqual(
-            result.llm_diagnostics[0].recovery_action, "compact_context"
-        )
-        self.assertTrue(result.llm_diagnostics[1].success)
-        self.assertEqual(result.llm_diagnostics[0].reasoning_chars, 8000)
-
-    def test_invalid_json_uses_structure_repair_without_compacting_context(self) -> None:
-        valid = json.dumps(
-            {
-                "analyses": [
-                    {
-                        "evidence_id": "E1",
-                        "status": "irrelevant",
-                        "digest": "与问题无关",
-                        "covered_targets": [],
-                        "addressed_information": [],
-                        "claims": [],
-                    }
-                ]
-            }
-        )
-        client = _DiagnosticClient(
-            (LLMCompletion("{bad", "stop"), LLMCompletion(valid, "stop"))
-        )
-        result = LLMEvidenceAnalyzer(client, max_attempts=2).analyze(
-            question="方法是什么？", evidence=(_record(1, content="unrelated"),)
-        )
-
-        second = json.loads(client.calls[1]["user_prompt"])
-        self.assertEqual(result.llm_diagnostics[0].error_stage, "invalid_json")
-        self.assertEqual(
-            result.llm_diagnostics[0].validation_summary, "json_invalid@root"
-        )
-        self.assertEqual(
-            result.llm_diagnostics[0].recovery_action, "repair_structure"
-        )
-        self.assertIn("合法 JSON", second["previous_validation_errors"][0])
-
-    def test_decision_length_retry_reduces_visible_evidence(self) -> None:
+    def test_decision_length_retry_reduces_view_detail_preserving_all_ids_and_runtime(self) -> None:
         client = _DiagnosticClient(
             (
                 LLMRequestError(
@@ -239,27 +172,41 @@ class AgenticP2RecoveryTests(unittest.TestCase):
                 ),
             )
         )
-        result = LLMDecisionAgent(client, max_attempts=2).decide(
-            _state(
-                tuple(
-                    _record(
-                        index,
-                        content=f"evidence {index}",
-                        paper_id=f"P{index}",
-                    )
-                    for index in range(1, 8)
-                )
-            )
-        )
+        result = LLMDecisionAgent(client, max_attempts=2).decide(_state(_supported_records()))
 
         first = json.loads(client.calls[0]["user_prompt"])
         second = json.loads(client.calls[1]["user_prompt"])
-        self.assertEqual(first["evidence_visibility"]["shown"], 7)
-        self.assertEqual(second["evidence_visibility"]["shown"], 6)
+        self.assertEqual(len(first["requirements"][0]["local_supports"]), 6)
+        self.assertEqual(len(second["requirements"][0]["local_supports"]), 3)
+        self.assertEqual(second["requirements"][0]["local_supports_omitted"], 4)
+        self.assertNotIn("verified_support_evidence_ids", second["requirements"][0])
+        self.assertEqual(first["runtime_action_capabilities"], second["runtime_action_capabilities"])
+        self.assertLess(result.llm_diagnostics[1].decision_view_metrics["decision_view_chars"],
+                        result.llm_diagnostics[0].decision_view_metrics["decision_view_chars"])
         self.assertIsInstance(result.action, FinishAction)
         self.assertEqual(
             result.llm_diagnostics[0].recovery_action, "compact_context"
         )
+
+    def test_decision_timeout_retry_really_compacts_the_view(self) -> None:
+        client = _DiagnosticClient((
+            LLMRequestError("timeout", error_stage="timeout"),
+            LLMCompletion(
+                json.dumps({"decision": {"action": "finish", "reason": "done"}}),
+                "stop",
+            ),
+        ))
+
+        result = LLMDecisionAgent(client, max_attempts=2).decide(
+            _state(_supported_records())
+        )
+
+        first = json.loads(client.calls[0]["user_prompt"])
+        second = json.loads(client.calls[1]["user_prompt"])
+        self.assertEqual(len(first["requirements"][0]["local_supports"]), 6)
+        self.assertEqual(len(second["requirements"][0]["local_supports"]), 3)
+        self.assertLess(len(client.calls[1]["user_prompt"]), len(client.calls[0]["user_prompt"]))
+        self.assertEqual(result.llm_diagnostics[0].recovery_action, "retry_request")
 
 
 if __name__ == "__main__":

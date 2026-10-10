@@ -97,7 +97,7 @@ def _result_to_json(result: AnswerServiceResult) -> dict[str, object]:
         "answer_status": result.answer.status,
         # 回答正文：即使生成失败也会返回明确的程序提示，避免前端处理 null。
         "answer": result.answer.answer,
-        # 被回答引用的 E#/R# 标识，均已经过程序验证，绝不会引用未提供的证据。
+        # 被回答引用的 E#/REF# 标识，均已经过程序验证，绝不会引用未提供的证据。
         "citations": list(result.answer.citations),
         # 证据不足标志：true 时答案不应被当作论文事实结论。
         "insufficient_evidence": result.answer.insufficient_evidence,
@@ -119,7 +119,7 @@ def _result_to_json(result: AnswerServiceResult) -> dict[str, object]:
             }
             for chunk in result.retrieval.chunks
         ],
-        # 扩展后的可用证据：E# 是正文同节连续块组合，R# 是不扩展的参考文献条目。
+        # 扩展后的可用证据：E# 是正文同节连续块组合，REF# 是不扩展的参考文献条目。
         "evidence": [_evidence_to_json(item) for item in result.expansion.evidence],
     }
 
@@ -127,7 +127,7 @@ def _result_to_json(result: AnswerServiceResult) -> dict[str, object]:
 def _evidence_to_json(item: object) -> dict[str, object]:
     """将 EvidenceUnit 显式转为 JSON，避免 dataclass 内部结构成为对外契约。"""
     return {
-        # 证据编号：回答文本只允许使用这里列出的 E#/R#。
+        # 证据编号：回答文本只允许使用这里列出的 E#/REF#。
         "evidence_id": item.evidence_id,
         # 证据类别：content 是正文，bibliography 是参考文献条目。
         "kind": item.kind,
@@ -144,7 +144,7 @@ def _evidence_to_json(item: object) -> dict[str, object]:
         "chunk_ids": list(item.chunk_ids),
         # 预算统计：正文按 SQLite raw_token_count 计数，参考文献为估算值。
         "token_count": item.token_count,
-        # 完整证据正文：不从中间截断，供人工核验回答中的每个 [E#]/[R#]。
+        # 完整证据正文：不从中间截断，供人工核验回答中的每个 [E#]/[REF#]。
         "text": item.text,
     }
 

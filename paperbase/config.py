@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import (
@@ -269,6 +269,8 @@ class AnswerGenerationSettings(BaseModel):
     min_rerank_score: float = Field(default=0.05, ge=0.0, le=1.0)
     # 回答需要解释论文证据，单独覆盖全局 LLM_MAX_TOKENS；不影响短小的 Query Rewrite。
     max_output_tokens: int = Field(default=4_000, ge=400, le=8_000)
+    timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    request_error_retries: int = Field(default=1, ge=0, le=3)
 
 
 class PaperOverviewSettings(BaseModel):
@@ -323,7 +325,7 @@ class ExplainSectionSettings(BaseModel):
 
 
 class AgenticResearchSettings(BaseModel):
-    """Agentic Research 的硬预算、Coverage 与 Evidence Selector 配置。"""
+    """Agentic Research 的循环保护、证据处理与运行配置。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -335,27 +337,45 @@ class AgenticResearchSettings(BaseModel):
     checkpoint_retention_days: int = Field(default=30, ge=1, le=3650)
     max_concurrent_runs: int = Field(default=1, ge=1, le=32)
     max_agent_iterations: int = Field(default=8, ge=1, le=50)
-    max_tool_calls: int = Field(default=8, ge=1, le=50)
-    max_retrieval_queries: int = Field(default=16, ge=1, le=100)
     max_queries_per_paper: int = Field(default=4, ge=1, le=20)
-    max_llm_calls: int = Field(default=12, ge=1, le=100)
-    max_invalid_actions: int = Field(default=2, ge=0, le=10)
-    max_no_new_evidence_per_paper: int = Field(default=2, ge=1, le=10)
+    node_max_attempts: int = Field(default=2, ge=1, le=5)
+    decision_temperature: float = Field(default=0, ge=0, le=2)
+    decision_thinking_enabled: bool = False
+    # Decision owns retries at the node layer; avoid multiplying SDK retries.
+    decision_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    decision_transport_max_retries: int = Field(default=0, ge=0, le=2)
+    llm_sampling_profile: Literal["configured", "qwen38_recommended"] = "configured"
+    planner_temperature: float = Field(default=0, ge=0, le=2)
+    projector_temperature: float = Field(default=0, ge=0, le=2)
+    answer_temperature: float = Field(default=0, ge=0, le=2)
+    decision_view_mode: Literal["compact", "shadow"] = "compact"
+    decision_view_support_limit: int = Field(default=6, ge=1, le=50)
+    decision_view_recent_observations: int = Field(default=2, ge=1, le=20)
+    decision_view_recent_queries: int = Field(default=3, ge=1, le=20)
+    decision_view_recent_actions: int = Field(default=3, ge=1, le=20)
+    decision_view_sections: int = Field(default=10, ge=1, le=100)
+    decision_view_scope_chars: int = Field(default=600, ge=80, le=4000)
+    decision_view_unresolved_limit: int = Field(default=6, ge=1, le=50)
+    decision_view_unresolved_chars: int = Field(default=240, ge=40, le=2000)
+    decision_view_entity_limit: int = Field(default=12, ge=1, le=100)
+    # Opt into strict mode only after verifying the configured endpoint/model.
+    schema_critical_output_mode: Literal["json_object", "json_schema"] = "json_object"
+    # Legacy keys accepted for config compatibility; structured nodes omit caps.
+    evidence_analysis_max_output_tokens: int = Field(default=1_400, ge=400, le=8_000)
+    evidence_projector_batch_size: int = Field(default=4, ge=1, le=32)
+    evidence_projector_batch_base_tokens: int = Field(default=200, ge=0, le=8_000)
+    evidence_projector_batch_per_evidence_tokens: int = Field(default=1_400, ge=400, le=8_000)
+    evidence_projector_batch_max_output_tokens: int = Field(default=8_000, ge=400, le=8_000)
+    evidence_analysis_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    # Legacy compatibility only; Agentic clients no longer send output caps.
+    max_output_tokens: int = Field(default=8_000, ge=1_000, le=32_000)
     top_k_per_paper: int = Field(default=5, ge=1, le=30)
     evidence_admission_enabled: bool = True
     evidence_min_rerank_score: float = Field(default=0.05, ge=0.0, le=1.0)
     evidence_source_overlap_threshold: float = Field(
         default=0.8, ge=0.5, le=1.0
     )
-    coverage_candidate_min_queries_per_paper: int = Field(default=1, ge=1, le=10)
-    coverage_exhaustive_min_queries_per_paper: int = Field(default=2, ge=1, le=10)
     final_evidence_max_units: int = Field(default=8, ge=1, le=50)
-    final_evidence_max_per_paper: int = Field(default=4, ge=1, le=20)
-    query_understanding_max_output_tokens: int = Field(default=1_000, ge=200, le=8_000)
-    planner_max_output_tokens: int = Field(default=1_400, ge=400, le=8_000)
-    candidate_selection_max_output_tokens: int = Field(default=2_400, ge=400, le=8_000)
-    decision_max_output_tokens: int = Field(default=2_400, ge=400, le=8_000)
-    evidence_analysis_max_output_tokens: int = Field(default=3_000, ge=400, le=8_000)
 
     @field_validator(
         "checkpoint_path", "evidence_analysis_cache_path", mode="after"
@@ -439,6 +459,10 @@ def load_settings(config_path: Path | str | None = None) -> AppSettings:
     agentic_config = raw_config.setdefault("agentic_research", {})
     if not isinstance(agentic_config, dict):
         raise ConfigurationError("agentic_research must be a YAML mapping.")
+    # 旧配置中的三个参数从未按配置值生效；读取时丢弃，避免升级后拒绝旧 YAML。
+    agentic_config.pop("max_evidence_per_analysis", None)
+    agentic_config.pop("final_evidence_max_per_paper", None)
+    agentic_config.pop("max_no_new_evidence_rounds", None)
     agentic_config.setdefault(
         "evidence_analysis_cache_path",
         "storage/evidence_analysis_cache.sqlite3",

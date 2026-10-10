@@ -42,7 +42,7 @@ class ConversationRecord:
 class ConversationTurn:
     """一轮用户问题、最终展示答案和可选 Evidence 快照。
 
-    ``evidence_json`` 与 ``audit_json`` 都是 nullable 的 JSON 文本。旧数据库或
+    ``evidence_json``、``audit_json`` 与 ``metadata_json`` 是 nullable 的 JSON 文本。旧数据库或
     旧 turn 没有这些值时保持 ``None``，页面仍会正常显示答案。
     """
 
@@ -57,6 +57,7 @@ class ConversationTurn:
     created_at: str
     evidence_json: str | None = None
     audit_json: str | None = None
+    metadata_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,7 @@ CREATE TABLE IF NOT EXISTS conversation_turns (
     audit_path TEXT,
     evidence_json TEXT,
     audit_json TEXT,
+    metadata_json TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (conversation_id) REFERENCES conversations(conversation_id) ON DELETE CASCADE,
     UNIQUE (conversation_id, turn_index),
@@ -150,6 +152,10 @@ class ConversationStore:
             if "audit_json" not in columns:
                 connection.execute(
                     "ALTER TABLE conversation_turns ADD COLUMN audit_json TEXT"
+                )
+            if "metadata_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE conversation_turns ADD COLUMN metadata_json TEXT"
                 )
 
     def create_conversation(
@@ -248,17 +254,19 @@ class ConversationStore:
         audit_path: str | None = None,
         evidence_json: str | None = None,
         audit_json: str | None = None,
+        metadata_json: str | None = None,
         finalize_agentic_thread_id: str | None = None,
     ) -> ConversationTurn:
         """原子追加回合；turn_index 在同一会话中严格单调递增。
 
-        ``evidence_json`` 和 ``audit_json`` 只接受合法 JSON 文本；空值会以
+        JSON 快照只接受合法文本；空值会以
         SQL NULL 保存，并与答案在同一个事务中写入。
         """
         normalized_user = _required_text(user_query, field_name="user_query")
         normalized_answer = _required_text(assistant_answer, field_name="assistant_answer")
         normalized_evidence = _optional_json_text(evidence_json, field_name="evidence_json")
         normalized_audit = _optional_json_text(audit_json, field_name="audit_json")
+        normalized_metadata = _optional_json_text(metadata_json, field_name="metadata_json")
         self.initialize()
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -289,14 +297,15 @@ class ConversationStore:
                     created_at=_utc_now(),
                     evidence_json=normalized_evidence,
                     audit_json=normalized_audit,
+                    metadata_json=normalized_metadata,
                 )
                 connection.execute(
                     """
                     INSERT INTO conversation_turns (
                         turn_id, conversation_id, turn_index, user_query, assistant_answer,
                         resolved_query, resolution_status, audit_path, evidence_json,
-                        audit_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        audit_json, metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         turn.turn_id,
@@ -309,6 +318,7 @@ class ConversationStore:
                         turn.audit_path,
                         turn.evidence_json,
                         turn.audit_json,
+                        turn.metadata_json,
                         turn.created_at,
                     ),
                 )
@@ -434,7 +444,7 @@ class ConversationStore:
                 """
                 SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
                        resolved_query, resolution_status, audit_path, evidence_json,
-                       audit_json, created_at
+                       audit_json, metadata_json, created_at
                 FROM conversation_turns
                 WHERE conversation_id = ?
                 ORDER BY turn_index DESC
@@ -462,7 +472,7 @@ class ConversationStore:
                 """
                 SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
                        resolved_query, resolution_status, audit_path, evidence_json,
-                       audit_json, created_at
+                       audit_json, metadata_json, created_at
                 FROM conversation_turns WHERE turn_id = ?
                 """,
                 (turn_id,),
@@ -480,7 +490,7 @@ class ConversationStore:
                 """
                 SELECT turn_id, conversation_id, turn_index, user_query, assistant_answer,
                        resolved_query, resolution_status, audit_path, evidence_json,
-                       audit_json, created_at
+                       audit_json, metadata_json, created_at
                 FROM conversation_turns
                 WHERE conversation_id = ?
                 ORDER BY turn_index ASC
@@ -545,6 +555,10 @@ def _turn_from_row(row: sqlite3.Row) -> ConversationTurn:
     except (IndexError, ValueError):
         # 旧行或外部脚本写入损坏值时只舍弃审计快照，不影响答案历史。
         audit_json = None
+    try:
+        metadata_json = _optional_json_text(row["metadata_json"], field_name="metadata_json")
+    except (IndexError, ValueError):
+        metadata_json = None
     return ConversationTurn(
         turn_id=str(row["turn_id"]),
         conversation_id=str(row["conversation_id"]),
@@ -557,6 +571,7 @@ def _turn_from_row(row: sqlite3.Row) -> ConversationTurn:
         created_at=str(row["created_at"]),
         evidence_json=evidence_json,
         audit_json=audit_json,
+        metadata_json=metadata_json,
     )
 
 

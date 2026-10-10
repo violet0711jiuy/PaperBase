@@ -150,6 +150,12 @@ class AskThisPaperTests(unittest.TestCase):
         bibliography = [chunk for chunk in result.chunks if chunk.section_type == "bibliography"]
         self.assertEqual([chunk.chunk_id for chunk in bibliography], ["reference-current"])
         self.assertEqual(bibliography[0].source_matches[0].route, "bm25_bibliography")
+        from paperbase.agentic.tools import _retrieved_chunk_to_evidence
+        from paperbase.retrieval.contracts import ScoreKind, ScoreDirection
+        bibliographic_evidence = _retrieved_chunk_to_evidence(bibliography[0])
+        self.assertIs(bibliographic_evidence.score_kind, ScoreKind.BM25)
+        self.assertIs(bibliographic_evidence.score_direction, ScoreDirection.HIGHER_IS_BETTER)
+        self.assertGreater(bibliographic_evidence.raw_score, 0)
         content = [chunk for chunk in result.chunks if chunk.section_type == "content"]
         content_routes = {
             item.route for chunk in content for item in chunk.source_matches
@@ -170,10 +176,11 @@ class AskThisPaperTests(unittest.TestCase):
 
         self.assertEqual(result.rewrite_plan.rewrite_status, "not_run")
         self.assertIn(
-            "agent_supplied_query_bypassed_rewriter",
+            "canonical_request_bypassed_rewriter",
             result.rewrite_plan.validation_diagnostics,
         )
-        self.assertIn("Graph WaveNet", result.rewrite_plan.lexical_keywords_en)
+        self.assertIn("graph", result.rewrite_plan.lexical_keywords_en)
+        self.assertIn("wavenet", result.rewrite_plan.lexical_keywords_en)
         self.assertTrue(result.chunks)
 
     def test_evidence_expansion_uses_section_id_and_never_crosses_sibling(self) -> None:

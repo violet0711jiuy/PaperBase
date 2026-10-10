@@ -1048,6 +1048,30 @@ class MetadataDatabase:
                 ).fetchall()
             )
 
+    def search_compiled_lexical(
+        self, fts_query: str, *, top_k: int,
+        paper_ids: Sequence[str] | None = None, bibliography: bool = False,
+    ) -> tuple[sqlite3.Row, ...]:
+        """Execute compiler-owned FTS exactly; SQL binding adds no semantics."""
+        if not fts_query or paper_ids == () or paper_ids == []:
+            return ()
+        if top_k < 1:
+            raise MetadataDatabaseError("top_k must be positive")
+        table = "bibliography_fts" if bibliography else "chunks_fts"
+        section_type = "bibliography" if bibliography else "content"
+        scope_sql, parameters = _paper_scope_sql(tuple(paper_ids) if paper_ids is not None else None)
+        self.initialize()
+        with self._connect() as connection:
+            return tuple(connection.execute(
+                f"""SELECT chunks.*, documents.paper_title AS paper_title,
+                    bm25({table}, 1.2, 0.8, 1.0) AS bm25_score
+                    FROM {table} JOIN chunks ON chunks.chunk_id = {table}.chunk_id
+                    JOIN documents ON documents.paper_id = chunks.paper_id
+                    WHERE {table} MATCH ? AND chunks.section_type = ? {scope_sql}
+                    ORDER BY bm25_score ASC, chunks.chunk_id ASC LIMIT ?""",
+                (fts_query, section_type, *parameters, top_k),
+            ).fetchall())
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """建立启用外键和事务语义的短生命周期 SQLite 连接。"""

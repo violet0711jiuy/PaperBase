@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
+import yaml
 
 from paperbase.config import default_config_path, load_settings
 from paperbase.parsing import PaperParser
@@ -44,11 +46,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.retrieval.bm25_keywords_top_k, 20)
         self.assertTrue(settings.retrieval.query_rewrite.enabled)
         self.assertEqual(settings.answer_generation.max_output_tokens, 4000)
+        self.assertEqual(settings.agentic_research.max_output_tokens, 8000)
+        self.assertFalse(hasattr(settings.agentic_research, "max_evidence_per_analysis"))
+        self.assertFalse(hasattr(settings.agentic_research, "final_evidence_max_per_paper"))
+        self.assertFalse(hasattr(settings.agentic_research, "max_no_new_evidence_rounds"))
         self.assertEqual(
-            settings.agentic_research.query_understanding_max_output_tokens, 1000
+            settings.agentic_research.evidence_analysis_max_output_tokens, 1400
         )
-        self.assertEqual(settings.agentic_research.planner_max_output_tokens, 1400)
-        self.assertEqual(settings.agentic_research.decision_max_output_tokens, 2400)
+        self.assertEqual(
+            settings.agentic_research.evidence_analysis_timeout_seconds, 60.0
+        )
+        self.assertEqual(settings.agentic_research.node_max_attempts, 2)
         self.assertEqual(
             settings.agentic_research.evidence_analysis_cache_path,
             project_root / "storage" / "evidence_analysis_cache.sqlite3",
@@ -67,6 +75,21 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(settings.parsing.docling.remove_peer_review_artifacts)
         self.assertIsInstance(parser, PaperParser)
         self.assertEqual(parser.parser_id, "docling")
+
+    def test_obsolete_agentic_limits_in_existing_yaml_are_ignored(self) -> None:
+        raw = yaml.safe_load(default_config_path().read_text(encoding="utf-8"))
+        raw.setdefault("agentic_research", {}).update(
+            max_evidence_per_analysis=8,
+            final_evidence_max_per_paper=1,
+            max_no_new_evidence_rounds=10,
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text(yaml.safe_dump(raw, allow_unicode=True), encoding="utf-8")
+            settings = load_settings(path)
+        self.assertFalse(hasattr(settings.agentic_research, "max_evidence_per_analysis"))
+        self.assertFalse(hasattr(settings.agentic_research, "final_evidence_max_per_paper"))
+        self.assertFalse(hasattr(settings.agentic_research, "max_no_new_evidence_rounds"))
 
 
 if __name__ == "__main__":

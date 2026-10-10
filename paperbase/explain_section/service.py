@@ -17,7 +17,7 @@ from paperbase.llm.client import (
     ChatCompletionClient,
     LLMRequestError,
     LLMRuntimeSettings,
-    OpenAICompatibleChatClient,
+    create_chat_completion_client,
     load_llm_runtime_settings,
 )
 from paperbase.prompts.explain_section import (
@@ -139,7 +139,7 @@ def run_explain_section_stage(
     repository = WorkspaceSectionRepository(settings.storage.staging_dir)
     snapshot = repository.load(workspace_id)
     runtime_settings = load_llm_runtime_settings(settings.config_path.parent / ".env")
-    client = OpenAICompatibleChatClient(
+    client = create_chat_completion_client(
         _with_explain_output_budget(runtime_settings, settings.explain_section.max_output_tokens)
     )
     return create_explain_section(
@@ -173,6 +173,7 @@ def create_explain_section(
                 context_chunk_count=len(context.chunks),
                 context_token_count=context.final_token_count,
                 minimum_explanation_chars=_minimum_explanation_chars(context),
+                max_key_points=settings.max_key_points,
             ),
             json_schema=_ExplainSectionDraft.model_json_schema(),
             schema_name="paperbase_explain_section",
@@ -442,16 +443,20 @@ def _validate_and_finalize_explanation(
     unknown_ids = set(source_ids).difference(context_ids)
     if unknown_ids:
         raise ValueError(f"Explain references chunks outside the provided context: {unknown_ids}")
-    explanation = "\n".join(line.strip() for line in draft.explanation.splitlines() if line.strip())
+    # Preserve paragraph separators required by the Prompt and presentation UI.
+    explanation = "\n".join(line.strip() for line in draft.explanation.splitlines()).strip()
     key_points = _unique_strings(draft.key_points)
     if len(key_points) > settings.max_key_points:
         raise ValueError("Explain returned more key_points than the configured limit.")
     has_evidence = bool(context.chunks)
-    if not has_evidence:
-        if not draft.insufficient_evidence or source_ids or key_points:
-            raise ValueError("An empty section context must return an uncited insufficient-evidence result.")
-    elif draft.insufficient_evidence:
-        raise ValueError("A section with supplied body evidence must not be marked insufficient.")
+    if draft.insufficient_evidence:
+        # Chunk presence does not establish that its content can explain the
+        # section. The model owns this semantic judgment; no facts are admitted
+        # through an insufficient result.
+        if source_ids or key_points:
+            raise ValueError("An insufficient explanation must have empty sources and key_points.")
+    elif not has_evidence:
+        raise ValueError("An empty section context must return insufficient evidence.")
     elif not source_ids:
         raise ValueError("An evidence-grounded explanation must cite at least one context chunk.")
     return ExplainSection(

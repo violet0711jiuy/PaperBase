@@ -13,7 +13,7 @@ from paperbase.config import QueryRewriteSettings
 from paperbase.llm.client import (
     ChatCompletionClient,
     LLMRequestError,
-    OpenAICompatibleChatClient,
+    create_chat_completion_client,
     load_llm_runtime_settings,
 )
 from paperbase.prompts.query_rewrite import (
@@ -299,7 +299,7 @@ def create_query_planner(
     if not settings.enabled:
         return NoopQueryPlanner(settings=settings)
     if client is None:
-        client = OpenAICompatibleChatClient(load_llm_runtime_settings(env_path))
+        client = create_chat_completion_client(load_llm_runtime_settings(env_path))
     return LLMQueryPlanner(settings=settings, client=client)
 
 

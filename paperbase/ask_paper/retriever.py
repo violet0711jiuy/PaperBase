@@ -12,13 +12,14 @@ import numpy as np
 from paperbase.config import RerankingSettings, RetrievalSettings
 from paperbase.embedding.base import QueryEmbedder
 from paperbase.reranking import Reranker
-from paperbase.retrieval.contracts import QueryOrigin
+from paperbase.retrieval.contracts import QueryOrigin, ScoreKind, ScoreDirection
 from paperbase.retrieval.hybrid_retriever import (
     RetrievedChunk,
     RetrievalResult,
     RetrievalSourceMatch,
 )
-from paperbase.retrieval.query_inputs import build_agent_supplied_plan
+from paperbase.retrieval.requests import compile_paper_request, retriever_parameters
+from paperbase.retrieval.query_inputs import plan_from_canonical
 from paperbase.retrieval.query_rewriter import QueryPlanner, TrustedPaperScope
 from paperbase.staging.bm25 import WorkspaceBM25Index, WorkspaceBM25IndexCache
 from paperbase.staging.sections import WorkspaceChunk, WorkspaceSectionSnapshot
@@ -186,16 +187,18 @@ class WorkspaceHybridRetriever:
         result_limit: int | None = None,
         query_origin: QueryOrigin = QueryOrigin.INITIAL_UNDERSTANDING,
         lexical_terms: Sequence[str] = (),
+        canonical_request=None,
     ) -> RetrievalResult:
         """运行四路正文召回；参考文献只在明确意图时本论文内直接返回。"""
         if result_limit is not None and result_limit < 1:
             raise ValueError("result_limit must be positive when provided.")
-        if QueryOrigin(query_origin) is QueryOrigin.AGENT_SUPPLIED:
-            plan = build_agent_supplied_plan(
-                query,
-                lexical_terms=lexical_terms,
-                max_lexical_terms=self._settings.query_rewrite.max_lexical_keywords_en,
-            )
+        if canonical_request is None and QueryOrigin(query_origin) is QueryOrigin.AGENT_SUPPLIED:
+            canonical_request = compile_paper_request(paper_id=self._snapshot.paper_id, query=query,
+                lexical_terms=lexical_terms, top_k=result_limit or self._default_output_limit(include_bibliography=False),
+                source="workspace", workspace_id=self._snapshot.workspace_id, retrieval_parameters=retriever_parameters(self))
+        if canonical_request is not None:
+            plan = plan_from_canonical(canonical_request)
+            result_limit = canonical_request.top_k
         else:
             plan = self._query_planner.plan(
                 query,
@@ -228,6 +231,7 @@ class WorkspaceHybridRetriever:
                 top_k=self._settings.bm25_keywords_top_k,
                 weight=self._settings.bm25_keywords_weight,
                 keywords=plan.lexical_keywords_en,
+                compiled_tokens=canonical_request.lexical_terms if canonical_request else None,
             )
         ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.chunk.chunk_id))
         reranked, reranking_status = self._rerank(
@@ -280,6 +284,8 @@ class WorkspaceHybridRetriever:
                     rank=result_index + 1,
                     raw_score=float(scores[query_index][result_index]),
                     weight=weight,
+                    score_kind=ScoreKind.DENSE,
+                    score_direction=ScoreDirection.HIGHER_IS_BETTER,
                 )
 
     def _add_bm25_matches(
@@ -290,9 +296,11 @@ class WorkspaceHybridRetriever:
         top_k: int,
         weight: float,
         keywords: tuple[str, ...] = (),
+        compiled_tokens: tuple[str, ...] | None = None,
     ) -> None:
         # 英文关键词组是正式链路中的一条 OR 路径；内存 BM25 逐词评分，仍只贡献一次 RRF 权重。
-        matches = self._content_bm25.search(" ".join(keywords) if keywords else query, top_k=top_k)
+        matches = self._content_bm25.search(" ".join(keywords) if keywords else query, top_k=top_k,
+                                                   **({"compiled_tokens": compiled_tokens} if compiled_tokens is not None else {}))
         for match in matches:
             self._add_candidate(
                 candidates,
@@ -303,6 +311,8 @@ class WorkspaceHybridRetriever:
                 rank=match.rank,
                 raw_score=match.bm25_score,
                 weight=weight,
+                score_kind=ScoreKind.BM25,
+                score_direction=ScoreDirection.HIGHER_IS_BETTER,
             )
 
     def _add_candidate(
@@ -315,12 +325,15 @@ class WorkspaceHybridRetriever:
         rank: int,
         raw_score: float,
         weight: float,
+        score_kind: ScoreKind,
+        score_direction: ScoreDirection,
     ) -> None:
         candidate = candidates.setdefault(chunk.chunk_id, _Candidate(chunk=chunk, vector_id=vector_id))
         candidate.score += weight / (self._settings.rrf_k + rank)
         candidate.sources.append(
             RetrievalSourceMatch(
-                route=route, query=query, rank=rank, raw_score=raw_score, effective_weight=weight
+                route=route, query=query, rank=rank, raw_score=raw_score, effective_weight=weight,
+                score_kind=score_kind, score_direction=score_direction,
             )
         )
 
@@ -360,6 +373,8 @@ class WorkspaceHybridRetriever:
                 sources=[RetrievalSourceMatch(
                     route="bm25_bibliography", query=query, rank=match.rank,
                     raw_score=match.bm25_score, effective_weight=0.0,
+                    score_kind=ScoreKind.BM25,
+                    score_direction=ScoreDirection.HIGHER_IS_BETTER,
                 )],
             )
             for match in matches
@@ -386,6 +401,11 @@ class WorkspaceHybridRetriever:
             raw_text=chunk.raw_text,
             pre_rerank_rank=pre_rank if is_content else None,
             rerank_score=candidate.rerank_score if is_content else None,
+            rerank_score_normalized=(
+                self._reranking_settings.normalize_scores
+                if is_content and candidate.rerank_score is not None and self._reranking_settings is not None
+                else None
+            ),
             fused_score=candidate.score,
             source_matches=tuple(candidate.sources),
             section_id=chunk.section_id,

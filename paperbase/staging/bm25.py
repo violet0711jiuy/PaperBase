@@ -98,11 +98,11 @@ class WorkspaceBM25Index:
             average_document_length=sum(document_lengths) / len(document_lengths),
         )
 
-    def search(self, query: str, *, top_k: int) -> tuple[WorkspaceBM25Match, ...]:
+    def search(self, query: str, *, top_k: int, compiled_tokens: tuple[str, ...] | None = None) -> tuple[WorkspaceBM25Match, ...]:
         """以当前论文为唯一语料进行 BM25 词法检索。"""
         if top_k < 1:
             raise WorkspaceBM25Error("BM25 top_k must be positive.")
-        query_terms = _tokenize(" ".join(query.split()))
+        query_terms = compiled_tokens if compiled_tokens is not None else _tokenize(" ".join(query.split()))
         if not query_terms:
             raise WorkspaceBM25Error("BM25 query must not be empty.")
 

@@ -21,7 +21,7 @@ class AgenticResearchBusyError(RuntimeError):
 
 
 class AgenticResearchService:
-    """生产入口只执行 LangGraph workflow；纯领域 Runtime 保留在独立测试中。"""
+    """Agentic 研究统一经 LangGraph workflow 执行。"""
 
     def __init__(
         self,

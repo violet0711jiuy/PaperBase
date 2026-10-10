@@ -615,7 +615,7 @@ class PaperBaseService:
         return self._conversations.get_turns(conversation_id)
 
     def ask_knowledge_base(self, query: str, conversation_id: str) -> AnswerServiceResult:
-        """把问题和会话 ID交给现有正式 KB QA 链路，并保存本轮 Evidence 快照。"""
+        """把问题和会话 ID 交给正式 KB QA 链路，由后端保存完整回合。"""
         normalized_query = " ".join(query.split())
         if not normalized_query:
             raise ValueError("问题不能为空。")
@@ -625,14 +625,10 @@ class PaperBaseService:
             expected_scope_type="knowledge_base",
             expected_scope_id=FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
         )
-        result = self._get_answer_service().answer_query(
+        return self._get_answer_service().answer_query(
             normalized_query,
             conversation_id=conversation_id,
         )
-        # ConversationStore 已由后端自动追加 turn；这里仅把同一结果中的真实 Evidence
-        # 写入 Service 管理的快照文件，供历史恢复使用，不重新检索也不复制 RAG 逻辑。
-        self._persist_answer_artifact(result)
-        return result
 
     def ask_knowledge_base_agentic(
         self,
@@ -797,8 +793,13 @@ class PaperBaseService:
     def get_conversation_turn_metadata(
         self, turn: ConversationTurn
     ) -> KnowledgeBaseTurnMetadata | None:
-        """恢复答案状态字段，支持 UI 清晰提示证据不足和部分覆盖。"""
-        payload = self._read_answer_artifact(turn)
+        """从会话库恢复答案状态；旧回合仍可从 sidecar 读取。"""
+        try:
+            payload = json.loads(turn.metadata_json) if turn.metadata_json else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if not isinstance(payload, dict):
+            payload = self._read_answer_artifact(turn)
         if payload is None:
             return None
         return KnowledgeBaseTurnMetadata(
@@ -1011,7 +1012,7 @@ class PaperBaseService:
             result,
             paper_titles=self._formal_paper_titles(),
         )
-        turn = self._conversations.append_turn(
+        self._conversations.append_turn(
             conversation_id,
             user_query=query,
             assistant_answer=answer.answer,
@@ -1021,32 +1022,25 @@ class PaperBaseService:
             resolution_status=answer.status,
             evidence_json=evidence_json,
             audit_json=audit_snapshot.to_json(),
+            metadata_json=json.dumps(
+                {
+                    "answer_status": answer.status,
+                    "insufficient_evidence": answer.insufficient_evidence,
+                    "partial_answer": answer.partial_answer,
+                    "coverage_note": answer.coverage_note,
+                    "overall_answer_status": getattr(answer, "overall_status", None),
+                    "answer_requirement_coverage": [
+                        {"requirement_id": item.requirement_id, "status": item.status,
+                         "evidence_ids": list(item.evidence_ids)}
+                        for item in getattr(answer, "requirement_coverage", ())
+                    ],
+                    "mode": "agentic",
+                    "thread_id": result.thread_id,
+                },
+                ensure_ascii=False,
+            ),
             finalize_agentic_thread_id=result.thread_id,
         )
-        payload = {
-            "conversation_id": conversation_id,
-            "turn_index": turn.turn_index,
-            "mode": "agentic",
-            "thread_id": result.thread_id,
-            "answer_status": answer.status,
-            "answer": answer.answer,
-            "citations": list(answer.citations),
-            "insufficient_evidence": answer.insufficient_evidence,
-            "partial_answer": answer.partial_answer,
-            "coverage_note": answer.coverage_note,
-            "error_codes": list(result.error_codes),
-            "evidence": [_agentic_evidence_payload(item) for item in displayed],
-            "audit_snapshot": audit_snapshot.to_dict(),
-        }
-        try:
-            path = self._answer_artifact_path(conversation_id, turn.turn_index)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except (OSError, TypeError, ValueError):
-            return
 
     def _formal_paper_titles(self) -> dict[str, str]:
         """读取论文 ID 到标题的稳定映射，审计落盘后不再依赖元数据变化。"""
@@ -1096,36 +1090,6 @@ class PaperBaseService:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return None
         return payload if isinstance(payload, dict) else None
-
-    def _persist_answer_artifact(self, result: AnswerServiceResult) -> None:
-        """保存本轮答案和真实 Evidence，写入失败不影响已经完成的回答。"""
-        conversation_id = result.conversation_id
-        if not conversation_id:
-            return
-        try:
-            turns = self.get_conversation_turns(conversation_id)
-            if not turns:
-                return
-            turn = turns[-1]
-            payload = {
-                "conversation_id": conversation_id,
-                "turn_index": turn.turn_index,
-                "answer_status": result.answer.status,
-                "answer": result.answer.answer,
-                "citations": list(result.answer.citations),
-                "insufficient_evidence": result.answer.insufficient_evidence,
-                "partial_answer": result.answer.partial_answer,
-                "coverage_note": result.answer.coverage_note,
-                "evidence": [
-                    _evidence_payload(item) for item in result.expansion.evidence
-                ],
-            }
-            path = self._answer_artifact_path(conversation_id, turn.turn_index)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except (OSError, TypeError, ValueError):
-            # Evidence 是增强展示能力；即使文件系统暂时不可写，主回答仍应可见。
-            return
 
     def _answer_artifact_path(self, conversation_id: str, turn_index: int) -> Path:
         """返回由后端生成 ID 组成的快照路径，不接受用户提供的任意路径。"""

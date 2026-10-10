@@ -108,6 +108,8 @@ class RetrievalServiceTests(unittest.TestCase):
             ["A encoder mechanism", "B temporal decoder"],
         )
         self.assertEqual([call[2] for call in adapter.calls], [3, 3])
+        self.assertIs(executions[0].search, request.searches[0])
+        self.assertIs(executions[1].search, request.searches[1])
         self.assertEqual(
             [execution.result["query"] for execution in executions],  # type: ignore[index]
             ["A encoder mechanism", "B temporal decoder"],

@@ -2229,11 +2229,6 @@ def _looks_like_title_author_line(text: str) -> bool:
     return len(names) >= 2 and "," in text
 
 
-def _is_fallback_title_candidate(text: str) -> bool:
-    """兼容旧内部调用：现在只过滤明确出版栏，不再使用长度阈值决定标题。"""
-    return _title_candidate_rejection_reason(text) is None
-
-
 def _normalize_spaced_capital_heading(text: str) -> str:
     """合并标题中逐字拉开的英文，并把词与词之间的版式空白收为一个空格。"""
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,20 +17,24 @@ from paperbase.agentic.contracts import (
     EvidenceOwnership,
     EvidenceRelation,
     EvidenceTarget,
+    MechanismProjection,
+    RequirementSupportAnchor,
     FinishAction,
     ResearchRunStatus,
     SearchPapersAction,
+    SearchReferencesAction,
     StopReason,
 )
 from paperbase.agentic.decision import DecisionResult, ScriptedDecisionAgent
 from paperbase.agentic.candidate_selection import CandidateSelectionResult
+from paperbase.agentic.checkpoint_serde import checkpoint_thread_id
 from paperbase.agentic.evidence_analysis import EvidenceAnalysisResult
+from paperbase.agentic.evidence_projection import LLMEvidenceProjector
 from paperbase.agentic.graph import LangGraphResearchWorkflow
 from paperbase.agentic.evaluation import evaluate_research_result
 from paperbase.agentic.persistence import SQLiteCheckpointStore
 from paperbase.agentic.planner import ResearchPlanner
 from paperbase.agentic.query_understanding import QueryUnderstandingService
-from paperbase.agentic.runtime import ResearchRuntime
 from paperbase.agentic.scope_resolver import ScopeResolver
 from paperbase.agentic.service import AgenticResearchBusyError, AgenticResearchService
 from paperbase.config import AgenticResearchSettings
@@ -40,6 +45,7 @@ from paperbase.retrieval.contracts import (
     PaperSearchOutcome,
     PaperSearchSpec,
     PaperSearchStatus,
+    ReferenceSearchPayload,
     RetrievedEvidence,
     SearchPapersPayload,
     ToolName,
@@ -83,10 +89,8 @@ class _Executor:
             )
             outcomes.append(
                 PaperSearchOutcome(
-                    paper_id=search.paper_id,
+                    search=PaperSearchSpec(paper_id=search.paper_id, query=search.query, lexical_terms=search.lexical_terms),
                     status=PaperSearchStatus.EMPTY if empty else PaperSearchStatus.OK,
-                    query=search.query,
-                    lexical_terms=search.lexical_terms,
                     evidence_candidates=evidence,
                 )
             )
@@ -128,20 +132,28 @@ class _QualifyingDecisionAgent:
 class _SupportingEvidenceAnalyzer:
     """测试替身：把每条新证据标为本文直接支持证据。"""
 
-    def analyze(self, *, question, evidence):
+    def analyze(self, *, request):
+        evidence, plan = request.evidence, request.plan
         analyses = tuple(
             EvidenceAnalysis(
                 evidence_id=record.evidence_id,
                 status=EvidenceAnalysisStatus.QUALIFIED,
-                digest=f"{record.evidence.paper_id} 的方法证据",
-                claims=(
-                    EvidenceClaim(
-                        claim_id=f"{record.evidence_id}:C1",
-                        statement=f"{record.evidence.paper_id} 描述了自己的方法",
-                        relation=EvidenceRelation.SUPPORTS,
-                        ownership=EvidenceOwnership.THIS_PAPER,
-                        rationale="该片段直接描述本文方法。",
-                        source_excerpt=record.evidence.content,
+                evaluated_requirement_ids=request.scope_for(record.evidence_id),
+                projection=MechanismProjection(
+                    evidence_id=record.evidence_id,
+                    mechanism=record.evidence.paper_id,
+                    supported_requirement_ids=tuple(
+                        rid for rid in request.scope_for(record.evidence_id)
+                    ),
+                    proposed_requirement_ids=tuple(
+                        rid for rid in request.scope_for(record.evidence_id)
+                    ),
+                    support_anchors=tuple(
+                        RequirementSupportAnchor(
+                            rid, record.evidence.content,
+                            record.evidence.content,
+                        )
+                        for rid in request.scope_for(record.evidence_id)
                     ),
                 ),
             )
@@ -173,16 +185,17 @@ class _StaticCandidateSelector:
 
 
 def _action(paper_id: str, query: str, subtask_id: str) -> SearchPapersAction:
+    # Historical tests named per-paper Subtasks. The current fallback Planner
+    # has one answer Requirement shared by the selected papers.
     return SearchPapersAction(
         searches=(
             PaperSearchSpec(
                 paper_id=paper_id,
                 query=query,
                 evidence_targets=frozenset({EvidenceTarget.METHOD.value}),
-                target_subtask_id=subtask_id,
+                requirement_ids=("R1",),
             ),
         ),
-        target_subtask_id=subtask_id,
     )
 
 
@@ -222,14 +235,25 @@ class _AnswerGenerator:
     def __init__(self) -> None:
         self.calls = []
 
-    def generate(self, *, query, evidence, conversation_context=None):
+    def generate(self, *, query, evidence, conversation_context=None,
+                 research_requirements=(), support_by_requirement=None):
+        from paperbase.generation.answer_coverage import AnswerRequirementCoverage
         self.calls.append((query, tuple(evidence)))
         citations = tuple(item.evidence_id for item in evidence)
+        coverage = tuple(
+            AnswerRequirementCoverage(
+                requirement_id,
+                "complete" if (support_by_requirement or {}).get(requirement_id) else "unsupported",
+                tuple((support_by_requirement or {}).get(requirement_id, ())),
+            )
+            for requirement_id, _ in research_requirements
+        )
         return AnswerGenerationOutcome(
             status="success",
-            answer="A 与 B 的方法不同 [E1][E2]。",
+            answer="Evidence: " + "".join(f"[{item}]" for item in citations),
             citations=citations,
             insufficient_evidence=False,
+            requirement_coverage=coverage,
         )
 
 
@@ -250,6 +274,70 @@ class _InvalidUnderstandingClient:
 
 
 class AgenticLangGraphTests(unittest.TestCase):
+    def test_reference_action_binding_reaches_projection_and_final_answer(self) -> None:
+        class ReferenceExecutor:
+            def execute(self, action, **kwargs):
+                return ToolResult(
+                    status=ToolStatus.OK,
+                    tool_name=ToolName.SEARCH_REFERENCES,
+                    payload=ReferenceSearchPayload(
+                        paper_id=action.paper_id,
+                        query=action.query,
+                        evidence_candidates=(RetrievedEvidence(
+                            source_type=EvidenceSourceType.BIBLIOGRAPHY,
+                            paper_id="A",
+                            seed_chunk_ids=("ref_1",),
+                            source_chunk_ids=("ref_1",),
+                            content="A cites Example Study by Smith (2020).",
+                        ),),
+                    ),
+                )
+
+        class ProjectionClient:
+            def __init__(self):
+                self.prompt = None
+
+            def complete_json(self, **kwargs):
+                self.prompt = json.loads(kwargs["user_prompt"])
+                return json.dumps({"projections": [{
+                    "projection_type": "fact",
+                    "evidence_id": "REF1",
+                    "status": "qualified",
+                    "fact_type": "reference",
+                    "value": "Example Study by Smith (2020)",
+                    "ownership": "prior_work",
+                    "supported_requirement_ids": ["R1"],
+                    "support_candidates": [{
+                        "requirement_id": "R1",
+                        "source_span_ids": ["S1"],
+                        "support_scope": "Example Study by Smith (2020)",
+                        "unresolved_aspects": [],
+                    }],
+                }]})
+
+        client = ProjectionClient()
+        result = _workflow(
+            ScriptedDecisionAgent((
+                SearchReferencesAction("A", "Example Study", requirement_ids=("R1",)),
+                FinishAction("reference verified"),
+            )),
+            ReferenceExecutor(),
+            evidence_analyzer=LLMEvidenceProjector(client, max_attempts=1),
+            answer_generator=_AnswerGenerator(),
+        ).run(
+            "A 引用了什么参考文献？",
+            selected_paper_ids=("A",),
+            thread_id="reference-action-binding",
+        )
+
+        self.assertEqual(client.prompt["projection_requirement_ids"], ["R1"])
+        self.assertEqual(client.prompt["projection_requirements"][0]["requirement_id"], "R1")
+        self.assertEqual(result.evidence[0].requested_requirement_ids, ("R1",))
+        self.assertEqual(result.requirement_states[0].status.value, "satisfied")
+        self.assertEqual(result.selected_evidence[0].evidence_id, "REF1")
+        self.assertEqual(result.answer.citations, ("REF1",))
+        self.assertFalse(result.answer.insufficient_evidence)
+
     def test_safe_llm_diagnostics_survive_checkpoint_and_final_result(self) -> None:
         resolver, _, planner = _components()
         workflow = LangGraphResearchWorkflow(
@@ -330,11 +418,17 @@ class AgenticLangGraphTests(unittest.TestCase):
             thread_id="answer-node",
         )
         self.assertIsNotNone(result.answer)
-        self.assertEqual(result.answer.citations, ("E1", "E2"))
+        self.assertEqual(result.status, ResearchRunStatus.COMPLETED)
+        self.assertTrue(result.selected_evidence)
+        self.assertEqual(
+            result.answer.citations,
+            tuple(item.evidence_id for item in result.selected_evidence),
+        )
         self.assertEqual(result.thread_id, "answer-node")
         self.assertEqual(result.budget_usage.llm_calls, 4)
         self.assertEqual(
-            [item.evidence_id for item in generator.calls[0][1]], ["E1", "E2"]
+            [item.evidence_id for item in generator.calls[0][1]],
+            [item.evidence_id for item in result.selected_evidence],
         )
         evaluation = evaluate_research_result(result)
         self.assertTrue(evaluation.passed)
@@ -410,6 +504,11 @@ class AgenticLangGraphTests(unittest.TestCase):
             )
             completed = resumed_workflow.resume("sqlite-resume")
             self.assertFalse(completed.interrupted)
+            self.assertIsNotNone(completed.result)
+            self.assertEqual(
+                [item.requirement_id for item in completed.result.requirement_states],
+                ["R1"],
+            )
             self.assertEqual(
                 [action.searches[0].paper_id for action in resumed_executor.calls],
                 ["B"],
@@ -495,7 +594,7 @@ class AgenticLangGraphTests(unittest.TestCase):
             thread_id="coverage-gate",
         )
         self.assertEqual(result.status, ResearchRunStatus.COMPLETED)
-        self.assertIn("CoverageIncomplete", result.traces[0].detail)
+        self.assertIn("RequirementResearchIncomplete", result.traces[0].detail)
         self.assertFalse(result.traces[0].accepted)
         self.assertIn(
             "guard_rejection",
@@ -513,51 +612,11 @@ class AgenticLangGraphTests(unittest.TestCase):
         self.assertTrue(
             all(
                 record.analysis_status is EvidenceAnalysisStatus.QUALIFIED
-                and record.claims
+                and record.assessment.projection is not None
                 for record in result.evidence
             )
         )
         self.assertEqual(set(result.coverage.positive_paper_ids), {"A", "B"})
-
-    def test_graph_and_legacy_loop_have_equivalent_domain_results(self) -> None:
-        actions = (
-            _action("A", "A method", "S1"),
-            _action("B", "B method after A", "S2"),
-            FinishAction("both papers covered"),
-        )
-        graph_executor = _Executor()
-        graph_result = _workflow(
-            ScriptedDecisionAgent(actions), graph_executor
-        ).run(
-            "A 和 B 的方法有什么区别？",
-            selected_paper_ids=("A", "B"),
-            thread_id="parity-graph",
-        )
-
-        resolver, understanding, planner = _components()
-        resolution = resolver.resolve("q", selected_paper_ids=("A", "B"))
-        understood = understanding.understand(
-            "A 和 B 的方法有什么区别？", resolution
-        )
-        planned = planner.plan(understood.context)
-        legacy_result = ResearchRuntime(
-            decision_agent=ScriptedDecisionAgent(actions),
-            evidence_analyzer=_SupportingEvidenceAnalyzer(),
-            tool_executor=_Executor(),
-            settings=AgenticResearchSettings(),
-        ).run(
-            context=understood.context,
-            plan=planned.plan,
-            initial_llm_calls=understood.llm_calls + planned.llm_calls,
-        )
-        self.assertEqual(graph_result.status, legacy_result.status)
-        self.assertEqual(graph_result.stop_reason, legacy_result.stop_reason)
-        self.assertEqual(graph_result.budget_usage, legacy_result.budget_usage)
-        self.assertEqual(
-            [(record.evidence_id, record.evidence.paper_id) for record in graph_result.evidence],
-            [(record.evidence_id, record.evidence.paper_id) for record in legacy_result.evidence],
-        )
-        self.assertEqual(graph_result.traces, legacy_result.traces)
 
     def test_checkpoint_resume_does_not_repeat_completed_tool_action(self) -> None:
         checkpointer = InMemorySaver()
@@ -597,6 +656,83 @@ class AgenticLangGraphTests(unittest.TestCase):
             [record.evidence_id for record in completed.result.evidence], ["E1", "E2"]
         )
 
+    def test_consumed_tool_payload_is_cleared_before_analysis_resume(self) -> None:
+        executor = _Executor()
+        workflow = _workflow(
+            ScriptedDecisionAgent((
+                _action("A", "A method", "S1"), FinishAction("done")
+            )),
+            executor,
+            checkpointer=InMemorySaver(),
+        )
+        interrupted = workflow.start(
+            "A method",
+            selected_paper_ids=("A",),
+            thread_id="consumed-tool-payload",
+            interrupt_after=("register_and_observe",),
+        )
+        self.assertEqual(interrupted.next_nodes, ("analyze_evidence",))
+        self.assertIsNone(interrupted.state["tool_result"])
+        self.assertIsNone(interrupted.state["evidence_filter_report"])
+        self.assertNotIn("action_fingerprint", interrupted.state)
+        self.assertNotIn("coverage", interrupted.state)
+        self.assertEqual(interrupted.state["pending_analysis_ids"], ["E1"])
+        completed = workflow.resume("consumed-tool-payload")
+        self.assertEqual(completed.result.status, ResearchRunStatus.COMPLETED)
+        self.assertTrue(completed.result.coverage.coverage_complete)
+        self.assertEqual(len(executor.calls), 1)
+
+    def test_legacy_checkpoint_plan_and_action_resume_as_requirements(self) -> None:
+        executor = _Executor()
+        workflow = _workflow(
+            ScriptedDecisionAgent((
+                _action("A", "A method", "S1"),
+                FinishAction("done"),
+            )),
+            executor,
+            checkpointer=InMemorySaver(),
+        )
+        interrupted = workflow.start(
+            "A method",
+            selected_paper_ids=("A",),
+            thread_id="legacy-checkpoint",
+            interrupt_after=("decide_action",),
+        )
+        self.assertEqual(interrupted.next_nodes, ("assess_action",))
+        legacy_plan = {
+            "goal": "A method",
+            "subtasks": [{
+                "subtask_id": "S1",
+                "goal": "查找 A 的方法",
+                "target_paper_ids": ["A"],
+                "evidence_targets": ["method"],
+                "success_criteria": "找到方法证据",
+                "status": "in_progress",
+            }],
+        }
+        legacy_action = {
+            "action_name": "search_papers",
+            "searches": [{
+                "paper_id": "A",
+                "query": "A method",
+                "target_subtask_id": "S1",
+            }],
+            "target_subtask_id": "S1",
+        }
+        workflow.graph.update_state(
+            {"configurable": {
+                "thread_id": checkpoint_thread_id("legacy-checkpoint"),
+            }},
+            {"plan": legacy_plan, "action": legacy_action},
+            as_node="decide_action",
+        )
+        completed = workflow.resume("legacy-checkpoint")
+        self.assertFalse(completed.interrupted)
+        self.assertEqual([call.searches[0].requirement_ids for call in executor.calls], [("S1",)])
+        self.assertEqual(completed.result.status, ResearchRunStatus.COMPLETED)
+        self.assertFalse(hasattr(completed.result.plan, "subtasks"))
+        self.assertEqual(completed.result.plan.requirements[0].requirement_id, "S1")
+
     def test_invalid_scope_is_rejected_before_tool_node(self) -> None:
         executor = _Executor()
         result = _workflow(
@@ -625,6 +761,34 @@ class AgenticLangGraphTests(unittest.TestCase):
         self.assertEqual(result.budget_usage.invalid_actions, 1)
         self.assertTrue(any("DuplicateAction" in trace.detail for trace in result.traces))
 
+    def test_per_paper_budget_rejection_replans_instead_of_ending_run(self) -> None:
+        executor = _Executor()
+        result = _workflow(
+            ScriptedDecisionAgent(
+                (
+                    _action("A", "A first method", "S1"),
+                    _action("A", "A forbidden second method", "S1"),
+                    _action("B", "B method after A budget", "S2"),
+                    FinishAction("both papers researched"),
+                )
+            ),
+            executor,
+            settings=AgenticResearchSettings(max_queries_per_paper=1),
+        ).run(
+            "A 和 B 的方法有什么区别？",
+            selected_paper_ids=("A", "B"),
+            thread_id="local-paper-budget-replan",
+        )
+        self.assertEqual(result.status, ResearchRunStatus.COMPLETED)
+        self.assertEqual(result.stop_reason, StopReason.AGENT_FINISHED)
+        self.assertEqual([call.searches[0].paper_id for call in executor.calls], ["A", "B"])
+        self.assertEqual(result.budget_usage.invalid_actions, 1)
+        self.assertEqual(result.action_rejections[-1].rejection_stage, "budget")
+        self.assertEqual(result.action_rejections[-1].rejection_code, "PerPaperBudget")
+        self.assertEqual(
+            result.action_rejections[-1].blockers[0]["paper_id"], "A"
+        )
+
     def test_iteration_budget_ends_graph_without_extra_tool_call(self) -> None:
         executor = _Executor(empty_queries={"miss 1", "miss 2", "must not run"})
         result = _workflow(
@@ -638,7 +802,6 @@ class AgenticLangGraphTests(unittest.TestCase):
             executor,
             settings=AgenticResearchSettings(
                 max_agent_iterations=2,
-                max_no_new_evidence_per_paper=5,
             ),
         ).run(
             "A 和 B 的方法有什么区别？",
@@ -648,6 +811,31 @@ class AgenticLangGraphTests(unittest.TestCase):
         self.assertEqual(result.stop_reason, StopReason.BUDGET_EXHAUSTED)
         self.assertEqual(result.budget_usage.agent_iterations, 2)
         self.assertEqual(len(executor.calls), 2)
+        self.assertEqual(result.selected_evidence, ())
+        self.assertTrue(result.answer.insufficient_evidence)
+
+    def test_budget_stop_keeps_verified_evidence_and_marks_answer_partial(self) -> None:
+        generator = _AnswerGenerator()
+        result = _workflow(
+            ScriptedDecisionAgent((_action("A", "A method", "S1"),)),
+            _Executor(),
+            settings=AgenticResearchSettings(max_agent_iterations=1),
+            answer_generator=generator,
+        ).run(
+            "A 的方法是什么？",
+            selected_paper_ids=("A",),
+            thread_id="budget-support-preserved",
+        )
+
+        self.assertEqual(result.status, ResearchRunStatus.PARTIAL)
+        self.assertEqual(result.stop_reason, StopReason.BUDGET_EXHAUSTED)
+        self.assertEqual(result.requirement_states[0].status.value, "satisfied")
+        self.assertEqual(len(result.selected_evidence), 1)
+        self.assertEqual(result.answer.citations, (result.selected_evidence[0].evidence_id,))
+        self.assertFalse(result.answer.partial_answer)
+        self.assertFalse(result.answer.insufficient_evidence)
+        self.assertEqual(result.answer.overall_status, "complete")
+        self.assertEqual(len(generator.calls), 1)
 
     def test_per_paper_no_new_evidence_does_not_block_other_paper(self) -> None:
         executor = _Executor(empty_queries={"A miss 1", "A miss 2", "A suppressed"})
@@ -661,22 +849,21 @@ class AgenticLangGraphTests(unittest.TestCase):
         result = _workflow(
             ScriptedDecisionAgent(actions),
             executor,
-            settings=AgenticResearchSettings(max_no_new_evidence_per_paper=2),
         ).run(
             "A 和 B 的方法有什么区别？",
             selected_paper_ids=("A", "B"),
             thread_id="per-paper-no-new",
         )
         self.assertEqual([record.evidence.paper_id for record in result.evidence], ["B"])
-        self.assertEqual(result.budget_usage.invalid_actions, 1)
-        self.assertEqual(len(executor.calls), 3)
+        self.assertEqual(result.budget_usage.invalid_actions, 0)
+        self.assertEqual(len(executor.calls), 4)
 
     def test_heterogeneous_batch_counts_no_new_evidence_per_paper(self) -> None:
         executor = _Executor(empty_queries={"A miss 1", "A miss 2", "A suppressed"})
         batch = SearchPapersAction(
             searches=(
-                PaperSearchSpec("A", "A miss 1", target_subtask_id="S1"),
-                PaperSearchSpec("B", "B hit 1", target_subtask_id="S2"),
+                PaperSearchSpec("A", "A miss 1", requirement_ids=("R1",)),
+                PaperSearchSpec("B", "B hit 1", requirement_ids=("R1",)),
             )
         )
         result = _workflow(
@@ -690,15 +877,14 @@ class AgenticLangGraphTests(unittest.TestCase):
                 )
             ),
             executor,
-            settings=AgenticResearchSettings(max_no_new_evidence_per_paper=2),
         ).run(
             "A 和 B 的方法有什么区别？",
             selected_paper_ids=("A", "B"),
             thread_id="heterogeneous-batch",
         )
-        self.assertEqual(result.budget_usage.invalid_actions, 1)
+        self.assertEqual(result.budget_usage.invalid_actions, 0)
         self.assertEqual([record.evidence.paper_id for record in result.evidence], ["B", "B"])
-        self.assertEqual(len(executor.calls), 3)
+        self.assertEqual(len(executor.calls), 4)
 
     def test_service_uses_graph_and_unresolved_scope_returns_clarification(self) -> None:
         executor = _Executor()

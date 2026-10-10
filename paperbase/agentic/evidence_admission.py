@@ -13,12 +13,15 @@ from paperbase.retrieval.contracts import (
     PaperSearchStatus,
     ReferenceSearchPayload,
     RetrievedEvidence,
+    ScoreKind,
+    ScoreDirection,
     SearchPapersPayload,
     SectionContextPayload,
     ToolResult,
     ToolStatus,
 )
 from paperbase.retrieval.evidence_fingerprint import build_evidence_fingerprint
+from paperbase.retrieval.evidence_scores import retrieval_rank_priority
 
 from .contracts import (
     EvidenceFilterDecision,
@@ -122,15 +125,17 @@ class EvidenceAdmissionFilter:
     ) -> tuple[tuple[RetrievedEvidence, ...], tuple[EvidenceFilterDecision, ...]]:
         rejected: dict[int, tuple[str, ...]] = {}
         by_fingerprint: dict[str, RetrievedEvidence] = {}
-        for candidate in sorted(candidates, key=_score, reverse=True):
+        for candidate in sorted(candidates, key=retrieval_rank_priority, reverse=True):
             fingerprint = build_evidence_fingerprint(candidate)
             if fingerprint in by_fingerprint:
                 rejected[id(candidate)] = ("duplicate_content",)
                 continue
             low_score = (
-                candidate.retrieval_metadata.get("reranking_status") == "success"
-                and candidate.score is not None
-                and candidate.score < self._min_rerank_score
+                candidate.score_kind is ScoreKind.RERANKER
+                and candidate.score_direction is ScoreDirection.HIGHER_IS_BETTER
+                and candidate.retrieval_metadata.get("rerank_score_normalized") is True
+                and candidate.raw_score is not None
+                and candidate.raw_score < self._min_rerank_score
             )
             if low_score:
                 rejected[id(candidate)] = ("below_rerank_threshold",)
@@ -159,7 +164,7 @@ class EvidenceAdmissionFilter:
         ):
             table_candidates = tuple(item for item in candidates if _table_like(item.content))
             if table_candidates:
-                rescued = max(table_candidates, key=_score)
+                rescued = max(table_candidates, key=retrieval_rank_priority)
                 fingerprint = build_evidence_fingerprint(rescued)
                 by_fingerprint[fingerprint] = rescued
                 rejected.pop(id(rescued), None)
@@ -211,12 +216,11 @@ def _decision(
         source_chunk_ids=evidence.source_chunk_ids,
         decision=decision,
         reasons=reasons,
-        score=evidence.score,
+        raw_score=evidence.raw_score,
+        score_kind=evidence.score_kind,
+        score_direction=evidence.score_direction,
+        retrieval_rank=evidence.retrieval_rank,
     )
-
-
-def _score(evidence: RetrievedEvidence) -> float:
-    return evidence.score if evidence.score is not None else float("-inf")
 
 
 def _source_overlap(left: RetrievedEvidence, right: RetrievedEvidence) -> float:

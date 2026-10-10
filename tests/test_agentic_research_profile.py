@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import fields
 
 from paperbase.agentic.contracts import (
     BudgetUsage,
+    CoverageState,
+    CoverageStrategy,
+    ComparisonProjection,
+    EvidenceAnalysis,
     EvidenceAnalysisStatus,
     EvidenceClaim,
     EvidenceOwnership,
@@ -18,11 +23,13 @@ from paperbase.agentic.contracts import (
     ResearchGoal,
     ResearchObservation,
     ResearchPlan,
-    ResearchSubtask,
+    ResearchRequirement,
+    RequirementSupportAnchor,
     ScopeSource,
 )
 from paperbase.agentic.decision import DecisionState, _state_prompt
-from paperbase.agentic.research_profile import build_research_profiles
+from paperbase.agentic.research_profile import PaperResearchProfile, build_research_profiles
+from paperbase.agentic.answering import CompletionView
 from paperbase.retrieval.contracts import (
     EvidenceSourceType,
     RetrievedEvidence,
@@ -32,14 +39,11 @@ from paperbase.retrieval.contracts import (
 
 def _plan() -> ResearchPlan:
     return ResearchPlan(
-        "比较方法",
-        (
-            ResearchSubtask(
-                "S1",
-                "比较 A 与 B 的方法",
-                ("A", "B"),
-                frozenset({EvidenceTarget.METHOD}),
-                "两篇均有方法证据",
+        goal="比较方法",
+        requirements=(
+            ResearchRequirement(
+                "R1", "比较 A 与 B 的方法",
+                evidence_targets=frozenset({EvidenceTarget.METHOD}),
             ),
         ),
     )
@@ -75,20 +79,10 @@ def _analyzed_a() -> EvidenceRecord:
         first_seen_iteration=1,
         last_seen_iteration=1,
         requested_evidence_targets=frozenset({EvidenceTarget.METHOD}),
-        requested_missing_information=("A 的核心机制",),
-        analysis_status=EvidenceAnalysisStatus.QUALIFIED,
-        digest="A 使用时间编码器。",
-        covered_targets=frozenset({EvidenceTarget.METHOD}),
-        addressed_information=("A 的核心机制",),
-        claims=(
-            EvidenceClaim(
-                "E1:C1",
-                "A 使用时间编码器。",
-                EvidenceRelation.SUPPORTS,
-                EvidenceOwnership.THIS_PAPER,
-                "原文直接陈述。",
-                excerpt,
-            ),
+        assessment=EvidenceAnalysis(
+            evidence_id="E1",
+            status=EvidenceAnalysisStatus.QUALIFIED,
+            projection=ComparisonProjection("E1", ("A 使用时间编码器。",)),
         ),
     )
 
@@ -106,7 +100,6 @@ class ResearchProfileTests(unittest.TestCase):
                     paper_id="A",
                     query="A temporal encoder",
                     evidence_targets=frozenset({EvidenceTarget.METHOD}),
-                    missing_information=("A 的核心机制",),
                     status="ok",
                 ),
             ),
@@ -120,28 +113,97 @@ class ResearchProfileTests(unittest.TestCase):
             default_targets=frozenset({EvidenceTarget.METHOD}),
         )
 
-        self.assertEqual(profiles[0].remaining_targets, frozenset())
-        self.assertEqual(profiles[0].remaining_information, ())
+        # Qualified content without integrity-valid Requirement support is not
+        # target completion. Both paper profiles still retain the Plan hint.
+        self.assertEqual(profiles[0].remaining_targets, frozenset({EvidenceTarget.METHOD}))
         self.assertEqual(
             profiles[0].qualified_claims, ("A 使用时间编码器。",)
         )
         self.assertEqual(
             profiles[1].remaining_targets, frozenset({EvidenceTarget.METHOD})
         )
+        self.assertEqual(profiles[0].supported_requirement_ids, ())
 
-    def test_decision_prompt_exposes_cross_paper_comparison_dimension(self) -> None:
+    def test_progress_views_do_not_store_derived_completion_fields(self) -> None:
+        profile_fields = {item.name for item in fields(PaperResearchProfile)}
+        self.assertFalse({
+            "remaining_targets", "requested_requirement_ids",
+            "covered_requirement_ids", "remaining_requirement_ids",
+            "remaining_optional_requirement_ids",
+        } & profile_fields)
+        completion_fields = {item.name for item in fields(CompletionView)}
+        self.assertEqual(
+            completion_fields, {"selected_verified_support_by_requirement"}
+        )
+        coverage_fields = {item.name for item in fields(CoverageState)}
+        self.assertNotIn("screened_paper_ids", coverage_fields)
+        self.assertNotIn("discovery_completed", coverage_fields)
+        coverage = CoverageState(
+            scope_paper_ids=("A", "B"), assessments=(),
+            strategy=CoverageStrategy.EXHAUSTIVE,
+            candidate_paper_ids=("A",), excluded_paper_ids=("B",),
+        )
+        self.assertEqual(coverage.screened_paper_ids, ("A", "B"))
+        self.assertFalse(coverage.coverage_complete)
+
+    def test_compact_decision_exposes_grounded_cross_paper_support_boundary(self) -> None:
+        from dataclasses import replace
+        record = _analyzed_a()
+        record = replace(record, assessment=replace(record.assessment, projection=None, projections=(ComparisonProjection(
+            "E1", ("A 使用时间编码器。",), supported_requirement_ids=("R1",),
+            proposed_requirement_ids=("R1",), support_anchors=(RequirementSupportAnchor(
+                "R1", record.evidence.content, "A 使用时间编码器。", ("B 的对应结构尚未说明",)),),
+        ),)))
         payload = json.loads(
             _state_prompt(
                 DecisionState(
-                    _context(), _plan(), (_analyzed_a(),), (), BudgetUsage()
+                    _context(), _plan(), (record,), (), BudgetUsage()
                 ),
                 [],
             )
         )
 
-        profiles = {item["paper_id"]: item for item in payload["research_profiles"]}
-        self.assertIn("A 使用时间编码器。", profiles["A"]["qualified_claims"])
-        self.assertEqual(profiles["B"]["remaining_targets"], ["method"])
+        support = payload["requirements"][0]["local_supports"][0]
+        self.assertEqual(support["covers"], ["A 使用时间编码器。"])
+        self.assertEqual(support["paper_id"], "A")
+        self.assertEqual(support["boundaries"], ["B 的对应结构尚未说明"])
+        # R1 already has verified local support in the State. The B-specific
+        # local boundary remains visible without a duplicate paper summary.
+        self.assertNotIn("paper_state", payload)
+
+    def test_decision_prompt_exposes_deterministic_search_delta_and_budget(self) -> None:
+        observation = ResearchObservation(
+            iteration=2,
+            action_name="search_papers",
+            tool_status=ToolStatus.OK,
+            added_evidence_ids=("E2",),
+            reused_evidence_ids=("E1",),
+            search_attempts=(
+                PaperSearchAttempt("A", "alternative method wording", requirement_ids=("R1",)),
+            ),
+            new_supporting_evidence_count=1,
+            newly_supported_requirement_ids=("R1",),
+            newly_exposed_section_ids=("methods",),
+        )
+        payload = json.loads(
+            _state_prompt(
+                DecisionState(
+                    _context(), _plan(), (), (observation,),
+                    BudgetUsage(queries_per_paper=(("A", 2),)),
+                    per_paper_query_limit=3,
+                ),
+                [],
+            )
+        )
+
+        from paperbase.agentic.decision_view import expand_decision_references
+        payload = expand_decision_references(payload)
+        event = payload["recent_research_events"][-1]
+        self.assertEqual(event["request"]["searches"][0]["paper_id"], "A")
+        self.assertEqual(event["new_verified_support"], 1)
+        self.assertEqual(event["new_sections"], ["methods"])
+        budget = {item["paper_id"]: item for item in payload["runtime_action_capabilities"]["tool_budget_state"]["per_paper"]}
+        self.assertEqual(budget["A"]["remaining"], 1)
 
 
 if __name__ == "__main__":

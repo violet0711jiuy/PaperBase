@@ -28,6 +28,8 @@ class EvidenceUnit:
     section_id: str | None = None
     evidence_digest: str | None = None
     claim_annotations: tuple["EvidenceClaimContext", ...] = ()
+    supported_requirement_ids: tuple[str, ...] = ()
+    projection_context: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -303,9 +305,9 @@ def _seed_as_row(seed: RetrievedChunk) -> dict[str, Any]:
 
 
 def _bibliography_to_evidence(chunk: RetrievedChunk, *, index: int) -> EvidenceUnit:
-    """参考文献不扩展相邻块，每条检索命中单独形成一个可标注的 R 证据。"""
+    """参考文献不扩展相邻块，每条检索命中单独形成一个 REF 证据。"""
     return EvidenceUnit(
-        evidence_id=f"R{index}",
+        evidence_id=f"REF{index}",
         kind="bibliography",
         paper_id=chunk.paper_id,
         paper_title=chunk.paper_title,

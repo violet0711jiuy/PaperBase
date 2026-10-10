@@ -15,7 +15,7 @@ from paperbase.agentic.contracts import (
     QueryScope,
     ResearchGoal,
     ResearchPlan,
-    ResearchSubtask,
+    ResearchRequirement,
     ScopeSource,
     SearchKnowledgeBaseAction,
     SearchPapersAction,
@@ -61,6 +61,20 @@ def _kb_context():
     )
 
 
+def _requirement_plan() -> ResearchPlan:
+    return ResearchPlan(
+        goal="method",
+        requirements=(
+            ResearchRequirement(
+                "R1",
+                "识别论文采用的方法",
+                required=True,
+                evidence_targets=frozenset({EvidenceTarget.METHOD}),
+            ),
+        ),
+    )
+
+
 class _QueuedClient:
     def __init__(self, values):
         self.values = list(values)
@@ -86,7 +100,8 @@ class _Database:
     def get_document(self, paper_id):
         return {"paper_id": paper_id}
 
-    def search_bibliography_keyword_group(self, terms, *, paper_id, top_k):
+    def search_compiled_lexical(self, terms, *, paper_ids, top_k, bibliography=False):
+        paper_id = paper_ids[0]
         return (
             {
                 "paper_id": paper_id,
@@ -147,7 +162,8 @@ class _GlobalRetriever:
 
 
 class _FailingDatabase(_Database):
-    def search_bibliography_keyword_group(self, terms, *, paper_id, top_k):
+    def search_compiled_lexical(self, terms, *, paper_ids, top_k, bibliography=False):
+        paper_id = paper_ids[0]
         raise RuntimeError("fts unavailable")
 
 
@@ -157,9 +173,9 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
             return {
                 "paper_id": "A",
                 "query": query,
-                "lexical_terms": [],
+                "lexical_terms": ["method"],
                 "evidence_targets": ["method"],
-                "missing_information": [],
+                "requirement_ids": ["R1"],
             }
 
         invalid = json.dumps(
@@ -167,7 +183,6 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
                 "decision": {
                     "action": "search_papers",
                     "searches": [search("method"), search("method details")],
-                    "target_subtask_id": "S1",
                 },
             }
         )
@@ -176,18 +191,10 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
                 "decision": {
                     "action": "search_papers",
                     "searches": [search("method")],
-                    "target_subtask_id": "S1",
                 },
             }
         )
-        plan = ResearchPlan(
-            "method",
-            (
-                ResearchSubtask(
-                    "S1", "find", ("A",), frozenset({EvidenceTarget.METHOD}), "evidence"
-                ),
-            ),
-        )
+        plan = _requirement_plan()
 
         decision = LLMDecisionAgent(_QueuedClient((invalid, valid))).decide(
             DecisionState(_single_context(), plan, (), (), BudgetUsage())
@@ -205,12 +212,11 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
                         {
                             "paper_id": "A",
                             "query": "method",
-                            "lexical_terms": [],
+                            "lexical_terms": ["method"],
                             "evidence_targets": ["method"],
-                            "missing_information": [],
+                            "requirement_ids": ["R1"],
                         }
                     ],
-                    "target_subtask_id": "S1",
                     "top_k": 100,
                 }
             }
@@ -223,20 +229,16 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
                         {
                             "paper_id": "A",
                             "query": "method",
-                            "lexical_terms": [],
+                            "lexical_terms": ["method"],
                             "evidence_targets": ["method"],
-                            "missing_information": [],
+                            "requirement_ids": ["R1"],
                         }
                     ],
-                    "target_subtask_id": "S1",
                 }
             }
         )
         context = _single_context()
-        plan = ResearchPlan(
-            "method",
-            (ResearchSubtask("S1", "find", ("A",), frozenset({EvidenceTarget.METHOD}), "evidence"),),
-        )
+        plan = _requirement_plan()
         decision = LLMDecisionAgent(_QueuedClient((invalid, valid))).decide(
             DecisionState(context, plan, (), (), BudgetUsage())
         )
@@ -250,7 +252,7 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
                     "action": "get_section_context",
                     "paper_id": "A",
                     "section_id": "invented",
-                    "target_subtask_id": "S1",
+                    "requirement_ids": ["R1"],
                 }
             }
         )
@@ -262,23 +264,15 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
                         {
                             "paper_id": "A",
                             "query": "method",
-                            "lexical_terms": [],
+                            "lexical_terms": ["method"],
                             "evidence_targets": ["method"],
-                            "missing_information": [],
+                            "requirement_ids": ["R1"],
                         }
                     ],
-                    "target_subtask_id": "S1",
                 }
             }
         )
-        plan = ResearchPlan(
-            "method",
-            (
-                ResearchSubtask(
-                    "S1", "find", ("A",), frozenset({EvidenceTarget.METHOD}), "evidence"
-                ),
-            ),
-        )
+        plan = _requirement_plan()
         decision = LLMDecisionAgent(
             _QueuedClient((unknown_section, valid_search))
         ).decide(DecisionState(_single_context(), plan, (), (), BudgetUsage()))
@@ -292,18 +286,11 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
                     "action": "get_section_context",
                     "paper_id": "A",
                     "section_id": "method",
-                    "target_subtask_id": "S1",
+                    "requirement_ids": ["R1"],
                 }
             }
         )
-        plan = ResearchPlan(
-            "method",
-            (
-                ResearchSubtask(
-                    "S1", "find", ("A",), frozenset({EvidenceTarget.METHOD}), "evidence"
-                ),
-            ),
-        )
+        plan = _requirement_plan()
         record = EvidenceRecord(
             "E1",
             RetrievedEvidence(
@@ -357,6 +344,16 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
         )
         self.assertEqual(section.tool_name, ToolName.GET_SECTION_CONTEXT)
         self.assertEqual(section.payload.evidence_candidates[0].source_chunk_ids, ("c1", "c2"))
+        from paperbase.retrieval.contracts import ScoreKind, ScoreDirection
+        reference = references.payload.evidence_candidates[0]
+        self.assertIs(reference.score_kind, ScoreKind.BM25_FTS5)
+        self.assertIs(reference.score_direction, ScoreDirection.LOWER_IS_BETTER)
+        self.assertEqual(reference.retrieval_rank, 1)
+        self.assertIsNone(reference.score)
+        non_ranked = section.payload.evidence_candidates[0]
+        self.assertIs(non_ranked.score_kind, ScoreKind.NON_RANKED)
+        self.assertIsNone(non_ranked.raw_score)
+        self.assertIsNone(non_ranked.retrieval_rank)
 
     def test_global_search_is_frozen_to_corpus_snapshot(self) -> None:
         retriever = _GlobalRetriever()

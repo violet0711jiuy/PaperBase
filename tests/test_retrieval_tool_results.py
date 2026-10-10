@@ -8,6 +8,7 @@ import unittest
 from paperbase.generation.section_expander import EvidenceUnit, ExpansionResult
 from paperbase.retrieval import (
     PaperBatchExecution,
+    PaperSearchSpec,
     PaperRetrievalSnapshot,
     QueryOrigin,
     RetrievedChunk,
@@ -93,21 +94,17 @@ def _snapshot(paper_id: str, *, with_chunk: bool, expanded: bool = False) -> Pap
 
 def _success(paper_id: str, *, with_chunk: bool, expanded: bool = False) -> PaperBatchExecution:
     return PaperBatchExecution(
-        paper_id=paper_id,
-        query=f"{paper_id} method",
-        lexical_terms=(paper_id,),
-        evidence_targets=frozenset({"method"}),
-        missing_information=("核心机制",),
-        target_subtask_id="S1",
+        search=PaperSearchSpec(
+            paper_id=paper_id, query=f"{paper_id} method", lexical_terms=(paper_id,),
+            evidence_targets=frozenset({"method"}), requirement_ids=("R1",),
+        ),
         result=_snapshot(paper_id, with_chunk=with_chunk, expanded=expanded),
     )
 
 
 def _failure(paper_id: str, error_code: str) -> PaperBatchExecution:
     return PaperBatchExecution(
-        paper_id=paper_id,
-        query="method",
-        lexical_terms=(),
+        search=PaperSearchSpec(paper_id=paper_id, query="method"),
         error_code=error_code,
         error_message="simulated",
     )
@@ -164,29 +161,29 @@ class RetrievalToolResultTests(unittest.TestCase):
         )
 
     def test_search_intent_survives_success_and_error_outcomes(self) -> None:
-        result = build_search_papers_tool_result(
-            (
-                _success("paper-a", with_chunk=True),
-                PaperBatchExecution(
-                    paper_id="paper-b",
-                    query="paper-b limitation",
-                    lexical_terms=("limitation",),
-                    evidence_targets=frozenset({"claim"}),
-                    missing_information=("适用边界",),
-                    target_subtask_id="S2",
+        executions = (
+            _success("paper-a", with_chunk=True),
+            PaperBatchExecution(
+                    search=PaperSearchSpec(
+                        paper_id="paper-b", query="paper-b limitation",
+                        lexical_terms=("limitation",),
+                        evidence_targets=frozenset({"claim"}), requirement_ids=("R2",),
+                    ),
                     error_code="RuntimeError",
-                ),
             ),
+        )
+        result = build_search_papers_tool_result(
+            executions,
             query_origin=QueryOrigin.AGENT_SUPPLIED,
         )
 
         success, failure = result.payload.paper_results
         self.assertEqual(success.evidence_targets, frozenset({"method"}))
-        self.assertEqual(success.missing_information, ("核心机制",))
-        self.assertEqual(success.target_subtask_id, "S1")
+        self.assertEqual(success.requirement_ids, ("R1",))
         self.assertEqual(failure.evidence_targets, frozenset({"claim"}))
-        self.assertEqual(failure.missing_information, ("适用边界",))
-        self.assertEqual(failure.target_subtask_id, "S2")
+        self.assertEqual(failure.requirement_ids, ("R2",))
+        self.assertIs(success.search, executions[0].search)
+        self.assertIs(failure.search, executions[1].search)
 
     def test_tool_name_must_match_payload_kind(self) -> None:
         @dataclass(frozen=True)

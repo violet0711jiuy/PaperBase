@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite
 from typing import Iterable, TypeAlias
 
 
@@ -55,6 +56,23 @@ class EvidenceSourceType(str, Enum):
     SECTION_CONTEXT = "section_context"
 
 
+class ScoreKind(str, Enum):
+    DENSE = "dense"
+    RERANKER = "reranker"
+    RRF = "rrf"
+    BM25 = "bm25"
+    BM25_FTS5 = "bm25_fts5"
+    NON_RANKED = "non_ranked"
+    OTHER = "other"
+    LEGACY_UNKNOWN = "legacy_unknown"
+
+
+class ScoreDirection(str, Enum):
+    HIGHER_IS_BETTER = "higher_is_better"
+    LOWER_IS_BETTER = "lower_is_better"
+    NOT_APPLICABLE = "not_applicable"
+
+
 @dataclass(frozen=True)
 class PaperSearchSpec:
     """一篇论文的一次定向检索；不同论文可以拥有不同 Query。"""
@@ -62,9 +80,9 @@ class PaperSearchSpec:
     paper_id: str
     query: str
     lexical_terms: tuple[str, ...] = ()
+    # Legacy/model-facing retrieval hint, not Registry intent or Search identity.
     evidence_targets: frozenset[str] = frozenset()
-    missing_information: tuple[str, ...] = ()
-    target_subtask_id: str | None = None
+    requirement_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "paper_id", _required_text(self.paper_id, "paper_id"))
@@ -81,15 +99,9 @@ class PaperSearchSpec:
         )
         object.__setattr__(
             self,
-            "missing_information",
-            _normalized_text_tuple(self.missing_information, "missing_information"),
+            "requirement_ids",
+            _normalized_text_tuple(self.requirement_ids, "requirement_ids"),
         )
-        if self.target_subtask_id is not None:
-            object.__setattr__(
-                self,
-                "target_subtask_id",
-                _required_text(self.target_subtask_id, "target_subtask_id"),
-            )
 
 
 @dataclass(frozen=True)
@@ -123,40 +135,15 @@ class SearchPapersRequest:
 class PaperBatchExecution:
     """Batch 内一篇论文的隔离执行结果，供 Tool 结果转换器消费。"""
 
-    paper_id: str
-    query: str
-    lexical_terms: tuple[str, ...]
-    evidence_targets: frozenset[str] = frozenset()
-    missing_information: tuple[str, ...] = ()
-    target_subtask_id: str | None = None
+    search: PaperSearchSpec
     result: object | None = None
     error_code: str | None = None
     error_message: str | None = None
+    execution_started: bool = True
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "paper_id", _required_text(self.paper_id, "paper_id"))
-        object.__setattr__(self, "query", _required_text(self.query, "query"))
-        object.__setattr__(
-            self,
-            "lexical_terms",
-            _normalized_text_tuple(self.lexical_terms, "lexical_terms"),
-        )
-        object.__setattr__(
-            self,
-            "evidence_targets",
-            frozenset(_normalized_text_tuple(self.evidence_targets, "evidence_targets")),
-        )
-        object.__setattr__(
-            self,
-            "missing_information",
-            _normalized_text_tuple(self.missing_information, "missing_information"),
-        )
-        if self.target_subtask_id is not None:
-            object.__setattr__(
-                self,
-                "target_subtask_id",
-                _required_text(self.target_subtask_id, "target_subtask_id"),
-            )
+        if not isinstance(self.search, PaperSearchSpec):
+            raise TypeError("search must be a PaperSearchSpec.")
 
     @property
     def succeeded(self) -> bool:
@@ -165,7 +152,15 @@ class PaperBatchExecution:
 
 @dataclass(frozen=True)
 class RetrievedEvidence:
-    """Tool 产生的无运行期编号证据；E#/R# 只由 Registry 分配。"""
+    """Unnumbered Tool evidence with source-local, uncalibrated retrieval scores.
+
+    raw_score is meaningful only within the producing scoring channel/request.
+    retrieval_rank is its 1-based returned position, never global relevance.
+    score is deprecated: retained solely for old constructor/checkpoint payloads.
+    Legacy score-only data keeps its numeric value with unknown semantics; a
+    persisted metadata.rank can migrate as rank without guessing score direction.
+    New producers populate the explicit fields and leave score unset.
+    """
 
     source_type: EvidenceSourceType
     paper_id: str
@@ -177,8 +172,12 @@ class RetrievedEvidence:
     section: str | None = None
     page_start: int | None = None
     page_end: int | None = None
-    score: float | None = None
+    score: float | None = field(default=None, metadata={"deprecated": True})
     retrieval_metadata: dict[str, object] = field(default_factory=dict)
+    raw_score: float | None = None
+    score_kind: ScoreKind = ScoreKind.LEGACY_UNKNOWN
+    score_direction: ScoreDirection = ScoreDirection.NOT_APPLICABLE
+    retrieval_rank: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_type", EvidenceSourceType(self.source_type))
@@ -199,49 +198,75 @@ class RetrievedEvidence:
             raise ValueError("content must be a non-empty string.")
         object.__setattr__(self, "content", self.content.strip())
         object.__setattr__(self, "retrieval_metadata", dict(self.retrieval_metadata))
+        kind = ScoreKind(self.score_kind)
+        direction = ScoreDirection(self.score_direction)
+        object.__setattr__(self, "score_kind", kind)
+        object.__setattr__(self, "score_direction", direction)
+        raw = self.raw_score if self.raw_score is not None else self.score
+        if raw is not None:
+            raw = float(raw)
+            if not isfinite(raw):
+                raise ValueError("raw_score must be finite when provided.")
+            object.__setattr__(self, "raw_score", raw)
+        if kind is ScoreKind.LEGACY_UNKNOWN:
+            if direction is not ScoreDirection.NOT_APPLICABLE:
+                raise ValueError("Legacy unknown scores have no ordering semantics.")
+            old_rank = self.retrieval_metadata.get("rank")
+            if self.retrieval_rank is None and type(old_rank) is int and old_rank > 0:
+                object.__setattr__(self, "retrieval_rank", old_rank)
+        expected = {
+            ScoreKind.DENSE: ScoreDirection.HIGHER_IS_BETTER,
+            ScoreKind.RERANKER: ScoreDirection.HIGHER_IS_BETTER,
+            ScoreKind.RRF: ScoreDirection.HIGHER_IS_BETTER,
+            ScoreKind.BM25: ScoreDirection.HIGHER_IS_BETTER,
+            ScoreKind.BM25_FTS5: ScoreDirection.LOWER_IS_BETTER,
+            ScoreKind.NON_RANKED: ScoreDirection.NOT_APPLICABLE,
+        }.get(kind)
+        if expected is not None and direction is not expected:
+            raise ValueError(f"{kind.value} requires score_direction={expected.value}.")
+        if kind is ScoreKind.NON_RANKED and (raw is not None or self.retrieval_rank is not None):
+            raise ValueError("Non-ranked evidence must not invent a score or retrieval rank.")
+        if self.retrieval_rank is not None and (
+            type(self.retrieval_rank) is not int or self.retrieval_rank < 1
+        ):
+            raise ValueError("retrieval_rank must be a positive 1-based integer.")
 
 
 @dataclass(frozen=True)
 class PaperSearchOutcome:
-    paper_id: str
+    search: PaperSearchSpec
     status: PaperSearchStatus
-    query: str
-    lexical_terms: tuple[str, ...]
-    evidence_targets: frozenset[str] = frozenset()
-    missing_information: tuple[str, ...] = ()
-    target_subtask_id: str | None = None
     evidence_candidates: tuple[RetrievedEvidence, ...] = ()
     error_code: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status", PaperSearchStatus(self.status))
-        object.__setattr__(self, "paper_id", _required_text(self.paper_id, "paper_id"))
-        object.__setattr__(self, "query", _required_text(self.query, "query"))
-        object.__setattr__(
-            self,
-            "lexical_terms",
-            _normalized_text_tuple(self.lexical_terms, "lexical_terms"),
-        )
-        object.__setattr__(
-            self,
-            "evidence_targets",
-            frozenset(_normalized_text_tuple(self.evidence_targets, "evidence_targets")),
-        )
-        object.__setattr__(
-            self,
-            "missing_information",
-            _normalized_text_tuple(self.missing_information, "missing_information"),
-        )
-        if self.target_subtask_id is not None:
-            object.__setattr__(
-                self,
-                "target_subtask_id",
-                _required_text(self.target_subtask_id, "target_subtask_id"),
-            )
+        if not isinstance(self.search, PaperSearchSpec):
+            raise TypeError("search must be a PaperSearchSpec.")
         if self.status is PaperSearchStatus.OK and not self.evidence_candidates:
             raise ValueError("An ok paper outcome requires evidence candidates.")
         if self.status is PaperSearchStatus.EMPTY and self.evidence_candidates:
             raise ValueError("An empty paper outcome cannot contain evidence candidates.")
+
+    @property
+    def paper_id(self) -> str:
+        return self.search.paper_id
+
+    @property
+    def query(self) -> str:
+        return self.search.query
+
+    @property
+    def lexical_terms(self) -> tuple[str, ...]:
+        return self.search.lexical_terms
+
+    @property
+    def evidence_targets(self) -> frozenset[str]:
+        return self.search.evidence_targets
+
+    @property
+    def requirement_ids(self) -> tuple[str, ...]:
+        return self.search.requirement_ids
 
 
 @dataclass(frozen=True)

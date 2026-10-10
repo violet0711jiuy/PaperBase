@@ -10,6 +10,8 @@ from threading import RLock
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
 
+from .checkpoint_serde import checkpoint_thread_id
+
 
 class SQLiteCheckpointStore:
     """持有 SqliteSaver 连接，并管理线程保留、压缩和删除。"""
@@ -59,6 +61,10 @@ class SQLiteCheckpointStore:
     def delete_thread(self, thread_id: str) -> None:
         """删除一个明确指定任务的全部 checkpoint 与生命周期记录。"""
         normalized = _normalize_thread_id(thread_id)
+        # Current runs use the versioned internal key.  Also remove the legacy
+        # public key when deletion is explicitly requested so invalidated data
+        # does not become undeletable storage.
+        self.saver.delete_thread(checkpoint_thread_id(normalized))
         self.saver.delete_thread(normalized)
         with self._lock, self._connection:
             self._connection.execute(

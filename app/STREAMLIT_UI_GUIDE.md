@@ -2,6 +2,12 @@
 
 这份说明只讲当前 `app/` 目录里最需要看懂的部分，方便以后自己调整 UI。
 
+核对日期：2026-10-06。当前架构与字段语义分别见[Agentic Research](../docs/architecture/agentic-research.md)和[字段事实源](../docs/field-source-of-truth.md)；不要用 UI 的“任务完成”提示推断 Answer 已完整回答。
+
+知识库的“问答模式”区分“快速问答”（Classic）与“Agentic Research”。后者通过 Service 调用 LangGraph，并支持“从检查点继续”或“放弃恢复入口”。pending task 只保存会话到 checkpoint 的链接，放弃入口不删除 checkpoint；当前 v4 才能恢复，历史 v2/v3 拒绝进入执行链。
+
+页面展示研究摘要、逐篇检索、诊断与 Evidence 来源，不替代 Guard/Registry/Answer 的权威。RequirementState.SATISFIED 是局部支持；最终 complete/partial/unsupported 来自 Answer 语义状态及 Coverage Compiler。当前 smoke 仍未通过稳定性门槛，详见[验证状态](../docs/evaluation/current-baseline.md)。
+
 ## 1. Streamlit 的基本运行方式
 
 Streamlit 和 React/Vue 不一样：每当你点击按钮、切换选择项、提交输入框时，当前 Python 脚本会从上到下重新执行一遍（rerun）。

@@ -189,9 +189,11 @@ def _render_agentic_audit(
 
     with st.expander("查看研究过程与归因", expanded=False):
         _render_audit_summary(audit)
+        _render_requirement_audit(audit)
         _render_candidate_audit(audit)
         _render_paper_research_audit(audit)
         _render_research_timeline(audit)
+        _render_rejected_actions(audit)
         _render_claim_audit(audit)
         _render_advanced_diagnostics(audit)
         if audit_json:
@@ -242,6 +244,20 @@ def _render_candidate_audit(audit: AgenticAuditSnapshot) -> None:
             st.markdown(f"- {item.title}：{item.reason}")
 
 
+def _render_requirement_audit(audit: AgenticAuditSnapshot) -> None:
+    """展示最终回答应满足的 Requirement 及其当前证据状态。"""
+    if not audit.requirements:
+        return
+    st.markdown("#### 回答需求完成度")
+    for item in audit.requirements:
+        required = "是" if item.required else "否"
+        evidence = ", ".join(item.evidence_ids) if item.evidence_ids else "—"
+        st.markdown(
+            f"**{item.requirement_id}**：{item.description}  "
+            f"  \n必需：{required} · 状态：{item.status} · 支持证据：{evidence}"
+        )
+
+
 def _render_paper_research_audit(audit: AgenticAuditSnapshot) -> None:
     """逐论文展示动态 Query、Coverage 与尚未解决的研究缺口。"""
     if not audit.papers:
@@ -259,8 +275,6 @@ def _render_paper_research_audit(audit: AgenticAuditSnapshot) -> None:
                     st.code(query, language=None)
             _render_tag_line("已覆盖目标", paper.covered_targets)
             _render_tag_line("未覆盖目标", paper.remaining_targets)
-            _render_tag_line("已回答信息", paper.addressed_information)
-            _render_tag_line("仍缺信息", paper.remaining_information)
             _render_tag_line("涉及章节", paper.sections_seen)
 
 
@@ -281,6 +295,11 @@ def _render_research_timeline(audit: AgenticAuditSnapshot) -> None:
             st.markdown(
                 f"- {attempt.title}：`{attempt.query}` → {attempt_status}{suffix}"
             )
+            _render_tag_line("Requirement", attempt.requirement_ids)
+            _render_tag_line("Lexical terms", attempt.lexical_terms)
+        if step.action_arguments:
+            st.caption("Tool 参数：")
+            st.json(step.action_arguments, expanded=False)
         if step.filter_total:
             st.caption(
                 "Evidence Filter："
@@ -301,6 +320,20 @@ def _render_research_timeline(audit: AgenticAuditSnapshot) -> None:
                 f"命中 {step.cache_hits}，未命中 {step.cache_misses}，"
                 f"写入 {step.cache_writes}，错误 {step.cache_errors}"
             )
+
+
+def _render_rejected_actions(audit: AgenticAuditSnapshot) -> None:
+    if not audit.rejected_actions:
+        return
+    st.markdown("#### 被运行时校验拒绝的动作")
+    for item in audit.rejected_actions:
+        st.markdown(f"**第 {item.iteration} 步 · {item.action_name}** — 已拒绝")
+        st.caption(f"{item.rejection_code}：{item.rejection_reason}")
+        st.caption(f"阶段：{item.rejection_stage} · 恢复动作：{item.recovery_action}")
+        _render_tag_line("Requirement", item.requirement_ids)
+        if item.blockers:
+            st.json({"blockers": item.blockers}, expanded=False)
+        st.json(item.action_arguments, expanded=False)
 
 
 def _render_claim_audit(audit: AgenticAuditSnapshot) -> None:
@@ -378,7 +411,7 @@ _STOP_REASON_MESSAGES = {
     "budget_exhausted": "已达到本轮迭代、工具或查询预算，现有结果可能只是部分回答。",
     "scope_unresolved": "尚未确定需要研究的论文范围，请补充论文名称或选择论文。",
     "no_available_actions": "现有信息下已没有新的安全检索动作。",
-    "invalid_action_limit": "Planner 连续产生无效动作，系统已停止以避免重复调用。",
+    "invalid_action_limit": "Agent 连续提出未通过运行时校验的动作，系统已停止以避免重复调用。",
     "fatal_error": "运行时发生不可恢复错误，已保留完成的证据和步骤。",
 }
 
@@ -566,10 +599,10 @@ def _conversation_timestamp(value: str) -> str:
 
 
 def _citation_ids(answer: str) -> tuple[str, ...]:
-    """从已保存答案正文提取已出现的 E#/R#，仅用于标记对应 Evidence。"""
+    """从已保存答案正文提取已出现的 E#/REF#，仅用于标记对应 Evidence。"""
     seen: set[str] = set()
     citations: list[str] = []
-    for citation in re.findall(r"\[([ER]\d+)\]", answer):
+    for citation in re.findall(r"\[((?:E|REF)\d+)\]", answer):
         if citation not in seen:
             seen.add(citation)
             citations.append(citation)

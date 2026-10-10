@@ -1,11 +1,6 @@
-# PaperBase 配置说明
+# 配置与实际调用参数
 
-PaperBase 将可公开的配置模板与机器相关的运行配置分开：
-
-- `config.example.yaml`：提交到 Git 的非敏感模板；
-- `config.yaml`：本机实际配置，已由 `.gitignore` 排除；
-- `.env.example`：环境变量模板；
-- `.env`：LLM 密钥和服务地址，已由 `.gitignore` 排除。
+核对日期：2026-10-06。字段与校验以 [config.py](../paperbase/config.py)、[config.example.yaml](../config.example.yaml) 和 [.env.example](../.env.example) 为准；节点实际装配见 [factory.py](../paperbase/agentic/factory.py) 与 [Decision](../paperbase/agentic/decision.py)。
 
 ## 初始化
 
@@ -14,99 +9,100 @@ Copy-Item .env.example .env
 Copy-Item config.example.yaml config.yaml
 ```
 
-随后在本地 `config.yaml` 中填写 Docling、Embedding 和 Reranker 的模型目录，在 `.env` 中填写 LLM 服务参数。相对路径统一相对于 `config.yaml` 所在目录解析。
+YAML 保存路径、模型目录、检索参数和研究循环设置；.env 保存 provider、API key 和共享 client 参数。相对路径以配置文件目录解析。不要提交本地密钥或把完整运行配置打印到共享日志。
 
-## 配置组
+当前 `.env` / `.env.example` 统一使用 ModelScope / Qwen/Qwen3.8-Flash-Next；`config.yaml` / `config.example.yaml` 的 Agentic 采样统一为 qwen38_recommended。模板填自己的 API key，并按本机调整模型目录。根目录只保留这两份 YAML；单次实验配置已移除，历史副本位于本地 output/config_cleanup_20261006/historical_configs/，不参与日常启动。
 
-| 配置组 | 作用 |
+```dotenv
+LLM_PROVIDER=openai_compatible
+LLM_BASE_URL=https://api-inference.modelscope.cn/v1
+LLM_API_KEY=填写自己的密钥
+LLM_MODEL=Qwen/Qwen3.8-Flash-Next
+LLM_STRUCTURED_OUTPUT_MODE=json_object
+LLM_THINKING_ENABLED=false
+LLM_TEMPERATURE=0.2
+LLM_TIMEOUT_SECONDS=30
+LLM_MAX_TOKENS=1600
+```
+
+上面的 temperature/mode 是共享基础值，**不是每个节点最终值**。模型名和服务可用性需在实际端点确认。
+
+## 各节点的有效模型配置
+
+下表是当前 qwen38_recommended 配方；共享基础 client 参数和 configured 兼容配方分别定义。
+
+| 节点 | temperature | 输出 mode | 自定义输出 token 上限 |
+|---|---|---|---|
+| Agentic Decision | 1，thinking=true | 明确覆盖为 json_schema，请求 strict=true | 移除上限参数 |
+| Agentic Planner | 0.7，thinking=false | json_schema | 移除上限参数 |
+| Agentic Projector | 0.7，thinking=false | json_schema | 移除上限参数 |
+| Agentic Answer | 0.7，thinking=false | 最终 generate() 明确覆盖为 json_schema | 移除上限参数 |
+| Agentic Query Understanding / Candidate Selection | 0.7，thinking=false | json_object | 移除上限参数 |
+| Classic Answer | 共享基础配置 | 共享基础配置 | answer_generation.max_output_tokens |
+
+上表的 native json_schema 描述 openai_compatible 路径。当前模板明确选择 schema_critical_output_mode=json_schema。Decision 自身覆盖为 json_schema；Agentic Answer 虽在 factory 接收该配置，但 generate() 在有 research_requirements 时再次覆盖为 json_schema，因此最终 mode 也不能仅凭 factory 推断。schema-critical client view 不发送项目自定义 max_tokens，但 provider 自身仍可能有长度上限。
+
+Decision 使用 decision_timeout_seconds（当前 60 秒）和 decision_transport_max_retries（当前 0）。SDK facade 共享 HTTP 资源但重试设置独立，节点仍按原 node_max_attempts 恢复，避免 SDK 重试和节点尝试相乘；其他节点 SDK 重试不变。请求 timeout 不是整个 case 的墙钟 deadline。Projector 使用 evidence_analysis_timeout_seconds；Answer 使用 answer_generation.timeout_seconds。所有节点共享 provider/client 基础实现，没有第二套 structured-output client。json_object 仍走本地模型校验；json_schema/strict=true 也不能替代本地验证与 Guard，实际 provider 可能不执行部分 keyword。
+
+审计应查看实际请求的 temperature、response mode、Schema 与 attempts，不能仅凭 YAML/.env 推断。
+
+## Agentic 循环与证据设置
+
+| 配置 | 实际含义 |
 |---|---|
-| `project` | 项目标识。 |
-| `storage` | PDF、解析检查产物和 staging 工件目录。 |
-| `parsing` | Docling 后端、OCR、公式增强、页面清理和章节层级推断。 |
-| `chunking` | tokenizer、token 上限、metadata 预算和相邻结构块合并。 |
-| `database` | 正式 SQLite 路径和锁等待时间。 |
-| `conversation` | 独立会话数据库与指代消解上下文窗口。 |
-| `embedding` | Qwen Embedding 模型、设备、batch 和 staging 输出。 |
-| `indexing` | FAISS 索引与 manifest 路径。 |
-| `reranking` | BGE Cross-Encoder、候选深度和 Final Top-K。 |
-| `context_expansion` | Final anchors 的同节相邻块扩展和 token 预算。 |
-| `answer_generation` | Evidence 数量、相关性阈值和回答输出预算。 |
-| `paper_overview` | Workspace 与正式论文 Overview 共用的字段候选与上下文预算。 |
-| `explain_section` | Explain Section 的分支覆盖和上下文预算。 |
-| `agentic_research` | 单 Agent 循环的预算、逐论文 Query、Coverage 策略与最终 Evidence 上限。 |
-| `retrieval` | 三路正文召回、RRF 权重、Query Planner 和 Bibliography 配额。 |
+| enabled | 是否允许创建研究服务 |
+| checkpoint_path / checkpoint_retention_days | 独立 SQLite checkpoint 与保留期 |
+| max_concurrent_runs | 服务并发上限，默认 1 |
+| max_agent_iterations | research iteration 上限，默认 8；即时替代候选不增加 iteration |
+| max_queries_per_paper | 原有逐篇查询限制，默认 4 |
+| node_max_attempts | 结构化节点尝试上限；也用于累计非法 iteration 的停止保护，默认 2，合法动作不 reset |
+| decision_temperature | Decision 独立采样温度，范围 0–2；不改变其他节点温度 |
+| decision_thinking_enabled | Decision 独立思考开关，当前配置与模板均为 false；评测中关闭后消除了 Decision 超时并降低总耗时。实际 OpenAI-compatible 请求为 extra_body.enable_thinking；不改变输出 Schema 或 Guard |
+| decision_timeout_seconds | Decision 独立请求超时，默认/当前 60 秒；原节点 attempt pool 保留 |
+| decision_transport_max_retries | Decision SDK 内部重试次数，默认/当前 0；请求恢复由 node_max_attempts 管理，其他节点不变 |
+| llm_sampling_profile | 当前与模板均为 qwen38_recommended；configured 作为兼容模式沿用独立温度。profile 覆盖 Agentic 节点采样，Classic/base client 不变 |
+| decision_view_mode | compact 为 factored View；shadow 对照完整输入序列化，两者共享当前 System Prompt |
+| decision_view_* | 支持/soft history/section/文本窗口大小；不裁剪 Runtime hard constraints |
+| top_k_per_paper | 工具内部单篇返回上限，默认 5，不是模型 Tool 参数 |
+| evidence_admission_enabled | Registry 前确定性证据准入 |
+| evidence_min_rerank_score | 仅对 normalized、higher-is-better、ScoreKind.RERANKER 的 score 使用，默认 0.05 |
+| evidence_source_overlap_threshold | source chunk Jaccard 重叠处理阈值，默认 0.8 |
+| evidence_projector_batch_size | Projector batch 执行大小，默认 4；assessment/cache/Integrity 仍按 Evidence 与 scope |
+| evidence_analysis_cache_path | 独立语义 cache SQLite |
+| final_evidence_max_units | 最终答案 Evidence 上限，默认 8 |
 
-`agentic_research.enabled: true` 只表示功能允许启用；后端需要通过
-`paperbase.agentic.create_agentic_research_service(...)` 装配 LangGraph、Research Tools
-和真实 LLM。该入口从配置文件同目录的 `.env` 读取 `LLM_*`，并让 Understanding、
-Planner、Candidate Selection、Decision、Evidence Analysis 和 Answer 复用同一连接池，
-但分别使用节点级输出预算。结构化输出仍会在本地执行严格 Schema 和领域校验，不能把
-Provider 的 `json_schema` 声明视为可信输入。
+恢复预检复用原 Guard，在现有 attempt pool 内至多一次即时替代候选；不增加新预算、不自动生成 query。NoProgressSignal 只是策略提示，未配置连续 N 次强制 Finish。
 
-Phase 3 新增的 Coverage 与 Selector 配置包括：
+当前配置使用 qwen38_recommended：思考节点（当前仅 Decision）temperature=1、top_p=0.95、presence_penalty=0；非思考节点 temperature=0.7、top_p=0.8、presence_penalty=1.5。共同扩展参数 top_k=20、min_p=0、repetition_penalty=1，通过 extra_body 发送；top_p/presence_penalty 是标准 SDK 参数。profile 覆盖 Decision/Planner/Projector/Answer 的温度，避免内部 client view 再变回旧值；node 构造、超时与修复 view 均保留配方。Schema 与 Guard 不变，provider 若拒绝参数，记录请求错误，不自动丢弃参数或降低输出 mode。
 
-- `coverage_candidate_min_queries_per_paper`：候选论文完成验证前的最少论文级查询数；
-- `coverage_exhaustive_min_queries_per_paper`：穷举任务每篇论文的最少查询数，默认覆盖直接查询和替代表达；
-- `final_evidence_max_units`：最终 Evidence 总上限；
-- `final_evidence_max_per_paper`：单篇论文进入最终 Evidence 的上限。
-- `evidence_admission_enabled`：是否启用 Agentic 专用的自动 Evidence 准入；
-- `evidence_min_rerank_score`：仅在 reranker 成功时生效的最低准入分数；
-- `evidence_source_overlap_threshold`：来源 chunk 集合的重叠去重阈值。结果型表格在
-  没有其他候选时会保守保留，并交给后续 Claim 校验。
+来源：[Qwen 官方模型卡](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#api-usage)。推理强度 reasoning_effort 与历史思考保留 preserve_thinking 未加入本次采样配方；现有 Graph/消息历史方式不变。
 
-P2 新增的节点输出预算包括：
+## Legacy compatibility
 
-- `query_understanding_max_output_tokens`；
-- `planner_max_output_tokens`；
-- `candidate_selection_max_output_tokens`；
-- `decision_max_output_tokens`；
-- `evidence_analysis_max_output_tokens`。
-- `evidence_analysis_cache_path`：Evidence Analysis 独立 SQLite 缓存路径。缓存键同时包含
-  Evidence 指纹、问题、请求目标/信息缺口、Schema 版本和提示词版本；失败分析不会写入。
+agentic_research.max_output_tokens、evidence_analysis_max_output_tokens、evidence_projector_batch_base_tokens、evidence_projector_batch_per_evidence_tokens、evidence_projector_batch_max_output_tokens 仍接受旧配置，但 Agentic 节点已不使用这些输出 cap；已从推荐 config.example.yaml 移除。保留字段是为了 Settings DTO、旧 deployment 和回归解析兼容，不是可生效参数。所有 Agentic 模型请求均省略应用层 max_tokens；provider 默认输出额度和上下文窗口仍然适用。Decision View 的历史数量与字符窗口、迭代和查询预算独立保留。
 
-这些值只控制对应节点的可见输出上限；API Key、Prompt、LLM 原始输出和隐藏推理正文不会
-写入诊断记录。运行记录只持久化 token 数、字符数、`finish_reason`、错误阶段和不含输入值
-的 ValidationError 类型/字段路径。
+旧 final_evidence_max_per_paper、max_evidence_per_analysis、max_no_new_evidence_rounds 在兼容加载中移除，不应当成可生效控制参数。其他未知字段由模型校验拒绝；不要添加看似有效但无人读取的配置。
 
-正式 Overview 独立保存在 `storage/paper_overviews/<paper_id>/overview.json` 与
-`context.json`。生成必须显式调用 `FormalOverviewRepository.generate(...)`；Agent 的
-`get_paper_overview` Tool 只读取已有产物，缺失时返回 `unavailable`。
+project.name 当前仅为必填元数据，没有运行时读取；retrieval.backend 当前也没有路由消费者，生产工厂固定创建 HybridRetriever。两者保留原配置 DTO，不应把修改其值理解为日志标识或切换 Retriever。其他 backend（parsing/chunking/embedding/indexing/reranking）有真实工厂校验，不能混为一谈。
 
-## 当前 Retrieval 参数语义
+共享 LLM_THINKING_ENABLED 会被 loader 解析，但基础 OpenAI-compatible client 构造目前固定 enable_thinking=false；ZhipuAI 路径和显式节点 view 另行处理。当前 Agentic thinking 由 decision_thinking_enabled / profile view 显式设置。基础开关不一致是单独 correctness issue，本轮未改。
 
-正文候选最多来自三条路径：
+配置可加载不等于 checkpoint 可恢复。当前 semantic authority 是 projector-requirement-directed-multi-projection-v4；历史 v2/v3 仅用于 parse/inspect/offline replay，resume/resume_stream 拒绝。
 
-1. `dense_resolved`：对经过指代消解的 Query 做 Dense Retrieval；
-2. `dense_semantic`：对英文 semantic rewrite 做 Dense Retrieval；
-3. `bm25_keywords`：对确定性与 LLM 共同生成的英文关键词做 FTS5/BM25。
+## 检索、存储与生成
 
-相关配置为：
+Classic 的 Query Resolution/Rewrite 开关及 lexical 数量由 retrieval.query_rewrite 控制；Agentic 通过 Decision Action 和 canonical compiler 生成有效请求，Query Understanding hints 不自动接入 Retriever。Dense/FTS 候选数、RRF weights 与 reranker top-k 使用各自配置，不由 Evidence raw_score 反推。
 
-- `dense_top_k_per_query`
-- `bm25_keywords_top_k`
-- `fused_top_k`
-- `rrf_k`
-- `dense_resolved_weight`
-- `dense_semantic_weight`
-- `bm25_keywords_weight`
+正式正文与 bibliography 索引隔离；正式 Overview 只读已生成产物；临时 workspace 不和正式 KB 混合。详见[存储](pipeline/storage-and-indexing.md)和[两条检索路径](pipeline/retrieval-and-generation.md)。
 
-当前没有 Original BM25 路径。Bibliography 使用独立的 `bibliography_fts`，仅在明确参考文献意图下执行，不进入正文 RRF 或 Cross-Encoder。
+## 审计与验证
 
-## 敏感信息边界
+普通 LLM diagnostics 记录节点、attempt、状态、耗时、tokens 与安全错误。现有 Evidence/Action audit 可包含事实值、source anchors、检索请求；不能宣称所有 public audit 都无输入内容。显式 debug/实验 trace 可以保存实际请求，分享前应按其产物范围检查。密钥与 hidden reasoning 不进入交付日志。
 
-以下内容不得写入 YAML、文档或测试：
-
-- API Key、Token 和密码；
-- 带凭证的私有服务 URL；
-- 本机用户名和私人目录；
-- 未脱敏的论文原文或会话数据库。
-
-`.env.example` 只能保留空值和公开的变量名称。
-
-## 校验
-
-配置由 Pydantic 严格校验。未知字段、类型错误和缺失必填项会在启动时失败，不会静默回退。
+预算逻辑计数不等于实际 SDK requests：Answer repair/retries、Decision 多候选和 SDK retries 要分别统计。最近测试和 live 状态见[当前验证状态](evaluation/current-baseline.md)。
 
 ```powershell
-.\.venv\Scripts\python.exe -c "from paperbase.config import load_settings; print(load_settings())"
+.\.venv\Scripts\python.exe -m paperbase.llm.healthcheck --config .\config.yaml
 ```
+
+healthcheck 会实际调用 provider。离线文档检查和单元测试无需执行它。

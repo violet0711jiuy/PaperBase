@@ -7,6 +7,8 @@ import json
 
 from paperbase.config import AgenticResearchSettings
 
+from .search_requests import compile_action_requests, canonical_action_identity
+from paperbase.retrieval.requests import validate_effective_request
 from .contracts import (
     AgentAction,
     CandidateSelection,
@@ -19,6 +21,8 @@ from .contracts import (
     QueryContext,
     QueryScope,
     ResearchPlan,
+    RequirementState,
+    RequirementStatus,
     SearchKnowledgeBaseAction,
     SearchPapersAction,
     SearchReferencesAction,
@@ -52,30 +56,31 @@ class BudgetAndGuardTracker:
         self.invalid_actions = snapshot.usage.invalid_actions
         self.queries_per_paper = dict(snapshot.usage.queries_per_paper)
         self.no_new_per_paper = dict(snapshot.no_new_per_paper)
+        self.no_goal_progress_per_paper = dict(
+            snapshot.no_goal_progress_per_paper
+        )
         self.suppressed_papers = set(snapshot.suppressed_paper_ids)
-        self._fingerprints = set(snapshot.executed_action_fingerprints)
+        # Search fingerprints from old checkpoints described wire strings, not
+        # executed retrieval semantics. Preserve non-search keys; never guess.
+        legacy_search = tuple(value for value in snapshot.executed_action_fingerprints
+                              if _legacy_search_fingerprint(value))
+        self._fingerprints = set(snapshot.executed_action_fingerprints) - set(legacy_search)
+        self.request_executions = list(snapshot.request_executions)
+        self.legacy_request_notes = list(snapshot.legacy_request_notes)
+        if legacy_search or any(not value.startswith("search-v1:") for value in snapshot.executed_paper_query_fingerprints):
+            self.legacy_request_notes.append("legacy search identity is not reliably migratable; fail-open, usage retained")
         self._paper_query_fingerprints = set(
-            snapshot.executed_paper_query_fingerprints
+            value for value in snapshot.executed_paper_query_fingerprints if value.startswith("search-v1:")
         )
 
-    def can_decide(self, *, reserved_llm_calls: int = 0) -> GuardDecision:
-        if reserved_llm_calls < 0:
-            raise ValueError("reserved_llm_calls must not be negative.")
+    def can_decide(self) -> GuardDecision:
         if self.iterations >= self.settings.max_agent_iterations:
             return GuardDecision(False, "IterationBudget", "Agent iteration budget exhausted.", True)
-        if self.llm_calls + reserved_llm_calls >= self.settings.max_llm_calls:
-            return GuardDecision(False, "LLMBudget", "LLM call budget exhausted.", True)
         return GuardDecision(True, "OK", "")
 
-    def record_decision(
-        self, llm_calls: int, *, reserved_llm_calls: int = 0
-    ) -> GuardDecision:
-        if reserved_llm_calls < 0:
-            raise ValueError("reserved_llm_calls must not be negative.")
+    def record_decision(self, llm_calls: int) -> GuardDecision:
         self.iterations += 1
         self.llm_calls += llm_calls
-        if self.llm_calls + reserved_llm_calls > self.settings.max_llm_calls:
-            return GuardDecision(False, "LLMBudget", "Decision exceeded LLM call budget.", True)
         return GuardDecision(True, "OK", "")
 
     def record_preparation_llm_calls(self, llm_calls: int) -> None:
@@ -92,14 +97,37 @@ class BudgetAndGuardTracker:
         plan: ResearchPlan,
         snapshot: CorpusScopeSnapshot | None,
         candidate_selection: CandidateSelection | None = None,
+        requirement_states: tuple[RequirementState, ...] = (),
+        known_section_pairs: frozenset[tuple[str, str]] = frozenset(),
+        canonical_requests=None,
     ) -> GuardDecision:
         if isinstance(action, FinishAction):
             return GuardDecision(True, "OK", "")
-        known_subtasks = {task.subtask_id for task in plan.subtasks}
-        for subtask_id in action_subtask_ids(action):
-            if subtask_id not in known_subtasks:
-                return GuardDecision(False, "UnknownSubtask", f"Unknown subtask: {subtask_id}")
-        target_ids = affected_paper_ids(action)
+        requests = (compile_action_requests(action, context=context, snapshot=snapshot,
+                    top_k=self.settings.top_k_per_paper) if canonical_requests is None else canonical_requests)
+        self.request_executions.extend({"request_identity": request.identity,
+            "iteration": self.iterations, "state": "attempted", "attempted": True,
+            "executed": False, "failed": False, "successful": False} for request in requests)
+        for request in requests:
+            rejection = validate_effective_request(request)
+            if rejection is not None:
+                return GuardDecision(False, rejection.code, rejection.detail)
+        if not _validate_requirement_bindings(action, plan, requirement_states):
+            return GuardDecision(
+                False,
+                "InvalidRequirementBinding",
+                "Action must bind existing active Requirements; support_found can still be researched.",
+            )
+        if isinstance(action, GetSectionContextAction):
+            if (action.paper_id, action.section_id) not in known_section_pairs:
+                return GuardDecision(
+                    False,
+                    "UnknownSection",
+                    "Section context must reference a section already exposed by evidence for the same paper.",
+                )
+        target_ids = (tuple(paper_id for request in requests
+                            if request.kind in {"search_papers", "search_references"}
+                            for paper_id in request.paper_ids) if requests else affected_paper_ids(action))
         if isinstance(action, SearchPapersAction) and len(target_ids) != len(
             set(target_ids)
         ):
@@ -122,6 +150,8 @@ class BudgetAndGuardTracker:
                 )
             if context.scope is not QueryScope.KNOWLEDGE_BASE or snapshot is None:
                 return GuardDecision(False, "InvalidScope", "Global search requires a corpus snapshot.")
+            if any(not set(request.paper_ids).issubset(allowed) for request in requests):
+                return GuardDecision(False, "InvalidScope", "Canonical KB scope exceeds trusted corpus snapshot.")
         else:
             if candidate_selection is not None:
                 allowed = set(
@@ -129,12 +159,11 @@ class BudgetAndGuardTracker:
                 )
             if not set(target_ids).issubset(allowed):
                 return GuardDecision(False, "InvalidScope", "Action targets papers outside trusted candidate scope.")
-        if any(paper_id in self.suppressed_papers for paper_id in target_ids):
-            return GuardDecision(False, "NoNewEvidenceSuppressed", "Paper has reached the no-new-evidence limit.")
-        fingerprint = action_fingerprint(action)
+        fingerprint = canonical_action_identity(requests) if requests else action_fingerprint(action)
         if fingerprint in self._fingerprints:
             return GuardDecision(False, "DuplicateAction", "The same action was already executed.")
-        paper_query_fingerprints = paper_query_fingerprints_for_action(action)
+        paper_query_fingerprints = tuple(request.identity for request in requests
+                                         if request.kind in {"search_papers", "search_references"})
         repeated_queries = tuple(
             value
             for value in paper_query_fingerprints
@@ -144,31 +173,44 @@ class BudgetAndGuardTracker:
             return GuardDecision(
                 False,
                 "DuplicatePaperQuery",
-                "同一论文的规范化 Query 已执行过，必须根据剩余缺口改写 Query。",
+                "The same effective search request for this paper has already completed. "
+                "Revise a retrieval-relevant input according to the remaining evidence gap "
+                "(for example semantic query or lexical focus); changing audit-only fields does not create a new search.",
             )
-        queries = retrieval_query_count(action)
-        if self.tool_calls + 1 > self.settings.max_tool_calls:
-            return GuardDecision(False, "ToolBudget", "Tool call budget exhausted.", True)
-        if self.retrieval_queries + queries > self.settings.max_retrieval_queries:
-            return GuardDecision(False, "RetrievalBudget", "Retrieval query budget exhausted.", True)
         for paper_id in target_ids:
             if self.queries_per_paper.get(paper_id, 0) + queries_for_paper(action, paper_id) > self.settings.max_queries_per_paper:
                 return GuardDecision(False, "PerPaperBudget", f"Query budget exhausted for {paper_id}.", True)
-        self._fingerprints.add(fingerprint)
-        self._paper_query_fingerprints.update(paper_query_fingerprints)
         return GuardDecision(True, "OK", "")
 
-    def record_tool_call(self, action: AgentAction) -> None:
+    def record_tool_call(self, action: AgentAction, *, canonical_requests=None, result=None) -> None:
+        requests = compile_action_requests(action, top_k=self.settings.top_k_per_paper) if canonical_requests is None else canonical_requests
+        records = result.metadata.get("request_executions") if result is not None else None
+        if records is None:
+            records = [{"request_identity": request.identity, "attempted": True,
+                        "executed": True, "failed": result is not None and result.status.value in {"error", "unavailable"},
+                        "successful": result is None or result.status.value in {"ok", "empty", "partial"}}
+                       for request in requests]
+        self.request_executions.extend({**record, "iteration": self.iterations,
+            "state": "successful" if record["successful"] else "failed"} for record in records)
+        successful = {record["request_identity"] for record in records
+                      if record["executed"] and record["successful"]}
+        self._paper_query_fingerprints.update(request.identity for request in requests
+            if request.identity in successful and request.kind in {"search_papers", "search_references"})
+        if requests and all(request.identity in successful for request in requests):
+            self._fingerprints.add(canonical_action_identity(requests))
+        elif not requests and (result is None or result.status.value in {"ok", "empty", "partial"}):
+            self._fingerprints.add(action_fingerprint(action))
         self.tool_calls += 1
-        self.retrieval_queries += retrieval_query_count(action)
+        self.retrieval_queries += sum(bool(record["executed"]) for record in records) if requests else retrieval_query_count(action)
         for paper_id in affected_paper_ids(action):
-            self.queries_per_paper[paper_id] = (
-                self.queries_per_paper.get(paper_id, 0) + queries_for_paper(action, paper_id)
-            )
+            count = (sum(bool(record["executed"]) for request, record in zip(requests, records)
+                         if request.kind in {"search_papers", "search_references"} and paper_id in request.paper_ids)
+                     if requests else queries_for_paper(action, paper_id))
+            self.queries_per_paper[paper_id] = self.queries_per_paper.get(paper_id, 0) + count
 
     def record_invalid_action(self) -> bool:
         self.invalid_actions += 1
-        return self.invalid_actions > self.settings.max_invalid_actions
+        return self.invalid_actions >= self.settings.node_max_attempts
 
     def record_evidence_delta(
         self, action: AgentAction, *, added_paper_ids: set[str]
@@ -185,8 +227,20 @@ class BudgetAndGuardTracker:
             else:
                 count = self.no_new_per_paper.get(paper_id, 0) + 1
                 self.no_new_per_paper[paper_id] = count
-                if count >= self.settings.max_no_new_evidence_per_paper:
-                    self.suppressed_papers.add(paper_id)
+
+    def record_goal_progress(
+        self,
+        paper_ids: tuple[str, ...],
+        *,
+        progressed: bool,
+    ) -> None:
+        """只把新增用户目标信息视为进展，防止无关新 Evidence 掩盖空转。"""
+        for paper_id in dict.fromkeys(paper_ids):
+            if progressed:
+                self.no_goal_progress_per_paper[paper_id] = 0
+                continue
+            count = self.no_goal_progress_per_paper.get(paper_id, 0) + 1
+            self.no_goal_progress_per_paper[paper_id] = count
 
     def no_available_actions(
         self,
@@ -194,16 +248,9 @@ class BudgetAndGuardTracker:
         *,
         candidate_selection: CandidateSelection | None = None,
     ) -> bool:
-        required = (
-            set(
-                (*candidate_selection.candidate_paper_ids, *candidate_selection.uncertain_paper_ids)
-            )
-            if candidate_selection is not None
-            else {"__knowledge_base__"}
-            if context.scope is QueryScope.KNOWLEDGE_BASE
-            else set(context.target_paper_ids)
-        )
-        return bool(required) and required.issubset(self.suppressed_papers)
+        # Kept for checkpoint/API compatibility.  A lack of new evidence is
+        # an observation for the decision agent, never a runtime stop rule.
+        return False
 
     def usage(self) -> BudgetUsage:
         return BudgetUsage(
@@ -218,15 +265,17 @@ class BudgetAndGuardTracker:
     def remaining(self) -> dict[str, int]:
         return {
             "agent_iterations": max(0, self.settings.max_agent_iterations - self.iterations),
-            "tool_calls": max(0, self.settings.max_tool_calls - self.tool_calls),
-            "retrieval_queries": max(0, self.settings.max_retrieval_queries - self.retrieval_queries),
-            "llm_calls": max(0, self.settings.max_llm_calls - self.llm_calls),
         }
 
     def snapshot(self) -> GuardState:
         return GuardState(
             usage=self.usage(),
+            request_executions=tuple(self.request_executions),
+            legacy_request_notes=tuple(dict.fromkeys(self.legacy_request_notes)),
             no_new_per_paper=tuple(sorted(self.no_new_per_paper.items())),
+            no_goal_progress_per_paper=tuple(
+                sorted(self.no_goal_progress_per_paper.items())
+            ),
             suppressed_paper_ids=tuple(sorted(self.suppressed_papers)),
             executed_action_fingerprints=tuple(sorted(self._fingerprints)),
             executed_paper_query_fingerprints=tuple(
@@ -245,18 +294,47 @@ def affected_paper_ids(action: AgentAction) -> tuple[str, ...]:
     return ()
 
 
-def action_subtask_ids(action: AgentAction) -> tuple[str, ...]:
-    values: list[str] = []
-    action_value = getattr(action, "target_subtask_id", None)
-    if action_value:
-        values.append(action_value)
+def action_requirement_ids(action: AgentAction) -> tuple[str, ...]:
+    """Return Requirement bindings without exposing legacy Subtask IDs."""
     if isinstance(action, SearchPapersAction):
-        values.extend(
-            search.target_subtask_id
-            for search in action.searches
-            if search.target_subtask_id is not None
+        return tuple(
+            dict.fromkeys(
+                requirement_id
+                for search in action.searches
+                for requirement_id in search.requirement_ids
+            )
         )
-    return tuple(dict.fromkeys(values))
+    return tuple(getattr(action, "requirement_ids", ()))
+
+
+def _validate_requirement_bindings(
+    action: AgentAction,
+    plan: ResearchPlan,
+    requirement_states: tuple[RequirementState, ...],
+) -> bool:
+    """Validate action bindings against the current Requirement plan."""
+    known = {item.requirement_id for item in plan.requirements}
+    if not known:
+        return True
+    if isinstance(action, SearchPapersAction):
+        if any(not search.requirement_ids for search in action.searches):
+            return False
+    elif not action_requirement_ids(action):
+        return False
+    requested = set(action_requirement_ids(action))
+    if not requested.issubset(known):
+        return False
+    state_by_id = {item.requirement_id: item.status for item in requirement_states}
+    # Missing state means an old checkpoint: retain its previous behaviour.
+    # Legacy satisfied means support found; more research remains legal.
+    return not any(
+        state_by_id.get(requirement_id)
+        in {
+            RequirementStatus.NO_SUPPORT_FOUND,
+            RequirementStatus.UNCERTAIN,
+        }
+        for requirement_id in requested
+    )
 
 
 def retrieval_query_count(action: AgentAction) -> int:
@@ -276,16 +354,10 @@ def queries_for_paper(action: AgentAction, paper_id: str) -> int:
 
 
 def action_fingerprint(action: AgentAction) -> str:
-    if isinstance(action, SearchPapersAction):
-        value = [
-            (item.paper_id, item.query.casefold(), tuple(term.casefold() for term in item.lexical_terms))
-            for item in action.searches
-        ]
-    elif isinstance(action, SearchKnowledgeBaseAction):
-        value = [action.action_name, action.query.casefold(), tuple(term.casefold() for term in action.lexical_terms)]
-    elif isinstance(action, SearchReferencesAction):
-        value = [action.action_name, action.paper_id, action.query.casefold(), tuple(term.casefold() for term in action.lexical_terms)]
-    elif isinstance(action, GetSectionContextAction):
+    requests = compile_action_requests(action)
+    if requests:
+        return canonical_action_identity(requests)
+    if isinstance(action, GetSectionContextAction):
         value = [action.action_name, action.paper_id, action.section_id]
     elif isinstance(action, GetPaperOverviewAction):
         value = [action.action_name, action.paper_id]
@@ -295,18 +367,16 @@ def action_fingerprint(action: AgentAction) -> str:
 
 
 def paper_query_fingerprints_for_action(action: AgentAction) -> tuple[str, ...]:
-    """逐论文记录 Query，避免改变 Batch 组成后绕过整动作去重。"""
-    if not isinstance(action, SearchPapersAction):
-        return ()
-    return tuple(
-        json.dumps(
-            [search.paper_id, _normalize_query(search.query)],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        for search in action.searches
-    )
+    return tuple(request.identity for request in compile_action_requests(action)
+                 if request.kind in {"search_papers", "search_references"})
 
 
-def _normalize_query(query: str) -> str:
-    return " ".join(query.casefold().split())
+def _legacy_search_fingerprint(value: str) -> bool:
+    if value.startswith("search-action-v1:"):
+        return False
+    try:
+        decoded = json.loads(value)
+    except (ValueError, TypeError):
+        return False
+    return bool(isinstance(decoded, list) and decoded and
+                (isinstance(decoded[0], list) or decoded[0] in {"search_papers", "search_references", "search_knowledge_base"}))

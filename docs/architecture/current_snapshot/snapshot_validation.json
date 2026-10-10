@@ -1,0 +1,140 @@
+{
+  "passed": true,
+  "provider_calls": 0,
+  "network_attempts": 0,
+  "mock_sdk_creates": 7,
+  "checks": [
+    {
+      "name": "production_library_imports",
+      "passed": true,
+      "count": 150,
+      "cli_entrypoints_compile_only": [
+        "paperbase.ask_paper.__main__",
+        "paperbase.embedding.__main__",
+        "paperbase.explain_section.__main__",
+        "paperbase.indexing.__main__",
+        "paperbase.overview.__main__",
+        "paperbase.promotion.__main__",
+        "paperbase.retrieval.__main__",
+        "paperbase.staging.__main__"
+      ],
+      "explanation": "__main__ wrappers intentionally execute CLI; underlying implementation modules imported, no CLI launched."
+    },
+    {
+      "name": "base_client_constructed",
+      "passed": true,
+      "sdk": "injected no-network sentinel; actual production client constructor"
+    },
+    {
+      "name": "checkpoint_serde_roundtrip",
+      "passed": true
+    },
+    {
+      "name": "schemas_built",
+      "passed": true,
+      "schema_hashes": {
+        "query_understanding": "537425abd910e75f8dda64a3de74486336838b2cde4ad21b4f32522ec981d580",
+        "candidate_selection": "bfc981c92ce6d564ebbd353d478f6fb3e11df57b378c45216ec1aababbbd16a5",
+        "planner": "960102dd04def57318acd1d362285652df5217cb742787c962ff19800efd0194",
+        "decision": "c906f97c57d4e7d61b44e168d88987b573f27fb1fdc30c1acfb5271834d0dc6a",
+        "projector": "ce4b1a6fb72661e1b75d9ac38f3efc475244c7ee4e0f6ac953a2dc9d0e9043f8",
+        "answer": "328cb07893c5544649d8f3760bf88b0f76c2e1d6c197727fcace722c524ac2b4",
+        "classic_answer": "0509a8851d61675433f3ea8f50ef309c4b6c55737f412539f37da350c8816755"
+      },
+      "dynamic_scope": "synthetic IDs only; no user State/Evidence"
+    },
+    {
+      "name": "actual_agentic_request_assembly",
+      "passed": true,
+      "method": "Actual production client views + native complete_json_diagnostic create metadata, injected mock SDK only."
+    },
+    {
+      "name": "production_factory_service_graph",
+      "passed": true,
+      "dependencies": "Injected SDK sentinel, empty DB/retriever, in-memory checkpointer, temporary cache; no production storage mutation or local model inference."
+    },
+    {
+      "name": "frozen_golden_read_only_validation",
+      "passed": true,
+      "cases": 40,
+      "taxonomy": {
+        "bibliography": 4,
+        "experiment": 6,
+        "fact": 8,
+        "method": 8,
+        "result": 6,
+        "synthesis": 4,
+        "unanswerable": 4
+      }
+    },
+    {
+      "name": "no_protected_file_mutation",
+      "passed": true,
+      "changed_files": []
+    },
+    {
+      "name": "scoped_authority_audit",
+      "passed": true,
+      "conflict_count": 0
+    },
+    {
+      "name": "curated_production_fingerprint",
+      "passed": true
+    },
+    {
+      "name": "full_pytest",
+      "passed": true,
+      "result": {
+        "status": "PASSED",
+        "passed": 1036,
+        "subtests": 21,
+        "seconds": 31.67,
+        "command": "python -m pytest tests -q -p snapshot_pytest_safety",
+        "log": "output/current_profile_stability_20261007/pytest_full.log"
+      }
+    },
+    {
+      "name": "whole_task_original_files_unchanged",
+      "passed": true,
+      "original_file_count": 293,
+      "changed_files": [],
+      "method": "Pre-task existing source/config/tests/Golden/docs/runtime SQLite/history metadata hashes compared after inspection and full tests."
+    },
+    {
+      "name": "full_pytest_zero_network_and_storage_isolation",
+      "passed": true,
+      "receipt": {
+        "provider_calls": 0,
+        "network_attempts": 0,
+        "redirected_production_sqlite_count": 2,
+        "redirected_sources": [
+          "storage/agentic_checkpoints.sqlite3",
+          "storage/evidence_analysis_cache.sqlite3"
+        ],
+        "boundary": "Only writable root/storage SQLite connections redirected; tests and production source unmodified."
+      },
+      "exit_code": 0
+    },
+    {
+      "name": "snapshot_document_links",
+      "passed": true,
+      "invalid_links": []
+    },
+    {
+      "name": "snapshot_credential_boundary",
+      "passed": true,
+      "method": "Actual configured credential compared in memory only; no secret emitted."
+    }
+  ],
+  "documentation_drift_count": 0,
+  "authority_conflict_count": 0,
+  "known_limitation_count": 7,
+  "inspection_boundary": "No real model calls, no live eval, no Graph research execution. Local retrieval models not loaded. Schema/request metadata captured through SDK sentinel.",
+  "privacy": {
+    "credentials_stored": false,
+    "raw_prompts_stored": false,
+    "evidence_text_stored": false,
+    "golden_reference_answers_stored": false,
+    "hidden_reasoning_stored": false
+  }
+}

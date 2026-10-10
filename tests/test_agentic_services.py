@@ -93,7 +93,7 @@ class AgenticServiceTests(unittest.TestCase):
         self.assertEqual(result.target_paper_ids, ())
         self.assertEqual(result.corpus_snapshot.paper_ids, ("paper_a", "paper_b"))
 
-    def test_comparison_understanding_and_fallback_plan_are_per_paper(self) -> None:
+    def test_comparison_understanding_and_fallback_plan_is_requirement_first(self) -> None:
         resolution = self.resolver.resolve(
             "Attention Is All You Need 和 BERT Pre-training of Deep Bidirectional Transformers 的方法有什么区别？"
         )
@@ -107,23 +107,20 @@ class AgenticServiceTests(unittest.TestCase):
             frozenset({EvidenceTarget.METHOD}),
         )
         planned = ResearchPlanner().plan(understood.context)
-        self.assertEqual(len(planned.plan.subtasks), 2)
-        self.assertEqual(
-            planned.plan.subtasks[0].target_paper_ids, ("paper_a", "paper_b")
-        )
-        self.assertEqual(
-            planned.plan.subtasks[1].target_paper_ids, ("paper_a", "paper_b")
-        )
+        self.assertTrue(planned.plan.requirements)
+        self.assertEqual(len(planned.plan.requirements), 1)
+        self.assertTrue(planned.plan.requirements[0].required)
 
-    def test_overplanned_llm_output_falls_back_to_two_compact_tasks(self) -> None:
+    def test_overplanned_llm_output_falls_back_to_compact_requirements(self) -> None:
         resolution = self.resolver.resolve("paper_a 的方法是什么？")
         context = QueryUnderstandingService().understand(
             "paper_a 的方法是什么？", resolution
         ).context
         planned = ResearchPlanner(_OverplannedClient()).plan(context)
         self.assertTrue(planned.used_fallback)
-        self.assertEqual(len(planned.plan.subtasks), 2)
-        self.assertNotIn("具体方法类别", planned.plan.subtasks[0].goal)
+        self.assertTrue(planned.plan.requirements)
+        self.assertEqual(len(planned.plan.requirements), 1)
+        self.assertNotIn("具体方法类别", planned.plan.requirements[0].description)
 
     def test_invalid_llm_output_falls_back_without_changing_scope(self) -> None:
         resolution = self.resolver.resolve("paper_a 的方法是什么？")

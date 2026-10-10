@@ -1,8 +1,10 @@
 # PaperBase Evaluation
 
-本目录保存可公开复用的 Golden Dataset、人工审核记录和 Retrieval Evaluation 工具。
+本目录保存可公开复用的 Golden Dataset、人工审核记录和 Classic Retrieval Evaluation 工具。Agentic E1 实现在 paperbase/evaluation，详见 [E1 契约](../docs/evaluation/e1_diagnostic.md)。两条路径的结果不能混报。
 评测脚本只观察正式 PaperBase 检索链路并计算确定性指标，不会修改生产
 RAG / Retrieval / Generation 实现。
+
+Agentic live case 的 Answer 原始最终输出自动保存到 `cases/<case_id>.answer_llm_outputs.jsonl`，包括失败和修复尝试；无 Answer 响应时文件为空。原文仅用于本地排错，不包含 hidden reasoning，也不进入公共 audit 或确定性评分。详见 [E1 契约](../docs/evaluation/e1_diagnostic.md)。
 
 ## 目录内容
 
@@ -26,7 +28,7 @@ Ground Truth 校验与评分，不会作为检索范围传给正式 Retriever。
 ## Benchmark 论文清单
 
 Golden v1.2 基于以下 4 篇论文。论文 PDF 受原出版来源约束，不在本仓库中重新分发；
-要复现当前基线，必须准备相同版本的 PDF，并通过当前 Parser / Chunker clean rebuild，
+要复现历史 Retrieval 基线，必须准备相同版本的 PDF，并通过当前 Parser / Chunker clean rebuild，
 使 `paper_id` 与 Ground Truth chunk IDs 一致。
 
 | paper_id | 论文标题 |
@@ -78,7 +80,7 @@ Audit 只读取已经保存的 trace，不会再次调用模型。
 | `golden_dataset_v1_1.jsonl` | 将 context-free Query 改写为尽可能 self-contained。 |
 | `golden_dataset_v1_2.jsonl` | 修正过严或过宽 Evidence 后的当前 Retrieval Benchmark。 |
 
-当前基线指标见 [`docs/evaluation/current-baseline.md`](../docs/evaluation/current-baseline.md)，
+历史 Retrieval 数值及当前 Agentic smoke 状态见 [`docs/evaluation/current-baseline.md`](../docs/evaluation/current-baseline.md)，
 Schema、类型、Tags 和指标定义见
 [`docs/evaluation/design.md`](../docs/evaluation/design.md)。
 
@@ -88,4 +90,4 @@ Schema、类型、Tags 和指标定义见
 - 不在 Evaluation 中修改正式 Retriever 参数或注入 Golden `paper_id`；
 - 不自动覆盖冻结数据集；
 - chunk 不存在或边界改变时必须人工 remap，不能做文本相似度猜测；
-- LLM Judge、Ragas、DeepEval、Ablation 与 Generation Evaluation 当前均未实现。
+- 完整 Retrieval Ablation 与 E2 semantic Judge 未实现；Ragas/DeepEval 未接入。Agentic E1 已实现并有真实 smoke，不能再表述为所有 Generation/Agentic 验证均未开始；E1 不等于语义质量评测。

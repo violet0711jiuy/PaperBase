@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
+from json import JSONDecodeError
+
 from pydantic import ValidationError
 
-from .client import LLMCallRecord, LLMCompletion, LLMRequestError
+from .client import (
+    LLMCallRecord,
+    LLMCompletion,
+    LLMRequestError,
+    ValidationDiagnostic,
+)
+
+
+REQUEST_ERROR_STAGES = frozenset(
+    {"request_error", "timeout", "rate_limit", "provider_5xx", "connection_error"}
+)
 
 
 def classify_llm_error(error: Exception) -> str:
     """把外部/语法/Schema/领域失败分开，避免上层重复同一种请求。"""
     if isinstance(error, LLMRequestError):
         return error.error_stage
+    if isinstance(error, JSONDecodeError):
+        return "invalid_json"
     if isinstance(error, ValidationError):
         if any(item.get("type") == "json_invalid" for item in error.errors()):
             return "invalid_json"
@@ -37,7 +51,7 @@ def recovery_action_for(error: Exception, *, can_retry: bool) -> str | None:
         return "repair_structure"
     if stage == "domain_validation":
         return "repair_domain"
-    if stage == "request_error":
+    if stage in REQUEST_ERROR_STAGES:
         return "retry_request"
     return None
 
@@ -51,12 +65,18 @@ def repair_hint(error: Exception) -> str:
         "schema_validation": "上一次 JSON 不符合字段或类型约束；请严格按 Schema 重写。",
         "domain_validation": "上一次输出违反业务范围或完整性约束；请根据输入 ID 与范围修正。",
         "request_error": "上一次请求未成功；请重新完成同一任务。",
+        "timeout": "上一次请求超时；请重新完成同一任务。",
+        "rate_limit": "上一次请求被限流；请稍后重新完成同一任务。",
+        "provider_5xx": "上一次供应商服务异常；请重新完成同一任务。",
+        "connection_error": "上一次连接失败；请重新完成同一任务。",
     }
     return hints.get(stage, "上一次输出不可用；请严格按约束重写。")
 
 
 def safe_validation_summary(error: Exception) -> str | None:
     """仅保留 ValidationError 的类型与字段路径，不保存 input_value。"""
+    if isinstance(error, JSONDecodeError):
+        return "json_invalid@root"
     if not isinstance(error, ValidationError):
         return None
     parts: list[str] = []
@@ -88,6 +108,7 @@ def failure_record(
     error: Exception,
     completion: LLMCompletion | None = None,
     can_retry: bool,
+    validation_diagnostics: tuple[ValidationDiagnostic, ...] = (),
 ) -> LLMCallRecord:
     """从异常或已返回 completion 中提取安全统计，不保存错误正文。"""
     if isinstance(error, LLMRequestError):
@@ -114,4 +135,5 @@ def failure_record(
         error_stage=classify_llm_error(error),
         recovery_action=recovery_action_for(error, can_retry=can_retry),
         validation_summary=safe_validation_summary(error),
+        validation_diagnostics=validation_diagnostics,
     )

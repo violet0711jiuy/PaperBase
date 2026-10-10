@@ -95,10 +95,12 @@ class ConversationStoreTests(unittest.TestCase):
                 assistant_answer="回答 [E1]",
                 evidence_json=snapshot,
                 audit_json=json.dumps({"schema_version": 1}),
+                metadata_json=json.dumps({"answer_status": "success"}),
             )
             saved_turn = store.get_turns(conversation.conversation_id)[0]
             self.assertEqual(saved_turn.evidence_json, snapshot)
             self.assertEqual(saved_turn.audit_json, '{"schema_version": 1}')
+            self.assertEqual(saved_turn.metadata_json, '{"answer_status": "success"}')
 
             # 模拟 Frontend Step 2 之前创建的旧 conversations.sqlite3，确认 initialize
             # 只补列而不破坏已经存在的 User/Assistant 历史。
@@ -142,6 +144,7 @@ class ConversationStoreTests(unittest.TestCase):
             self.assertEqual(old_turn.assistant_answer, "旧回答")
             self.assertIsNone(old_turn.evidence_json)
             self.assertIsNone(old_turn.audit_json)
+            self.assertIsNone(old_turn.metadata_json)
 
     def test_damaged_audit_json_does_not_hide_answer_history(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -156,8 +159,8 @@ class ConversationStoreTests(unittest.TestCase):
             connection = sqlite3.connect(path)
             try:
                 connection.execute(
-                    "UPDATE conversation_turns SET audit_json = ? WHERE turn_id = ?",
-                    ("{not-json", turn.turn_id),
+                    "UPDATE conversation_turns SET audit_json = ?, metadata_json = ? WHERE turn_id = ?",
+                    ("{not-json", "{not-json", turn.turn_id),
                 )
                 connection.commit()
             finally:
@@ -167,6 +170,7 @@ class ConversationStoreTests(unittest.TestCase):
 
             self.assertEqual(restored.assistant_answer, "仍然可见的回答")
             self.assertIsNone(restored.audit_json)
+            self.assertIsNone(restored.metadata_json)
 
     def test_pending_agentic_task_survives_restart_and_finalizes_atomically(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -323,6 +327,10 @@ class ConversationStoreTests(unittest.TestCase):
             self.assertIn("User: ESDTW 的整体流程是什么？", retriever.contexts[1][0])
             self.assertIn("Assistant: 最终展示答案。", retriever.contexts[1][0])
             self.assertEqual(generator.contexts, [None, None])
+            metadata = json.loads(store.get_turns(first.conversation_id or "")[0].metadata_json or "{}")
+            self.assertEqual(metadata["answer_status"], "success")
+            self.assertEqual(metadata["mode"], "quick")
+            self.assertTrue(metadata["insufficient_evidence"])
 
     def test_answer_service_can_use_formal_frontend_scope_without_changing_default(self) -> None:
         with TemporaryDirectory() as temporary_directory:

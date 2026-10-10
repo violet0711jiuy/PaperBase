@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from .contracts import (
     CandidateAssessment,
     CandidateDisposition,
@@ -21,25 +19,11 @@ from .contracts import (
     QueryScope,
     ResearchObservation,
 )
-
-
-@dataclass(frozen=True)
-class CoveragePolicy:
-    candidate_min_queries_per_paper: int = 1
-    exhaustive_min_queries_per_paper: int = 2
-
-    def __post_init__(self) -> None:
-        if self.candidate_min_queries_per_paper < 1:
-            raise ValueError("候选验证的单篇最少查询数必须大于零。")
-        if self.exhaustive_min_queries_per_paper < 1:
-            raise ValueError("穷举策略的单篇最少查询数必须大于零。")
+from .grounding import verified_support_ids
 
 
 class CoverageManager:
     """Coverage 是可重算的派生状态，不把“未找到”表达成事实不存在。"""
-
-    def __init__(self, policy: CoveragePolicy | None = None) -> None:
-        self._policy = policy or CoveragePolicy()
 
     def evaluate(
         self,
@@ -63,8 +47,6 @@ class CoverageManager:
         assessments = tuple(
             self._assess_paper(
                 paper_id,
-                strategy=strategy,
-                shallow=paper_id in set(uncertain_ids),
                 evidence=evidence,
                 observations=observations,
             )
@@ -75,13 +57,8 @@ class CoverageManager:
             assessments=assessments,
             strategy=strategy,
             candidate_paper_ids=candidate_ids,
-            screened_paper_ids=(selection.screened_paper_ids if selection else ()),
             uncertain_paper_ids=uncertain_ids,
             excluded_paper_ids=(selection.excluded_paper_ids if selection else ()),
-            discovery_completed=(
-                selection is not None
-                and set(selection.screened_paper_ids) == set(scope_ids)
-            ),
         )
 
     @staticmethod
@@ -122,8 +99,6 @@ class CoverageManager:
         self,
         paper_id: str,
         *,
-        strategy: CoverageStrategy,
-        shallow: bool,
         evidence: tuple[EvidenceRecord, ...],
         observations: tuple[ResearchObservation, ...],
     ) -> PaperAssessment:
@@ -147,24 +122,19 @@ class CoverageManager:
                 for claim in record.claims
             )
         )
-        minimum = (
-            1
-            if shallow
-            else (
-                self._policy.exhaustive_min_queries_per_paper
-                if strategy is CoverageStrategy.EXHAUSTIVE
-                else self._policy.candidate_min_queries_per_paper
-            )
-        )
         direct_verified_outside_discovery = any(
-            any(tool != "search_knowledge_base" for tool in record.originating_tools)
+            not record.originating_tools
+            or any(tool != "search_knowledge_base" for tool in record.originating_tools)
             for record in direct
         )
-        direct_ready = len(queries) >= minimum or (
-            strategy is CoverageStrategy.CANDIDATE_VERIFICATION
-            and direct_verified_outside_discovery
+        projected_support = tuple(
+            record
+            for record in records
+            if record.analysis_status is EvidenceAnalysisStatus.QUALIFIED
+            and bool(record.projections)
+            and verified_support_ids(record)
         )
-        if direct and direct_ready:
+        if direct and direct_verified_outside_discovery:
             return PaperAssessment(
                 paper_id=paper_id,
                 status=PaperAssessmentStatus.POSITIVE,
@@ -172,18 +142,26 @@ class CoverageManager:
                 evidence_ids=tuple(record.evidence_id for record in direct),
                 rationale="已找到并标注为本文直接证据的内容。",
             )
+        if projected_support:
+            return PaperAssessment(
+                paper_id=paper_id,
+                status=PaperAssessmentStatus.POSITIVE,
+                queries_tried=queries,
+                evidence_ids=tuple(record.evidence_id for record in projected_support),
+                rationale="已找到支持当前 Requirement 的结构化 Projection。",
+            )
         all_evidence_ids = tuple(record.evidence_id for record in records)
-        if len(queries) < minimum:
+        if not queries:
             return PaperAssessment(
                 paper_id=paper_id,
                 status=(
                     PaperAssessmentStatus.CANDIDATE
-                    if queries or records
+                    if records
                     else PaperAssessmentStatus.UNVISITED
                 ),
                 queries_tried=queries,
                 evidence_ids=all_evidence_ids,
-                rationale=f"尚未达到当前策略要求的 {minimum} 次论文级查询。",
+                rationale="尚未执行论文级正文查询。",
             )
         uncertain = any(
             record.analysis_status
@@ -194,7 +172,7 @@ class CoverageManager:
                 for claim in record.claims
             )
             for record in records
-        )
+        ) or bool(direct)
         if uncertain:
             return PaperAssessment(
                 paper_id=paper_id,

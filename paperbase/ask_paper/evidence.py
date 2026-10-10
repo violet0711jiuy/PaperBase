@@ -30,7 +30,7 @@ class WorkspaceSectionEvidenceExpander:
         }
 
     def expand(self, result: RetrievalResult) -> ExpansionResult:
-        """正文按同一 section_id 连续扩展；bibliography 始终保持单条 R 证据。"""
+        """正文按同一 section_id 连续扩展；bibliography 始终保持单条 REF 证据。"""
         content_seeds = tuple(chunk for chunk in result.chunks if chunk.section_type == "content")
         bibliography = tuple(chunk for chunk in result.chunks if chunk.section_type == "bibliography")
         groups = self._groups(content_seeds)
@@ -52,7 +52,7 @@ class WorkspaceSectionEvidenceExpander:
             ))
         references = tuple(
             EvidenceUnit(
-                evidence_id=f"R{index}", kind="bibliography", paper_id=self._snapshot.paper_id,
+                evidence_id=f"REF{index}", kind="bibliography", paper_id=self._snapshot.paper_id,
                 paper_title=chunk.paper_title or self._title, section=chunk.section or "References",
                 page_start=chunk.page_start, page_end=chunk.page_end, seed_chunk_ids=(chunk.chunk_id,),
                 chunk_ids=(chunk.chunk_id,), text=chunk.raw_text,

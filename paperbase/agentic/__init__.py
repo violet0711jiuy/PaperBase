@@ -2,6 +2,7 @@
 
 from .contracts import (
     AgentAction,
+    ActionRejectionContext,
     CandidateAssessment,
     CandidateDisposition,
     CandidateSelection,
@@ -13,6 +14,13 @@ from .contracts import (
     EvidenceAnalysisStatus,
     EvidenceClaim,
     EvidenceOwnership,
+    EvidenceProjectionType,
+    EnumerationProjection,
+    ComparisonProjection,
+    FactProjection,
+    MechanismProjection,
+    ProjectedEntity,
+    ProjectedEntityRole,
     EvidenceQualification,
     EvidenceRelation,
     EvidenceRecord,
@@ -26,10 +34,12 @@ from .contracts import (
     QueryScope,
     ResearchGoal,
     ResearchPlan,
+    ResearchRequirement,
+    RequirementState,
+    RequirementStatus,
     ResearchAnswer,
     ResearchRunResult,
     ResearchRunStatus,
-    ResearchSubtask,
     PaperAssessment,
     PaperAssessmentStatus,
     ScopeResolution,
@@ -47,15 +57,17 @@ from .candidate_selection import (
     PaperMetadata,
 )
 from .decision import LLMDecisionAgent, ScriptedDecisionAgent
-from .coverage import CoverageManager, CoveragePolicy
+from .coverage import CoverageManager
 from .evidence_registry import EvidenceRegistry
-from .evidence_analysis import EvidenceAnalysisResult, LLMEvidenceAnalyzer
+from .evidence_analysis import EvidenceAnalysisRequest, EvidenceAnalysisResult, EvidenceAnalyzer, LegacyEvidenceAnalyzerAdapter
+from .evidence_projection import LLMEvidenceProjector, ProjectionRequest
 from .evidence_analysis_cache import SQLiteEvidenceAnalysisCache
 from .evaluation import AgenticEvaluationReport, evaluate_research_result
 from .events import ResearchProgressEvent
 from .audit import (
     AUDIT_SCHEMA_VERSION,
     AgenticAuditSnapshot,
+    RequirementAudit,
     build_agentic_audit_snapshot,
 )
 from .factory import AgenticResearchConfigurationError, create_agentic_research_service
@@ -68,8 +80,6 @@ from .graph import (
 )
 from .planner import ResearchPlanner
 from .query_understanding import QueryUnderstandingService
-from .qualification import EvidenceQualificationManager
-from .runtime import ResearchRuntime
 from .scope_resolver import ScopeResolver, TrustedWorkspaceScope
 from .selector import FinalEvidenceSelector
 from .service import AgenticResearchBusyError, AgenticResearchService
@@ -77,23 +87,32 @@ from .tools import ResearchToolExecutor
 
 __all__ = [
     "AgentAction",
+    "ActionRejectionContext",
     "CandidateAssessment",
     "CandidateDisposition",
     "CandidateSelection",
     "CandidateSelectionResult",
     "CorpusScopeSnapshot",
     "CoverageManager",
-    "CoveragePolicy",
     "CoverageState",
     "CoverageStrategy",
     "EvidenceAnalysis",
     "EvidenceAnalysisCacheStats",
     "EvidenceAnalysisResult",
+    "EvidenceAnalysisRequest",
+    "EvidenceAnalyzer",
+    "LegacyEvidenceAnalyzerAdapter",
     "EvidenceAnalysisStatus",
     "EvidenceClaim",
     "EvidenceOwnership",
+    "EvidenceProjectionType",
+    "EnumerationProjection",
+    "ComparisonProjection",
+    "FactProjection",
+    "MechanismProjection",
+    "ProjectedEntity",
+    "ProjectedEntityRole",
     "EvidenceQualification",
-    "EvidenceQualificationManager",
     "EvidenceRelation",
     "EvidenceRecord",
     "EvidenceTarget",
@@ -109,9 +128,11 @@ __all__ = [
     "ResearchGoal",
     "ResearchAnswer",
     "ResearchPlan",
+    "ResearchRequirement",
+    "RequirementState",
+    "RequirementStatus",
     "ResearchRunResult",
     "ResearchRunStatus",
-    "ResearchSubtask",
     "PaperAssessment",
     "PaperAssessmentStatus",
     "ScopeResolution",
@@ -132,12 +153,12 @@ __all__ = [
     "LangGraphResearchWorkflow",
     "LLMDecisionAgent",
     "LLMCandidateSelector",
-    "LLMEvidenceAnalyzer",
+    "LLMEvidenceProjector",
+    "ProjectionRequest",
     "SQLiteEvidenceAnalysisCache",
     "PaperMetadata",
     "QueryUnderstandingService",
     "ResearchPlanner",
-    "ResearchRuntime",
     "ResearchToolExecutor",
     "ScopeResolver",
     "ScriptedDecisionAgent",
@@ -148,5 +169,6 @@ __all__ = [
     "ResearchProgressEvent",
     "AUDIT_SCHEMA_VERSION",
     "AgenticAuditSnapshot",
+    "RequirementAudit",
     "build_agentic_audit_snapshot",
 ]

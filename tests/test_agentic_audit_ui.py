@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from paperbase.agentic.audit import AgenticAuditSnapshot, BudgetAudit
-from app.pages.knowledge_base import _audit_status_message
+from app.pages.knowledge_base import _audit_status_message, _citation_ids
 
 
 def _snapshot(*, status: str, reason: str) -> AgenticAuditSnapshot:
@@ -50,3 +50,10 @@ def test_fatal_error_audit_preserves_completed_work_message() -> None:
 
     assert level == "error"
     assert "保留" in message
+
+
+def test_ui_extracts_e_and_ref_citations_but_not_requirements_or_native_numbers() -> None:
+    assert _citation_ids("Body [E1], reference [REF1], requirement [R1], native [2].") == (
+        "E1",
+        "REF1",
+    )

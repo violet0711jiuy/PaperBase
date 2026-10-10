@@ -3,11 +3,29 @@
 from __future__ import annotations
 
 import unittest
+import json
+from dataclasses import replace
 
 from paperbase.config import AnswerGenerationSettings, ContextExpansionSettings
 from paperbase.generation.answer_generator import GroundedAnswerGenerator
 from paperbase.generation.section_expander import EvidenceUnit, SectionAwareNeighborExpander
-from paperbase.prompts.answer_generation import ANSWER_GENERATION_SYSTEM_PROMPT
+from paperbase.prompts.answer_generation import (
+    ANSWER_GENERATION_SYSTEM_PROMPT, build_answer_generation_user_prompt,
+)
+
+
+def test_classic_and_agentic_supply_the_same_exact_citation_id_namespace():
+    evidence = tuple(EvidenceUnit(evidence_id=eid,kind='content' if eid=='E1' else 'bibliography',
+        paper_id='P',paper_title='P',section='s',page_start=1,page_end=1,
+        seed_chunk_ids=('c',),chunk_ids=('c',),text='A source fact.',token_count=4)
+        for eid in ('E1','REF1'))
+    for requirements, supports in (((), {}), ((('R1','a fact'),), {'R1':('E1','REF1')})):
+        prompt = build_answer_generation_user_prompt(query='a fact', evidence=evidence,
+            research_requirements=requirements, support_by_requirement=supports)
+        assert prompt.count('<allowed_evidence_ids>') == 1
+        allowed = json.loads(prompt.split('<allowed_evidence_ids>\n',1)[1].split('\n</allowed_evidence_ids>',1)[0])
+        assert allowed == ['E1','REF1']
+        assert ('<requirements_with_verified_support>' in prompt) == bool(requirements)
 from paperbase.retrieval.hybrid_retriever import RetrievedChunk, RetrievalResult
 from paperbase.retrieval.query_rewriter import QueryRewritePlan
 
@@ -149,7 +167,7 @@ class SectionAwareNeighborExpansionTests(unittest.TestCase):
         self.assertEqual(database.calls, [("paper-a", "3.2 Method")])
         self.assertEqual(result.content_evidence[0].chunk_ids, ("c1", "c2", "c3"))
         self.assertEqual(len(result.bibliography_evidence), 1)
-        self.assertEqual(result.bibliography_evidence[0].evidence_id, "R1")
+        self.assertEqual(result.bibliography_evidence[0].evidence_id, "REF1")
         self.assertEqual(result.bibliography_evidence[0].chunk_ids, ("reference-1",))
 
     def test_overlapping_windows_keep_all_reranker_seed_chunks(self) -> None:
@@ -217,6 +235,22 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
             ),
         )
 
+    def test_agentic_citation_bindings_use_selected_ids_and_preserve_source_numbers(self) -> None:
+        reference = replace(self._evidence()[0], evidence_id="REF7", kind="bibliography",
+                            text="[2] Review 2009. [3] SVR 2015.")
+        prompt = build_answer_generation_user_prompt(
+            query="Which papers?", evidence=(reference,),
+            research_requirements=(("R1", "Review"), ("R2", "SVR")),
+            support_by_requirement={"R1": ("REF7",), "R2": ("REF7",)},
+        )
+        binding_json = prompt.split("<evidence_citation_bindings>\n", 1)[1].split(
+            "\n</evidence_citation_bindings>", 1)[0]
+        self.assertEqual(json.loads(binding_json), [{"evidence_id": "REF7", "in_text_citation": "[REF7]"}])
+        self.assertIn("[2] Review 2009. [3] SVR 2015.", prompt)
+        # Classic input rendering is outside this Agentic change.
+        classic = build_answer_generation_user_prompt(query="Which papers?", evidence=(reference,))
+        self.assertNotIn("<evidence_citation_bindings>", classic)
+
     def test_uses_json_schema_and_accepts_only_known_citations(self) -> None:
         client = _FakeClient(
             ['{"direct_answer":"该方法使用动态图。[E1]","evidence_explanation":"证据说明其使用动态图。[E1]","reading_interpretation":"这表示动态图是该方法的核心机制。[E1]","citations":[" E1 ","E1"],"insufficient_evidence":false}']
@@ -235,10 +269,10 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
 
     def test_prompt_requests_reading_level_explanation(self) -> None:
         """回答提示词应要求解释推导与含义，而不是只复制一行检索结论。"""
-        self.assertIn("阅读式解释深度", ANSWER_GENERATION_SYSTEM_PROMPT)
-        self.assertIn("公式、复杂度或定量结果问题", ANSWER_GENERATION_SYSTEM_PROMPT)
-        self.assertIn("### 论文中的依据与推导", ANSWER_GENERATION_SYSTEM_PROMPT)
-        self.assertIn("无关证据同样属于证据不足", ANSWER_GENERATION_SYSTEM_PROMPT)
+        self.assertIn("说明 Evidence 能支持的对象、关键步骤、作用和输出", ANSWER_GENERATION_SYSTEM_PROMPT)
+        self.assertIn("指标和数值", ANSWER_GENERATION_SYSTEM_PROMPT)
+        self.assertIn('"evidence_explanation"', ANSWER_GENERATION_SYSTEM_PROMPT)
+        self.assertIn("不得引用无关 Evidence", ANSWER_GENERATION_SYSTEM_PROMPT)
 
     def test_rejects_fabricated_citation_and_falls_back_to_evidence(self) -> None:
         client = _FakeClient(

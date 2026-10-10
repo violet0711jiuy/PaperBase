@@ -10,12 +10,19 @@ from paperbase.retrieval.contracts import (
 )
 
 from .contracts import (
+    AgentAction,
     EvidenceAnalysis,
-    EvidenceQualification,
+    EvidenceAnalysisStatus,
     EvidenceRecord,
     RegistryDelta,
     RegistryState,
+    ResearchPlan,
+    SearchPapersAction,
 )
+
+from .requirement_targets import targets_for_requirement_ids, requirement_target_bindings
+from .evidence_analysis import requires_analysis, projection_requirement_scope
+from .grounding import verified_support_ids
 
 
 class EvidenceRegistry:
@@ -37,14 +44,17 @@ class EvidenceRegistry:
         self,
         result: ToolResult,
         *,
+        action: AgentAction,
         iteration: int,
         supporting_queries: tuple[str, ...] = (),
-        target_subtask_ids: tuple[str, ...] = (),
+        plan: ResearchPlan | None = None,
     ) -> RegistryDelta:
+        if plan is not None:
+            requirement_target_bindings(plan, action)  # validate all before Registry mutation
         added: list[str] = []
         reused: list[str] = []
-        for evidence, query, targets, missing, subtask_id in _evidence_with_queries(
-            result, supporting_queries
+        for evidence, query, targets, requirement_ids in _evidence_with_queries(
+            result, action, supporting_queries, plan
         ):
             key = _evidence_key(evidence)
             storage_key = key
@@ -69,21 +79,15 @@ class EvidenceRegistry:
                     originating_tools=tuple(
                         dict.fromkeys((*current.originating_tools, result.tool_name.value))
                     ),
-                    target_subtask_ids=tuple(
-                        dict.fromkeys(
-                            (
-                                *current.target_subtask_ids,
-                                *target_subtask_ids,
-                                *((subtask_id,) if subtask_id else ()),
-                            )
-                        )
+                    requested_evidence_targets=(
+                        targets_for_requirement_ids(plan, tuple(
+                            rid for rid in dict.fromkeys((*current.requested_requirement_ids, *requirement_ids))
+                            if rid in {item.requirement_id for item in plan.requirements}
+                        )) if plan is not None else frozenset((*current.requested_evidence_targets, *targets))
                     ),
-                    requested_evidence_targets=frozenset(
-                        (*current.requested_evidence_targets, *targets)
-                    ),
-                    requested_missing_information=tuple(
+                    requested_requirement_ids=tuple(
                         dict.fromkeys(
-                            (*current.requested_missing_information, *missing)
+                            (*current.requested_requirement_ids, *requirement_ids)
                         )
                     ),
                 )
@@ -91,7 +95,7 @@ class EvidenceRegistry:
                 continue
             if evidence.source_type.value == "bibliography":
                 self._reference_counter += 1
-                evidence_id = f"R{self._reference_counter}"
+                evidence_id = f"REF{self._reference_counter}"
             else:
                 self._content_counter += 1
                 evidence_id = f"E{self._content_counter}"
@@ -102,21 +106,16 @@ class EvidenceRegistry:
                 first_seen_iteration=iteration,
                 last_seen_iteration=iteration,
                 originating_tools=(result.tool_name.value,),
-                target_subtask_ids=tuple(dict.fromkeys(target_subtask_ids)),
                 requested_evidence_targets=frozenset(targets),
-                requested_missing_information=tuple(missing),
+                requested_requirement_ids=tuple(requirement_ids),
             )
-            if subtask_id:
-                current_record = self._records_by_key[key]
-                self._records_by_key[key] = replace(
-                    current_record,
-                    target_subtask_ids=tuple(
-                        dict.fromkeys((*current_record.target_subtask_ids, subtask_id))
-                    ),
-                )
             added.append(evidence_id)
         return RegistryDelta(
-            tuple(dict.fromkeys(added)), tuple(dict.fromkeys(reused))
+            tuple(dict.fromkeys(added)), tuple(dict.fromkeys(reused)),
+            tuple(dict.fromkeys((*added, *(
+                eid for eid in reused if plan is not None
+                and requires_analysis(self.get(eid), plan)
+            )))),
         )
 
     def _find_overlapping_record(
@@ -137,27 +136,8 @@ class EvidenceRegistry:
             None,
         )
 
-    def apply_qualifications(
-        self, qualifications: tuple[EvidenceQualification, ...]
-    ) -> tuple[str, ...]:
-        """把 Agent 标注写回已登记证据；拒绝未知或重复的 Evidence ID。"""
-        evidence_ids = [item.evidence_id for item in qualifications]
-        if len(evidence_ids) != len(set(evidence_ids)):
-            raise ValueError("同一轮 Qualification 不能重复标注同一 Evidence。")
-        records_by_id = {record.evidence_id: record for record in self._records_by_key.values()}
-        unknown_ids = tuple(
-            evidence_id for evidence_id in evidence_ids if evidence_id not in records_by_id
-        )
-        if unknown_ids:
-            raise ValueError("Qualification 引用了未知 Evidence：" + ", ".join(unknown_ids))
-        for qualification in qualifications:
-            current = records_by_id[qualification.evidence_id]
-            key = _evidence_key(current.evidence)
-            self._records_by_key[key] = replace(current, qualification=qualification)
-        return tuple(evidence_ids)
-
     def apply_analyses(
-        self, analyses: tuple[EvidenceAnalysis, ...]
+        self, analyses: tuple[EvidenceAnalysis, ...], *, plan: ResearchPlan | None = None
     ) -> tuple[str, ...]:
         """把独立 Evidence Analysis 原子写回 Registry。"""
         evidence_ids = [item.evidence_id for item in analyses]
@@ -175,20 +155,27 @@ class EvidenceRegistry:
             raise ValueError(
                 "Evidence Analysis 引用了未知 Evidence：" + ", ".join(unknown_ids)
             )
+        replacements = []
         for analysis in analyses:
             current = records_by_id[analysis.evidence_id]
+            # A failed reanalysis must leave the last successful assessment intact.
+            if (analysis.status in {EvidenceAnalysisStatus.FAILED, EvidenceAnalysisStatus.PENDING}
+                    and current.analysis_status in {EvidenceAnalysisStatus.QUALIFIED, EvidenceAnalysisStatus.IRRELEVANT}):
+                continue
+            candidate = replace(current, assessment=analysis)
+            requirements = plan.requirements if plan is not None else ()
+            if not set(verified_support_ids(current, requirements)).issubset(
+                    verified_support_ids(candidate, requirements)):
+                continue
+            if plan is not None:
+                if analysis.evaluated_requirement_ids and not set(analysis.evaluated_requirement_ids).issubset(
+                        projection_requirement_scope(current, plan)):
+                    raise ValueError("Successful analysis evaluated scope must belong to Evidence-local scope.")
+            replacements.append((current, analysis))
+        for current, analysis in replacements:
             key = _evidence_key(current.evidence)
-            self._records_by_key[key] = replace(
-                current,
-                analysis_status=analysis.status,
-                digest=analysis.digest,
-                claims=analysis.claims,
-                covered_targets=analysis.covered_targets,
-                addressed_information=analysis.addressed_information,
-                analysis_error=analysis.error_code,
-                qualification=None,
-            )
-        return tuple(evidence_ids)
+            self._records_by_key[key] = replace(current, assessment=analysis)
+        return tuple(analysis.evidence_id for _, analysis in replacements)
 
     def snapshot(self) -> RegistryState:
         return RegistryState(
@@ -199,18 +186,28 @@ class EvidenceRegistry:
 
 
 def _evidence_with_queries(
-    result: ToolResult, fallback_queries: tuple[str, ...]
+    result: ToolResult, action: AgentAction, fallback_queries: tuple[str, ...],
+    plan: ResearchPlan | None = None,
 ):
+    if result.tool_name.value != action.action_name:
+        raise ValueError("ToolResult and Action must refer to the same tool.")
     payload = result.payload
     if isinstance(payload, SearchPapersPayload):
-        for paper_result in payload.paper_results:
+        if not isinstance(action, SearchPapersAction) or len(payload.paper_results) != len(action.searches):
+            raise ValueError("search_papers outcomes must match the Action searches.")
+        if any(
+            (outcome.paper_id, outcome.query) != (search.paper_id, search.query)
+            for outcome, search in zip(payload.paper_results, action.searches)
+        ):
+            raise ValueError("search_papers outcome does not match its Action search.")
+        for paper_result, search in zip(payload.paper_results, action.searches):
             for evidence in paper_result.evidence_candidates:
                 yield (
                     evidence,
-                    paper_result.query,
-                    paper_result.evidence_targets,
-                    paper_result.missing_information,
-                    paper_result.target_subtask_id,
+                    search.query,
+                    targets_for_requirement_ids(plan, search.requirement_ids)
+                    if plan is not None else search.evidence_targets,
+                    search.requirement_ids,
                 )
         return
     query = getattr(payload, "query", "")
@@ -218,9 +215,9 @@ def _evidence_with_queries(
         yield (
             evidence,
             query or (fallback_queries[0] if fallback_queries else ""),
-            frozenset(),
-            (),
-            None,
+            targets_for_requirement_ids(plan, getattr(action, "requirement_ids", ()))
+            if plan is not None else frozenset(),
+            getattr(action, "requirement_ids", ()),
         )
 
 

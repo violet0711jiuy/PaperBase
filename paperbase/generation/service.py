@@ -114,6 +114,16 @@ class AnswerService:
                     answer.citations,
                     answer_status=answer.status,
                 ),
+                metadata_json=json.dumps(
+                    {
+                        "answer_status": answer.status,
+                        "insufficient_evidence": answer.insufficient_evidence,
+                        "partial_answer": answer.partial_answer,
+                        "coverage_note": answer.coverage_note,
+                        "mode": "quick",
+                    },
+                    ensure_ascii=False,
+                ),
             )
         return AnswerServiceResult(
             retrieval=retrieval,
@@ -162,7 +172,7 @@ def _evidence_snapshot_json(
     if answer_status in {"needs_clarification", "insufficient_evidence"}:
         return None
     citation_set = set(citations)
-    # 正常生成答案时只落正文实际引用的 E#/R#；无引用的降级答案仍保留检索到的
+    # 正常生成答案时只落正文实际引用的 E#/REF#；无引用的降级答案仍保留检索到的
     # 用户可读证据，方便“回答生成未启用”时查看原文。
     selected_evidence = (
         tuple(item for item in expansion.evidence if item.evidence_id in citation_set)

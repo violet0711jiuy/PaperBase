@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from inspect import signature
 from types import SimpleNamespace
+import json
 
 from app.services.paperbase_service import (
     FORMAL_KNOWLEDGE_BASE_SCOPE_ID,
@@ -63,6 +64,10 @@ def test_kb_answer_service_receives_query_and_persists_real_evidence_snapshot(tm
     assert evidence[0].page_start == 3
     assert evidence[0].page_end is None
     assert evidence[0].text == "真实证据原文"
+    metadata = service.get_conversation_turn_metadata(turns[0])
+    assert metadata is not None
+    assert metadata.mode == "quick"
+    assert not service._answer_artifact_path(conversation.conversation_id, 0).exists()
 
 
 def test_kb_scope_does_not_accept_default_or_workspace_conversation(tmp_path) -> None:
@@ -78,6 +83,40 @@ def test_kb_scope_does_not_accept_default_or_workspace_conversation(tmp_path) ->
             assert "scope" in str(error).lower()
         else:
             raise AssertionError("cross-scope conversation must be rejected")
+
+
+def test_legacy_kb_sidecar_remains_readable(tmp_path) -> None:
+    service = PaperBaseService(_temporary_settings(tmp_path))
+    conversation = service.create_kb_conversation()
+    turn = service._conversations.append_turn(  # type: ignore[attr-defined]
+        conversation.conversation_id,
+        user_query="旧问题",
+        assistant_answer="旧回答 [E1]",
+    )
+    path = service._answer_artifact_path(conversation.conversation_id, turn.turn_index)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "conversation_id": conversation.conversation_id,
+        "turn_index": turn.turn_index,
+        "answer_status": "success",
+        "partial_answer": True,
+        "coverage_note": "只覆盖一篇论文。",
+        "evidence": [{
+            "evidence_id": "E1",
+            "type": "content",
+            "paper_title": "旧论文",
+            "raw_text": "旧证据",
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    restored = service.get_conversation_turns(conversation.conversation_id)[0]
+    metadata = service.get_conversation_turn_metadata(restored)
+    evidence = service.get_conversation_turn_evidence(restored)
+
+    assert metadata is not None
+    assert metadata.partial_answer
+    assert metadata.coverage_note == "只覆盖一篇论文。"
+    assert evidence[0].text == "旧证据"
 
 
 def test_agentic_stream_persists_answer_thread_and_evidence(tmp_path) -> None:
@@ -108,6 +147,8 @@ def test_agentic_stream_persists_answer_thread_and_evidence(tmp_path) -> None:
     assert metadata is not None
     assert metadata.mode == "agentic"
     assert metadata.thread_id == "research-test"
+    assert turn.metadata_json is not None
+    assert not service._answer_artifact_path(conversation.conversation_id, 0).exists()
     audit = service.get_conversation_turn_audit(turn)
     assert audit is not None
     assert audit.thread_id == "research-test"
@@ -158,13 +199,6 @@ class _FakeAnswerService:
 
     def answer_query(self, query: str, *, conversation_id: str) -> object:
         self.calls.append((query, conversation_id))
-        self.store.append_turn(
-            conversation_id,
-            user_query=query,
-            assistant_answer="回答 [E1]",
-            resolved_query=query,
-            resolution_status="resolved",
-        )
         evidence = SimpleNamespace(
             evidence_id="E1",
             kind="content",
@@ -173,6 +207,29 @@ class _FakeAnswerService:
             page_start=3,
             page_end=None,
             text="真实证据原文",
+        )
+        self.store.append_turn(
+            conversation_id,
+            user_query=query,
+            assistant_answer="回答 [E1]",
+            resolved_query=query,
+            resolution_status="resolved",
+            evidence_json=json.dumps([{
+                "evidence_id": evidence.evidence_id,
+                "type": evidence.kind,
+                "paper_title": evidence.paper_title,
+                "section": evidence.section,
+                "page_start": evidence.page_start,
+                "page_end": evidence.page_end,
+                "raw_text": evidence.text,
+            }], ensure_ascii=False),
+            metadata_json=json.dumps({
+                "answer_status": "success",
+                "insufficient_evidence": False,
+                "partial_answer": False,
+                "coverage_note": None,
+                "mode": "quick",
+            }),
         )
         return SimpleNamespace(
             conversation_id=conversation_id,

@@ -12,6 +12,7 @@ from paperbase.agentic.contracts import (
     ScopeSource,
 )
 from paperbase.config import AgenticResearchSettings
+from paperbase.agentic.guards import BudgetAndGuardTracker
 
 
 class AgenticContractTests(unittest.TestCase):
@@ -28,19 +29,19 @@ class AgenticContractTests(unittest.TestCase):
                 default_evidence_targets=frozenset({EvidenceTarget.GENERAL}),
             )
 
-    def test_program_owned_flags_cannot_disagree_with_semantics(self) -> None:
-        with self.assertRaisesRegex(ValueError, "requires_complete_coverage"):
-            QueryContext(
-                original_query="all",
-                resolved_query="all",
-                intent=Intent.RETRIEVE,
-                scope=QueryScope.SINGLE_PAPER,
-                target_paper_ids=("A",),
-                scope_source=ScopeSource.UI_SELECTION,
-                retrieval_goal=ResearchGoal.EXHAUSTIVE_ENUMERATION,
-                default_evidence_targets=frozenset({EvidenceTarget.GENERAL}),
-                requires_complete_coverage=False,
-            )
+    def test_program_owned_flags_are_derived_from_context(self) -> None:
+        context = QueryContext(
+            original_query="all",
+            resolved_query="all",
+            intent=Intent.RETRIEVE,
+            scope=QueryScope.SINGLE_PAPER,
+            target_paper_ids=("A",),
+            scope_source=ScopeSource.UI_SELECTION,
+            retrieval_goal=ResearchGoal.EXHAUSTIVE_ENUMERATION,
+            default_evidence_targets=frozenset({EvidenceTarget.REFERENCE}),
+        )
+        self.assertTrue(context.requires_complete_coverage)
+        self.assertTrue(context.search_bibliography)
 
     def test_corpus_snapshot_is_membership_stable(self) -> None:
         first = CorpusScopeSnapshot.create(("B", "A"))
@@ -54,7 +55,16 @@ class AgenticContractTests(unittest.TestCase):
         settings = AgenticResearchSettings(max_agent_iterations=3)
         self.assertEqual(settings.max_agent_iterations, 3)
         with self.assertRaises(ValueError):
-            AgenticResearchSettings(max_tool_calls=0)
+            AgenticResearchSettings(final_evidence_max_units=0)
+
+    def test_llm_call_count_is_observable_but_does_not_stop_loop(self) -> None:
+        tracker = BudgetAndGuardTracker(
+            AgenticResearchSettings(max_agent_iterations=2),
+            initial_llm_calls=10_000,
+        )
+
+        self.assertTrue(tracker.can_decide().accepted)
+        self.assertEqual(tracker.usage().llm_calls, 10_000)
 
 
 if __name__ == "__main__":

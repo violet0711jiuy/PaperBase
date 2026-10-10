@@ -1,31 +1,19 @@
-"""独立的 Claim 级 Evidence Analysis，不再把证据审核塞进 Decision。"""
+"""证据分析器共享的运行期结果契约。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
-
-from paperbase.llm.client import (
-    ChatCompletionClient,
-    LLMCompletion,
-    complete_json_with_diagnostics,
-)
-from paperbase.prompts.evidence_analysis import (
-    EVIDENCE_ANALYSIS_SYSTEM_PROMPT,
-    build_evidence_analysis_user_prompt,
-)
 
 from .contracts import (
     EvidenceAnalysis,
     EvidenceAnalysisCacheStats,
-    EvidenceAnalysisStatus,
-    EvidenceClaim,
     EvidenceRecord,
     LLMCallRecord,
+    EvidenceAnalysisStatus,
+    QueryContext,
+    ResearchPlan,
 )
-from .evidence_analysis_cache import SQLiteEvidenceAnalysisCache
-from paperbase.llm.diagnostics import failure_record, repair_hint, success_record
-from .schemas import EvidenceAnalysisBatchDraft
 
 
 @dataclass(frozen=True)
@@ -36,226 +24,108 @@ class EvidenceAnalysisResult:
     cache_stats: EvidenceAnalysisCacheStats = EvidenceAnalysisCacheStats()
 
 
+def projection_requirement_scope(record: EvidenceRecord, plan: ResearchPlan) -> tuple[str, ...]:
+    """Binding is the scope authority; Plan order makes grouping deterministic."""
+    requested = set(record.requested_requirement_ids)
+    return tuple(item.requirement_id for item in plan.requirements
+                 if item.requirement_id in requested)
+
+
+def requires_analysis(record: EvidenceRecord, plan: ResearchPlan) -> bool:
+    return (record.analysis_status is EvidenceAnalysisStatus.PENDING
+            or bool(set(projection_requirement_scope(record, plan))
+                    - set(record.assessment.evaluated_requirement_ids)))
+
+
+@dataclass(frozen=True)
+class EvidenceAnalysisRequest:
+    question: str
+    evidence: tuple[EvidenceRecord, ...]
+    context: QueryContext
+    plan: ResearchPlan
+    requirement_scopes: tuple[tuple[str, tuple[str, ...]], ...]
+
+    def __post_init__(self) -> None:
+        evidence = tuple(self.evidence)
+        ids = tuple(record.evidence_id for record in evidence)
+        scopes = tuple((eid, tuple(rids)) for eid, rids in self.requirement_scopes)
+        scope_ids = tuple(eid for eid, _ in scopes)
+        if len(set(ids)) != len(ids) or len(set(scope_ids)) != len(scope_ids):
+            raise ValueError("EvidenceAnalysisRequest requires unique Evidence IDs/scopes.")
+        if set(ids) != set(scope_ids):
+            raise ValueError("Each input Evidence requires exactly one projection scope.")
+        known = {item.requirement_id for item in self.plan.requirements}
+        by_id = dict(scopes)
+        for record in evidence:
+            scope = by_id[record.evidence_id]
+            if not scope or len(scope) != len(set(scope)) or not set(scope).issubset(known):
+                raise ValueError("Projection scope must be nonempty, unique and belong to Plan.")
+            if set(scope) != set(projection_requirement_scope(record, self.plan)):
+                raise ValueError("Projection scope must equal Evidence-local binding intersect Plan.")
+        object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "requirement_scopes", tuple(
+            (record.evidence_id, projection_requirement_scope(record, self.plan))
+            for record in evidence
+        ))
+
+    def scope_for(self, evidence_id: str) -> tuple[str, ...]:
+        for eid, scope in self.requirement_scopes:
+            if eid == evidence_id:
+                return scope
+        raise KeyError(evidence_id)
+
+
 class EvidenceAnalyzer(Protocol):
     def analyze(
-        self, *, question: str, evidence: tuple[EvidenceRecord, ...]
+        self, *, request: EvidenceAnalysisRequest
     ) -> EvidenceAnalysisResult: ...
 
 
-class LLMEvidenceAnalyzer:
-    """按有界 Batch 分析新 Evidence；失败项保持 fail-closed。"""
-
-    def __init__(
-        self,
-        client: ChatCompletionClient,
-        *,
-        batch_size: int = 4,
-        max_content_chars: int = 1_200,
-        max_attempts: int = 2,
-        cache: SQLiteEvidenceAnalysisCache | None = None,
-    ) -> None:
-        if batch_size < 1 or max_content_chars < 100 or max_attempts < 1:
-            raise ValueError("Evidence Analysis limits must be positive.")
-        self._client = client
-        self._batch_size = batch_size
-        self._max_content_chars = max_content_chars
-        self._max_attempts = max_attempts
-        self._cache = cache
-
-    def analyze(
-        self, *, question: str, evidence: tuple[EvidenceRecord, ...]
-    ) -> EvidenceAnalysisResult:
-        pending = tuple(
-            item
-            for item in evidence
-            if item.analysis_status is EvidenceAnalysisStatus.PENDING
-        )
-        analyses_by_id: dict[str, EvidenceAnalysis] = {}
-        llm_calls = 0
-        diagnostics: list[LLMCallRecord] = []
-        cache_stats = EvidenceAnalysisCacheStats()
-        uncached: list[EvidenceRecord] = []
-        for item in pending:
-            if self._cache is None:
-                uncached.append(item)
-                continue
-            lookup = self._cache.lookup(question=question, record=item)
-            if lookup.analysis is not None:
-                analyses_by_id[item.evidence_id] = lookup.analysis
-                cache_stats = cache_stats + EvidenceAnalysisCacheStats(hits=1)
-            else:
-                uncached.append(item)
-                cache_stats = cache_stats + EvidenceAnalysisCacheStats(
-                    misses=1, errors=int(lookup.error)
-                )
-        uncached_tuple = tuple(uncached)
-        for offset in range(0, len(uncached_tuple), self._batch_size):
-            batch = uncached_tuple[offset : offset + self._batch_size]
-            errors: list[str] = []
-            accepted: tuple[EvidenceAnalysis, ...] | None = None
-            content_limit = self._max_content_chars
-            for attempt in range(1, self._max_attempts + 1):
-                llm_calls += 1
-                completion: LLMCompletion | None = None
-                try:
-                    completion = complete_json_with_diagnostics(
-                        self._client,
-                        system_prompt=EVIDENCE_ANALYSIS_SYSTEM_PROMPT,
-                        user_prompt=build_evidence_analysis_user_prompt(
-                            {
-                                "question": question,
-                                "evidence": [
-                                    _payload(item, content_limit) for item in batch
-                                ],
-                                "previous_validation_errors": errors[-1:],
-                            }
-                        ),
-                        json_schema=EvidenceAnalysisBatchDraft.model_json_schema(),
-                        schema_name="paperbase_evidence_analysis",
-                    )
-                    draft = EvidenceAnalysisBatchDraft.model_validate_json(
-                        completion.content
-                    )
-                    accepted = _convert_and_validate(batch, draft)
-                    diagnostics.append(
-                        success_record(
-                            node="analyze_evidence",
-                            attempt=attempt,
-                            completion=completion,
-                        )
-                    )
-                    break
-                except Exception as error:
-                    record = failure_record(
-                        node="analyze_evidence",
-                        attempt=attempt,
-                        error=error,
-                        completion=completion,
-                        can_retry=attempt < self._max_attempts,
-                    )
-                    diagnostics.append(record)
-                    errors.append(repair_hint(error))
-                    if record.recovery_action == "compact_context":
-                        content_limit = max(100, content_limit // 2)
-            if accepted is not None:
-                for analysis in accepted:
-                    analyses_by_id[analysis.evidence_id] = analysis
-                    if self._cache is not None:
-                        record = next(
-                            item
-                            for item in batch
-                            if item.evidence_id == analysis.evidence_id
-                        )
-                        wrote = self._cache.put(
-                            question=question,
-                            record=record,
-                            analysis=analysis,
-                        )
-                        cache_stats = cache_stats + EvidenceAnalysisCacheStats(
-                            writes=int(wrote), errors=int(not wrote)
-                        )
-            else:
-                error_code = (
-                    diagnostics[-1].error_stage if diagnostics else None
-                ) or "EvidenceAnalysisFailed"
-                for item in batch:
-                    analyses_by_id[item.evidence_id] = EvidenceAnalysis(
-                        evidence_id=item.evidence_id,
-                        status=EvidenceAnalysisStatus.FAILED,
-                        error_code=error_code,
-                    )
-        return EvidenceAnalysisResult(
-            tuple(analyses_by_id[item.evidence_id] for item in pending),
-            llm_calls,
-            tuple(diagnostics),
-            cache_stats,
-        )
+class LegacyEvidenceAnalyzer(Protocol):
+    def analyze(self, *, question: str, evidence: tuple[EvidenceRecord, ...]) -> EvidenceAnalysisResult: ...
 
 
-def _payload(record: EvidenceRecord, max_content_chars: int) -> dict[str, object]:
-    source = record.evidence
-    return {
-        "evidence_id": record.evidence_id,
-        "paper_id": source.paper_id,
-        "paper_title": source.paper_title,
-        "section": source.section,
-        "pages": [source.page_start, source.page_end],
-        "requested_evidence_targets": sorted(
-            target.value for target in record.requested_evidence_targets
-        ),
-        "requested_missing_information": list(
-            record.requested_missing_information
-        ),
-        "content": source.content[:max_content_chars],
-    }
+class LegacyEvidenceAnalyzerAdapter:
+    """Explicit construction-time compatibility; claims cannot attest a task scope."""
+
+    def __init__(self, analyzer: LegacyEvidenceAnalyzer) -> None:
+        self._analyzer = analyzer
+
+    def analyze(self, *, request: EvidenceAnalysisRequest) -> EvidenceAnalysisResult:
+        result = self._analyzer.analyze(question=request.question, evidence=request.evidence)
+        return replace(result, analyses=tuple(
+            replace(item, evaluated_requirement_ids=()) for item in result.analyses
+        ))
 
 
-def _convert_and_validate(
-    records: tuple[EvidenceRecord, ...], draft: EvidenceAnalysisBatchDraft
-) -> tuple[EvidenceAnalysis, ...]:
-    expected = [item.evidence_id for item in records]
-    actual = [item.evidence_id for item in draft.analyses]
-    if len(actual) != len(set(actual)) or set(actual) != set(expected):
-        raise ValueError("Evidence Analysis 必须完整且不重复地返回输入 evidence_id。")
-    by_id = {item.evidence_id: item for item in records}
-    converted: list[EvidenceAnalysis] = []
-    for item in draft.analyses:
-        record = by_id[item.evidence_id]
-        covered_targets = frozenset(item.covered_targets)
-        addressed_information = tuple(dict.fromkeys(item.addressed_information))
-        if not covered_targets.issubset(record.requested_evidence_targets):
-            raise ValueError(
-                f"{item.evidence_id} 的 covered_targets 只能来自 requested_evidence_targets。"
-            )
-        if not set(addressed_information).issubset(
-            set(record.requested_missing_information)
-        ):
-            raise ValueError(
-                f"{item.evidence_id} 的 addressed_information 只能逐项复制 requested_missing_information。"
-            )
-        if item.status == "irrelevant":
-            if item.claims or covered_targets or addressed_information:
-                raise ValueError(
-                    "irrelevant Evidence 的 claims 与覆盖字段必须为空。"
-                )
-            converted.append(
-                EvidenceAnalysis(
-                    evidence_id=item.evidence_id,
-                    status=EvidenceAnalysisStatus.IRRELEVANT,
-                    digest=item.digest,
-                )
-            )
-            continue
-        if not item.claims:
-            raise ValueError("qualified Evidence 至少需要一条 Claim。")
-        claims: list[EvidenceClaim] = []
-        for index, claim in enumerate(item.claims, start=1):
-            if _fold(claim.source_excerpt) not in _fold(record.evidence.content):
-                raise ValueError(
-                    f"{item.evidence_id} 的 source_excerpt 不是原文连续片段。"
-                )
-            claims.append(
-                EvidenceClaim(
-                    claim_id=f"{item.evidence_id}:C{index}",
-                    statement=claim.statement,
-                    relation=claim.relation,
-                    ownership=claim.ownership,
-                    rationale=claim.rationale,
-                    source_excerpt=claim.source_excerpt,
-                )
-            )
-        converted.append(
-            EvidenceAnalysis(
-                evidence_id=item.evidence_id,
-                status=EvidenceAnalysisStatus.QUALIFIED,
-                digest=item.digest,
-                covered_targets=covered_targets,
-                addressed_information=addressed_information,
-                claims=tuple(claims),
-            )
-        )
-    return tuple(converted)
-
-
-def _fold(value: str) -> str:
-    return " ".join(value.split()).casefold()
+def merge_analysis_groups(record: EvidenceRecord, groups: tuple[EvidenceAnalysis, ...],
+                          plan: ResearchPlan) -> EvidenceAnalysis:
+    """Append successful missing-scope results; failed groups attest no evaluation."""
+    from .projection_reads import dedupe_projections
+    from .grounding import verified_support_ids
+    old = record.assessment
+    successful = tuple(item for item in groups if item.status in {
+        EvidenceAnalysisStatus.QUALIFIED, EvidenceAnalysisStatus.IRRELEVANT})
+    if not successful:
+        if old.status in {EvidenceAnalysisStatus.QUALIFIED, EvidenceAnalysisStatus.IRRELEVANT}:
+            return old
+        return EvidenceAnalysis(record.evidence_id, EvidenceAnalysisStatus.FAILED,
+                                error_code="EvidenceProjectionFailed")
+    projections = dedupe_projections((*old.projections,
+        *(projection for item in successful for projection in item.projections)))
+    evaluated = set(old.evaluated_requirement_ids)
+    evaluated.update(rid for item in successful for rid in item.evaluated_requirement_ids)
+    desired = set(projection_requirement_scope(record, plan))
+    if not evaluated.issubset(desired):
+        raise ValueError("Aggregate evaluated scope exceeds Evidence-local binding.")
+    candidate = EvidenceAnalysis(record.evidence_id,
+        EvidenceAnalysisStatus.QUALIFIED if projections else EvidenceAnalysisStatus.IRRELEVANT,
+        projections=projections,
+        evaluated_requirement_ids=tuple(r.requirement_id for r in plan.requirements if r.requirement_id in evaluated),
+        projection_rejections=tuple(dict.fromkeys((*old.projection_rejections,
+            *(reason for item in groups for reason in item.projection_rejections)))),
+    )
+    if not set(verified_support_ids(record, plan.requirements)).issubset(
+        verified_support_ids(replace(record, assessment=candidate), plan.requirements)):
+        raise ValueError("support_regression in aggregate merged assessment.")
+    return candidate

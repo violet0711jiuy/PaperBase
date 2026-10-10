@@ -16,16 +16,19 @@ from paperbase.llm.client import (
     ChatCompletionClient,
     LLMRequestError,
     LLMRuntimeSettings,
-    OpenAICompatibleChatClient,
+    create_chat_completion_client,
     load_llm_runtime_settings,
 )
 from paperbase.prompts.paper_overview import (
     PAPER_OVERVIEW_SYSTEM_PROMPT,
+    OVERVIEW_MISSING_CONTENT,
+    OVERVIEW_MISSING_TITLE,
     build_paper_overview_user_prompt,
 )
 
 
-_MISSING = "论文未明确说明"
+_MISSING = OVERVIEW_MISSING_CONTENT
+_LEGACY_MISSING = "论文未明确说明"
 _CORE_SECTION_ORDER = (
     "abstract",
     "introduction",
@@ -164,7 +167,7 @@ def run_paper_overview_stage(
     overview_runtime_settings = _with_overview_output_budget(
         runtime_settings, settings.paper_overview.max_output_tokens
     )
-    client = OpenAICompatibleChatClient(overview_runtime_settings)
+    client = create_chat_completion_client(overview_runtime_settings)
     return create_paper_overview(
         workspace_root=workspace_root,
         settings=settings.paper_overview,
@@ -301,10 +304,12 @@ def _validate_and_finalize_overview(
         unknown_ids = set(chunk_ids).difference(source_sections)
         if unknown_ids:
             raise ValueError(f"Overview references chunks outside the provided context: {unknown_ids}")
-        if content == _MISSING:
+        if content in {_MISSING, _LEGACY_MISSING}:
             if chunk_ids:
                 raise ValueError("A missing Overview field must not cite a chunk.")
-            return OverviewField(content=content)
+            # Normalize the documented legacy sentinel at generation only;
+            # existing saved artifacts are not rewritten or reinterpreted.
+            return OverviewField(content=_MISSING)
         if not chunk_ids:
             raise ValueError("A non-missing Overview field must cite at least one context chunk.")
         return OverviewField(
@@ -313,8 +318,9 @@ def _validate_and_finalize_overview(
             source_sections=_unique_strings(source_sections[chunk_id] for chunk_id in chunk_ids),
         )
 
-    expected_title = context.paper_title or _MISSING
-    if draft.paper_title.strip() != expected_title:
+    expected_title = context.paper_title or OVERVIEW_MISSING_TITLE
+    legacy_missing_title = not context.paper_title and draft.paper_title.strip() == _LEGACY_MISSING
+    if draft.paper_title.strip() != expected_title and not legacy_missing_title:
         raise ValueError("Overview paper_title must exactly match the workspace metadata.")
     return PaperOverview(
         paper_title=expected_title,

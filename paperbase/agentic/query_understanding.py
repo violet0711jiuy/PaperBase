@@ -16,7 +16,6 @@ from paperbase.prompts.agentic_query_understanding import (
     QUERY_UNDERSTANDING_SYSTEM_PROMPT,
     build_query_understanding_user_prompt,
 )
-from paperbase.retrieval.lexical_terms import extract_lexical_terms, merge_lexical_terms
 
 from .contracts import (
     EvidenceTarget,
@@ -88,10 +87,10 @@ class QueryUnderstandingService:
                 )
                 draft = fallback
                 used_fallback = True
-        deterministic_terms = extract_lexical_terms(query)
-        lexical = merge_lexical_terms(draft.lexical_keywords_en, deterministic_terms)
+        # The validated draft owns the advisory hints. Do not apply the Search
+        # compiler's independent quota or inject original-language query terms.
+        lexical = tuple(dict.fromkeys(term.strip() for term in draft.lexical_keywords_en if term.strip()))
         targets = frozenset(draft.evidence_targets)
-        # Bibliography 与 coverage 标志由程序语义派生，不能由模型直接设置。
         context = QueryContext(
             original_query=query,
             resolved_query=draft.resolved_query,
@@ -103,10 +102,6 @@ class QueryUnderstandingService:
             scope_source=resolution.scope_source,
             retrieval_goal=draft.retrieval_goal,
             default_evidence_targets=targets,
-            requires_complete_coverage=(
-                draft.retrieval_goal is ResearchGoal.EXHAUSTIVE_ENUMERATION
-            ),
-            search_bibliography=(EvidenceTarget.REFERENCE in targets),
         )
         return QueryUnderstandingResult(
             context, used_fallback, llm_calls, tuple(diagnostics)

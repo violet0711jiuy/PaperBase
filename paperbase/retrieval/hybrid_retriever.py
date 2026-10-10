@@ -13,9 +13,10 @@ from paperbase.embedding.base import QueryEmbedder
 from paperbase.indexing import FaissIndexStore
 from paperbase.reranking import Reranker
 
-from .contracts import QueryOrigin
+from .contracts import QueryOrigin, ScoreKind, ScoreDirection
 from .lexical_terms import extract_lexical_terms
-from .query_inputs import build_agent_supplied_plan
+from .requests import compile_paper_request, compile_kb_request, retriever_parameters
+from .query_inputs import plan_from_canonical
 from .query_rewriter import QueryPlanner, QueryRewritePlan, TrustedPaperScope
 
 
@@ -28,6 +29,8 @@ class RetrievalSourceMatch:
     rank: int
     raw_score: float
     effective_weight: float
+    score_kind: ScoreKind = ScoreKind.LEGACY_UNKNOWN
+    score_direction: ScoreDirection = ScoreDirection.NOT_APPLICABLE
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,8 @@ class RetrievedChunk:
     source_matches: tuple[RetrievalSourceMatch, ...]
     # 直属 Section 的稳定 ID；旧库或 front matter 允许为 None。
     section_id: str | None = None
+    # True=sigmoid [0,1], False=unscaled logits, None=unknown/not reranked.
+    rerank_score_normalized: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -116,16 +121,25 @@ class HybridRetriever:
         paper_ids: Sequence[str] | None = None,
         query_origin: QueryOrigin = QueryOrigin.INITIAL_UNDERSTANDING,
         lexical_terms: Sequence[str] = (),
+        canonical_request=None,
     ) -> RetrievalResult:
         """运行 resolved Dense、英文语义 Dense 与英文关键词 BM25 三路召回。"""
-        normalized_paper_ids = _normalize_paper_ids(paper_ids)
+        normalized_paper_ids = canonical_request.paper_ids if canonical_request is not None else _normalize_paper_ids(paper_ids)
+        if canonical_request is None and QueryOrigin(query_origin) is QueryOrigin.AGENT_SUPPLIED:
+            parameters = retriever_parameters(self)
+            if normalized_paper_ids is not None and len(normalized_paper_ids) == 1:
+                canonical_request = compile_paper_request(paper_id=normalized_paper_ids[0], query=query,
+                    lexical_terms=lexical_terms, top_k=result_limit or self._default_output_limit(include_bibliography=False),
+                    source="formal_knowledge_base", retrieval_parameters=parameters)
+            else:
+                canonical_request = compile_kb_request(paper_ids=normalized_paper_ids, query=query,
+                    lexical_terms=lexical_terms, top_k=result_limit or self._default_output_limit(include_bibliography=False),
+                    retrieval_parameters=parameters)
         # trusted_scope 是程序状态；conversation_context 只作为 Resolution 的普通待处理数据。
-        if QueryOrigin(query_origin) is QueryOrigin.AGENT_SUPPLIED:
-            plan = build_agent_supplied_plan(
-                query,
-                lexical_terms=lexical_terms,
-                max_lexical_terms=self._settings.query_rewrite.max_lexical_keywords_en,
-            )
+        if canonical_request is not None:
+            plan = plan_from_canonical(canonical_request)
+            result_limit = canonical_request.top_k
+            normalized_paper_ids = None if getattr(canonical_request, "scope", None) == "all" else canonical_request.paper_ids
         else:
             plan = self._query_planner.plan(
                 query,
@@ -141,6 +155,8 @@ class HybridRetriever:
                 reranking_status="not_run",
                 chunks=(),
             )
+        if normalized_paper_ids == ():
+            return RetrievalResult(query=plan.original_query, rewrite_plan=plan, reranking_status="not_run", chunks=())
         resolved_query = plan.resolved_query or plan.original_query
         candidates: dict[str, _Candidate] = {}
 
@@ -163,6 +179,7 @@ class HybridRetriever:
             keywords=plan.lexical_keywords_en,
             weight=self._settings.bm25_keywords_weight,
             paper_ids=normalized_paper_ids,
+            compiled_fts_query=canonical_request.lexical_query if canonical_request else None,
         )
         bibliography_candidates: tuple[_Candidate, ...] = ()
         if plan.search_bibliography:
@@ -218,6 +235,11 @@ class HybridRetriever:
                         else None
                     ),
                     rerank_score=_find_rerank_score(candidate),
+                    rerank_score_normalized=(
+                        self._reranking_settings.normalize_scores
+                        if self._reranking_settings is not None and candidate.rerank_score is not None
+                        else None
+                    ),
                 )
                 for index, candidate in enumerate(ordered)
             ),
@@ -315,6 +337,8 @@ class HybridRetriever:
                     rank=scoped_rank,
                     raw_score=float(scores[query_index][result_index]),
                     effective_weight=group_weight,
+                    score_kind=ScoreKind.DENSE,
+                    score_direction=ScoreDirection.HIGHER_IS_BETTER,
                 )
                 if scoped_rank >= self._settings.dense_top_k_per_query:
                     break
@@ -326,11 +350,17 @@ class HybridRetriever:
         keywords: tuple[str, ...],
         weight: float,
         paper_ids: tuple[str, ...] | None,
+        compiled_fts_query: str | None = None,
     ) -> None:
         """将英文关键词组作为一条 Rewritten BM25 Top-20 路径，而非三条独立查询。"""
         if not keywords:
             return
-        if paper_ids is None:
+        if compiled_fts_query is not None:
+            rows = self._database.search_compiled_lexical(
+                compiled_fts_query, paper_ids=paper_ids,
+                top_k=self._settings.bm25_keywords_top_k,
+            )
+        elif paper_ids is None:
             rows = self._database.search_bm25_keyword_group(
                 keywords, top_k=self._settings.bm25_keywords_top_k
             )
@@ -369,6 +399,8 @@ class HybridRetriever:
                 rank=result_index + 1,
                 raw_score=float(row["bm25_score"]),
                 effective_weight=weight,
+                score_kind=ScoreKind.BM25_FTS5,
+                score_direction=ScoreDirection.LOWER_IS_BETTER,
             )
 
     def _collect_bibliography_candidates(
@@ -407,6 +439,8 @@ class HybridRetriever:
                         raw_score=float(row["bm25_score"]),
                         # 0 表示此来源直接输出而非加入 RRF 权重计算。
                         effective_weight=0.0,
+                        score_kind=ScoreKind.BM25_FTS5,
+                        score_direction=ScoreDirection.LOWER_IS_BETTER,
                     )
                 ],
             )
@@ -423,6 +457,8 @@ class HybridRetriever:
         rank: int,
         raw_score: float,
         effective_weight: float,
+        score_kind: ScoreKind,
+        score_direction: ScoreDirection,
     ) -> None:
         """将一个通道命中并入 chunk 级 RRF 分数，并完整保留其来源。"""
         chunk_id = str(row["chunk_id"])
@@ -435,6 +471,8 @@ class HybridRetriever:
                 rank=rank,
                 raw_score=raw_score,
                 effective_weight=effective_weight,
+                score_kind=score_kind,
+                score_direction=score_direction,
             )
         )
 
@@ -445,6 +483,7 @@ def _to_retrieved_chunk(
     rank: int,
     pre_rerank_rank: int | None,
     rerank_score: float | None,
+    rerank_score_normalized: bool | None = None,
 ) -> RetrievedChunk:
     """将 SQLite 行转换为 API 稳定的数据类，避免上层依赖 sqlite3.Row。"""
     row = candidate.row
@@ -465,6 +504,7 @@ def _to_retrieved_chunk(
         raw_text=str(row["raw_text"]),
         pre_rerank_rank=pre_rerank_rank,
         rerank_score=rerank_score,
+        rerank_score_normalized=rerank_score_normalized,
         fused_score=candidate.score,
         source_matches=tuple(candidate.sources),
         section_id=(

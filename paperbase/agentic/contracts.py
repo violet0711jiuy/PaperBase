@@ -9,7 +9,8 @@ from hashlib import sha256
 from typing import TypeAlias
 
 from paperbase.llm.client import LLMCallRecord
-from paperbase.retrieval.contracts import PaperSearchSpec, RetrievedEvidence, ToolStatus
+from paperbase.generation.answer_coverage import AnswerRequirementCoverage
+from paperbase.retrieval.contracts import PaperSearchSpec, RetrievedEvidence, ToolStatus, ScoreKind, ScoreDirection
 from paperbase.retrieval.evidence_fingerprint import build_evidence_fingerprint
 
 
@@ -41,7 +42,16 @@ class ResearchGoal(str, Enum):
     SYNTHESIS_SUPPORT = "synthesis_support"
 
 
+class PlanningMode(str, Enum):
+    UNSPECIFIED = "unspecified"
+    MODEL = "model"
+    LITERAL_FALLBACK = "literal_fallback"
+    DETERMINISTIC_ENUMERATION = "deterministic_enumeration"
+
+
 class EvidenceTarget(str, Enum):
+    """Retrieval/routing hints, never completion, verified support or a hard filter."""
+
     PAPER_OWN_FACT = "paper_own_fact"
     METHOD = "method"
     RESULT = "result"
@@ -80,6 +90,24 @@ class EvidenceAnalysisStatus(str, Enum):
     FAILED = "failed"
 
 
+class EvidenceProjectionType(str, Enum):
+    ENUMERATION = "enumeration"
+    COMPARISON = "comparison"
+    FACT = "fact"
+    MECHANISM = "mechanism"
+
+
+class ProjectedEntityRole(str, Enum):
+    PROPOSED = "proposed"
+    ADOPTED = "adopted"
+    BASELINE = "baseline"
+    PRIOR_WORK = "prior_work"
+    UNKNOWN = "unknown"
+    # Legacy checkpoint input only.  New projector Schema rejects it and
+    # ProjectedEntity normalizes it to ``unknown`` on restoration.
+    OTHER = "other"
+
+
 class PaperAssessmentStatus(str, Enum):
     UNVISITED = "unvisited"
     CANDIDATE = "candidate"
@@ -107,11 +135,14 @@ class CandidateDisposition(str, Enum):
     EXCLUDED = "excluded"
 
 
-class SubtaskStatus(str, Enum):
+class RequirementStatus(str, Enum):
+    """Research progress; legacy ``satisfied`` means support_found, not complete."""
+
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    BLOCKED = "blocked"
+    SATISFIED = "satisfied"
+    NO_SUPPORT_FOUND = "no_support_found"
+    UNCERTAIN = "uncertain"
 
 
 class ResearchRunStatus(str, Enum):
@@ -125,10 +156,146 @@ class ResearchRunStatus(str, Enum):
 class StopReason(str, Enum):
     AGENT_FINISHED = "agent_finished"
     BUDGET_EXHAUSTED = "budget_exhausted"
+    PER_PAPER_QUERY_LIMIT = "per_paper_query_limit"
     SCOPE_UNRESOLVED = "scope_unresolved"
     NO_AVAILABLE_ACTIONS = "no_available_actions"
     INVALID_ACTION_LIMIT = "invalid_action_limit"
     FATAL_ERROR = "fatal_error"
+
+
+@dataclass(frozen=True)
+class ActionRejectionContext:
+    """Unified runtime action-validation feedback for the next Agent replan."""
+
+    action_name: str
+    action_arguments: dict[str, object]
+    requirement_ids: tuple[str, ...]
+    rejection_code: str
+    rejection_reason: str
+    guard_name: str
+    iteration: int
+    recovery_action: str = "replan_action"
+    rejection_stage: str = "guard"
+    # Structured when the runtime can name a concrete blocker (for example a
+    # per-paper query budget).  `object` intentionally keeps old checkpoints
+    # with string blockers readable.
+    blockers: tuple[object, ...] = ()
+    validator_name: str = "runtime_guard"
+    action_canonicalization: "ActionCanonicalization | None" = None
+
+
+# Checkpoints produced during Phase A.1 used this public name.  Keep the
+# import alias only; new state and payloads use ActionRejectionContext.
+GuardRejectionContext = ActionRejectionContext
+
+
+@dataclass(frozen=True)
+class CanonicalizationOperation:
+    """One deterministic, non-semantic normalization made to an Action."""
+
+    field_path: str
+    operation: str
+    count: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "field_path", _text(self.field_path, "field_path"))
+        object.__setattr__(self, "operation", _text(self.operation, "operation"))
+        if self.count < 1:
+            raise ValueError("Canonicalization operation count must be positive.")
+
+
+@dataclass(frozen=True)
+class ActionCanonicalization:
+    """Safe audit summary for an Action canonicalized before domain validation."""
+
+    changed: bool = False
+    changed_fields: tuple[str, ...] = ()
+    operations: tuple[CanonicalizationOperation, ...] = ()
+
+    def __post_init__(self) -> None:
+        fields = _unique_texts(self.changed_fields)
+        operations = tuple(self.operations)
+        if self.changed != bool(operations):
+            raise ValueError("Canonicalization changed must match its operations.")
+        object.__setattr__(self, "changed_fields", fields)
+        object.__setattr__(self, "operations", operations)
+
+
+@dataclass(frozen=True)
+class RuntimeUnavailableAction:
+    """Historical Action telemetry, not an effective Search identity or prohibition."""
+
+    action_name: str
+    action_arguments: dict[str, object]
+    requirement_ids: tuple[str, ...]
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "action_name", _text(self.action_name, "action_name"))
+        object.__setattr__(self, "action_arguments", dict(self.action_arguments))
+        object.__setattr__(self, "requirement_ids", _unique_texts(self.requirement_ids))
+        object.__setattr__(self, "reason_code", _text(self.reason_code, "reason_code"))
+
+
+@dataclass(frozen=True)
+class RuntimeUnavailablePaperQuery:
+    """Deprecated checkpoint/API telemetry; never a Search dedup authority."""
+
+    paper_id: str
+    query: str
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "paper_id", _text(self.paper_id, "paper_id"))
+        object.__setattr__(self, "query", _text(self.query, "query"))
+        object.__setattr__(self, "reason_code", _text(self.reason_code, "reason_code"))
+
+
+@dataclass(frozen=True)
+class RuntimeActionCapabilities:
+    """Single structural feasible-domain contract, projected from Graph State.
+
+    valid_paper_ids, tool_budget_state.available_tools and unavailable_paper_queries
+    are compatibility/view fields only. Search identity belongs to canonical
+    requests and Guard, never to raw Action history.
+    """
+
+    valid_requirement_ids: tuple[str, ...] = ()
+    valid_paper_ids: tuple[str, ...] = ()
+    known_section_ids_by_paper: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    available_section_ids_by_paper: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    tool_budget_state: dict[str, object] = field(default_factory=dict)
+    unavailable_capabilities: tuple[str, ...] = ()
+    recent_unavailable_actions: tuple[RuntimeUnavailableAction, ...] = ()
+    unavailable_paper_queries: tuple[RuntimeUnavailablePaperQuery, ...] = ()
+    available_tools: tuple[str, ...] = ()
+    search_paper_ids: tuple[str, ...] = ()
+    reference_paper_ids: tuple[str, ...] = ()
+    overview_paper_ids: tuple[str, ...] = ()
+    capability_reasons: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "valid_requirement_ids", _unique_texts(self.valid_requirement_ids))
+        object.__setattr__(self, "valid_paper_ids", _unique_texts(self.valid_paper_ids))
+        sections: list[tuple[str, tuple[str, ...]]] = []
+        for paper_id, section_ids in self.known_section_ids_by_paper:
+            sections.append((_text(paper_id, "paper_id"), _unique_texts(section_ids)))
+        object.__setattr__(self, "known_section_ids_by_paper", tuple(sections))
+        available_sections: list[tuple[str, tuple[str, ...]]] = []
+        for paper_id, section_ids in self.available_section_ids_by_paper:
+            available_sections.append(
+                (_text(paper_id, "paper_id"), _unique_texts(section_ids))
+            )
+        object.__setattr__(
+            self, "available_section_ids_by_paper", tuple(available_sections)
+        )
+        object.__setattr__(self, "tool_budget_state", dict(self.tool_budget_state))
+        object.__setattr__(self, "unavailable_capabilities", _unique_texts(self.unavailable_capabilities))
+        object.__setattr__(self, "recent_unavailable_actions", tuple(self.recent_unavailable_actions))
+        object.__setattr__(self, "unavailable_paper_queries", tuple(self.unavailable_paper_queries))
+        for name in ("available_tools", "search_paper_ids", "reference_paper_ids",
+                     "overview_paper_ids", "capability_reasons"):
+            object.__setattr__(self, name, _unique_texts(getattr(self, name)))
 
 
 @dataclass(frozen=True)
@@ -233,10 +400,9 @@ class QueryContext:
     scope_source: ScopeSource
     retrieval_goal: ResearchGoal
     default_evidence_targets: frozenset[EvidenceTarget]
+    # Advisory English cold-start concepts only; never implicit Retriever inputs.
     semantic_query_en: str | None = None
     lexical_keywords_en: tuple[str, ...] = ()
-    requires_complete_coverage: bool = False
-    search_bibliography: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "original_query", _text(self.original_query, "original_query"))
@@ -258,51 +424,85 @@ class QueryContext:
             raise ValueError("selected_papers scope requires at least two paper_ids.")
         if self.scope is QueryScope.KNOWLEDGE_BASE and ids:
             raise ValueError("knowledge_base scope stores membership in a corpus snapshot.")
-        expected_complete = self.retrieval_goal is ResearchGoal.EXHAUSTIVE_ENUMERATION
-        if self.requires_complete_coverage != expected_complete:
-            raise ValueError("requires_complete_coverage is derived from retrieval_goal.")
-        expected_bibliography = EvidenceTarget.REFERENCE in targets
-        if self.search_bibliography != expected_bibliography:
-            raise ValueError("search_bibliography is derived from evidence targets.")
+
+    @property
+    def requires_complete_coverage(self) -> bool:
+        return self.retrieval_goal is ResearchGoal.EXHAUSTIVE_ENUMERATION
+
+    @property
+    def search_bibliography(self) -> bool:
+        return EvidenceTarget.REFERENCE in self.default_evidence_targets
 
 
 @dataclass(frozen=True)
-class ResearchSubtask:
-    subtask_id: str
-    goal: str
-    target_paper_ids: tuple[str, ...]
-    evidence_targets: frozenset[EvidenceTarget]
-    success_criteria: str
-    status: SubtaskStatus = SubtaskStatus.PENDING
+class ResearchRequirement:
+    """A stable answer obligation.
+
+    evidence_targets are this Requirement's authoritative retrieval/routing
+    intent. They do not assert completion or semantic support.
+    """
+
+    requirement_id: str
+    description: str
+    evidence_targets: frozenset[EvidenceTarget] = frozenset()
+    required: bool = True
+    # Semantic analysis shape, independent of retrieval/routing targets.
+    # None is historical/direct-fixture compatibility only.
+    projection_type: EvidenceProjectionType | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "subtask_id", _text(self.subtask_id, "subtask_id"))
-        object.__setattr__(self, "goal", _text(self.goal, "goal"))
-        object.__setattr__(self, "success_criteria", _text(self.success_criteria, "success_criteria"))
-        object.__setattr__(self, "target_paper_ids", _unique_texts(self.target_paper_ids))
-        object.__setattr__(self, "evidence_targets", frozenset(EvidenceTarget(v) for v in self.evidence_targets))
-        object.__setattr__(self, "status", SubtaskStatus(self.status))
+        object.__setattr__(
+            self, "requirement_id", _text(self.requirement_id, "requirement_id")
+        )
+        object.__setattr__(self, "description", _text(self.description, "description"))
+        if self.projection_type is not None:
+            object.__setattr__(self, "projection_type", EvidenceProjectionType(self.projection_type))
+        if not isinstance(self.required, bool):
+            raise ValueError("ResearchRequirement.required must be boolean.")
+        object.__setattr__(
+            self,
+            "evidence_targets",
+            frozenset(EvidenceTarget(value) for value in self.evidence_targets),
+        )
+        if not self.evidence_targets:
+            raise ValueError("ResearchRequirement 至少需要一个 evidence target。")
+
+
+@dataclass(frozen=True)
+class RequirementState:
+    """Research progress for one Requirement, never final answer completeness."""
+
+    requirement_id: str
+    status: RequirementStatus = RequirementStatus.PENDING
+    evidence_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "requirement_id", _text(self.requirement_id, "requirement_id"))
+        object.__setattr__(self, "status", RequirementStatus(self.status))
+        object.__setattr__(self, "evidence_ids", _unique_texts(self.evidence_ids))
 
 
 @dataclass(frozen=True)
 class ResearchPlan:
+    """The answer goal and its stable requirements."""
+
     goal: str
-    subtasks: tuple[ResearchSubtask, ...]
+    requirements: tuple[ResearchRequirement, ...] = ()
+    planning_mode: PlanningMode = PlanningMode.UNSPECIFIED
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "goal", _text(self.goal, "goal"))
-        object.__setattr__(self, "subtasks", tuple(self.subtasks))
-        if not self.subtasks:
-            raise ValueError("A research plan requires at least one subtask.")
-        ids = [task.subtask_id for task in self.subtasks]
-        if len(ids) != len(set(ids)):
-            raise ValueError("Research subtask IDs must be unique.")
+        requirements = tuple(self.requirements)
+        requirement_ids = [item.requirement_id for item in requirements]
+        if len(requirement_ids) != len(set(requirement_ids)):
+            raise ValueError("Research requirement IDs must be unique.")
+        object.__setattr__(self, "requirements", requirements)
+        object.__setattr__(self, "planning_mode", PlanningMode(self.planning_mode))
 
 
 @dataclass(frozen=True)
 class SearchPapersAction:
     searches: tuple[PaperSearchSpec, ...]
-    target_subtask_id: str | None = None
     action_name: str = field(default="search_papers", init=False)
 
     def __post_init__(self) -> None:
@@ -315,12 +515,13 @@ class SearchPapersAction:
 class SearchKnowledgeBaseAction:
     query: str
     lexical_terms: tuple[str, ...] = ()
-    target_subtask_id: str | None = None
+    requirement_ids: tuple[str, ...] = ()
     action_name: str = field(default="search_knowledge_base", init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "query", _text(self.query, "query"))
         object.__setattr__(self, "lexical_terms", _unique_texts(self.lexical_terms))
+        object.__setattr__(self, "requirement_ids", _unique_texts(self.requirement_ids))
 
 
 @dataclass(frozen=True)
@@ -328,41 +529,38 @@ class SearchReferencesAction:
     paper_id: str
     query: str
     lexical_terms: tuple[str, ...] = ()
-    target_subtask_id: str | None = None
+    requirement_ids: tuple[str, ...] = ()
     action_name: str = field(default="search_references", init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "paper_id", _text(self.paper_id, "paper_id"))
         object.__setattr__(self, "query", _text(self.query, "query"))
         object.__setattr__(self, "lexical_terms", _unique_texts(self.lexical_terms))
+        object.__setattr__(self, "requirement_ids", _unique_texts(self.requirement_ids))
 
 
 @dataclass(frozen=True)
 class GetSectionContextAction:
     paper_id: str
     section_id: str
-    target_subtask_id: str | None = None
+    requirement_ids: tuple[str, ...] = ()
     action_name: str = field(default="get_section_context", init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "paper_id", _text(self.paper_id, "paper_id"))
         object.__setattr__(self, "section_id", _text(self.section_id, "section_id"))
+        object.__setattr__(self, "requirement_ids", _unique_texts(self.requirement_ids))
 
 
 @dataclass(frozen=True)
 class GetPaperOverviewAction:
     paper_id: str
-    target_subtask_id: str | None = None
+    requirement_ids: tuple[str, ...] = ()
     action_name: str = field(default="get_paper_overview", init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "paper_id", _text(self.paper_id, "paper_id"))
-        if self.target_subtask_id is not None:
-            object.__setattr__(
-                self,
-                "target_subtask_id",
-                _text(self.target_subtask_id, "target_subtask_id"),
-            )
+        object.__setattr__(self, "requirement_ids", _unique_texts(self.requirement_ids))
 
 
 @dataclass(frozen=True)
@@ -423,36 +621,197 @@ class EvidenceClaim:
 
 
 @dataclass(frozen=True)
+class ProjectedEntity:
+    canonical_name: str
+    entity_type: str
+    role: ProjectedEntityRole
+    ownership: EvidenceOwnership
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "canonical_name", _text(self.canonical_name, "canonical_name"))
+        object.__setattr__(self, "entity_type", _text(self.entity_type, "entity_type"))
+        # ``other`` was emitted by the Phase-3 schema.  Preserve old
+        # checkpoints while ensuring new projections use the closed ``unknown``
+        # vocabulary.
+        role = "unknown" if self.role == "other" else self.role
+        object.__setattr__(self, "role", ProjectedEntityRole(role))
+        object.__setattr__(self, "ownership", EvidenceOwnership(self.ownership))
+
+
+@dataclass(frozen=True)
+class RequirementSupportAnchor:
+    """Evidence-local support boundary, with only its source validated at runtime."""
+
+    requirement_id: str
+    source_excerpt: str
+    support_scope: str
+    unresolved_aspects: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "requirement_id", _text(self.requirement_id, "requirement_id"))
+        object.__setattr__(self, "source_excerpt", _text(self.source_excerpt, "source_excerpt"))
+        object.__setattr__(self, "support_scope", _text(self.support_scope, "support_scope"))
+        object.__setattr__(self, "unresolved_aspects", _unique_texts(self.unresolved_aspects))
+
+
+@dataclass(frozen=True)
+class EnumerationProjection:
+    evidence_id: str
+    entities: tuple[ProjectedEntity, ...]
+    supported_requirement_ids: tuple[str, ...] = ()
+    support_anchors: tuple[RequirementSupportAnchor, ...] = ()
+    projection_type: EvidenceProjectionType = field(
+        default=EvidenceProjectionType.ENUMERATION, init=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_id", _text(self.evidence_id, "evidence_id"))
+        object.__setattr__(self, "entities", tuple(self.entities))
+        object.__setattr__(self, "supported_requirement_ids", _unique_texts(self.supported_requirement_ids))
+        object.__setattr__(self, "support_anchors", tuple(self.support_anchors))
+
+
+@dataclass(frozen=True)
+class ComparisonProjection:
+    evidence_id: str
+    comparison_dimensions: tuple[str, ...]
+    supported_requirement_ids: tuple[str, ...] = ()
+    proposed_requirement_ids: tuple[str, ...] = ()
+    support_anchors: tuple[RequirementSupportAnchor, ...] = ()
+    projection_type: EvidenceProjectionType = field(
+        default=EvidenceProjectionType.COMPARISON, init=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_id", _text(self.evidence_id, "evidence_id"))
+        object.__setattr__(self, "comparison_dimensions", _unique_texts(self.comparison_dimensions))
+        object.__setattr__(self, "supported_requirement_ids", _unique_texts(self.supported_requirement_ids))
+        object.__setattr__(self, "proposed_requirement_ids", _unique_texts(self.proposed_requirement_ids))
+        object.__setattr__(self, "support_anchors", tuple(self.support_anchors))
+
+
+@dataclass(frozen=True)
+class FactItem:
+    fact_type: str
+    value: str
+    ownership: EvidenceOwnership
+    supported_requirement_ids: tuple[str, ...] = ()
+    proposed_requirement_ids: tuple[str, ...] = ()
+    support_anchors: tuple[RequirementSupportAnchor, ...] = ()
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fact_type", _text(self.fact_type, "fact_type"))
+        object.__setattr__(self, "value", _text(self.value, "value"))
+        object.__setattr__(self, "ownership", EvidenceOwnership(self.ownership))
+        object.__setattr__(self, "supported_requirement_ids", _unique_texts(self.supported_requirement_ids))
+        object.__setattr__(self, "proposed_requirement_ids", _unique_texts(self.proposed_requirement_ids))
+        object.__setattr__(self, "support_anchors", tuple(self.support_anchors))
+
+
+@dataclass(frozen=True)
+class FactProjection:
+    evidence_id: str
+    facts: tuple[FactItem, ...]
+    projection_type: EvidenceProjectionType = field(
+        default=EvidenceProjectionType.FACT, init=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_id", _text(self.evidence_id, "evidence_id"))
+        if not self.facts:
+            raise ValueError("FactProjection requires at least one fact.")
+        object.__setattr__(self, "facts", tuple(self.facts))
+
+    @property
+    def supported_requirement_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            requirement_id for fact in self.facts
+            for requirement_id in fact.supported_requirement_ids
+        ))
+
+    @property
+    def proposed_requirement_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            requirement_id for fact in self.facts
+            for requirement_id in fact.proposed_requirement_ids
+        ))
+
+    @property
+    def support_anchors(self) -> tuple[RequirementSupportAnchor, ...]:
+        return tuple(anchor for fact in self.facts for anchor in fact.support_anchors)
+
+
+@dataclass(frozen=True)
+class MechanismProjection:
+    evidence_id: str
+    mechanism: str
+    steps: tuple[str, ...] = ()
+    inputs: tuple[str, ...] = ()
+    outputs: tuple[str, ...] = ()
+    supported_requirement_ids: tuple[str, ...] = ()
+    proposed_requirement_ids: tuple[str, ...] = ()
+    support_anchors: tuple[RequirementSupportAnchor, ...] = ()
+    projection_type: EvidenceProjectionType = field(
+        default=EvidenceProjectionType.MECHANISM, init=False
+    )
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_id", _text(self.evidence_id, "evidence_id"))
+        object.__setattr__(self, "mechanism", _text(self.mechanism, "mechanism"))
+        object.__setattr__(self, "steps", _unique_texts(self.steps))
+        object.__setattr__(self, "inputs", _unique_texts(self.inputs))
+        object.__setattr__(self, "outputs", _unique_texts(self.outputs))
+        object.__setattr__(self, "supported_requirement_ids", _unique_texts(self.supported_requirement_ids))
+        object.__setattr__(self, "proposed_requirement_ids", _unique_texts(self.proposed_requirement_ids))
+        object.__setattr__(self, "support_anchors", tuple(self.support_anchors))
+
+
+EvidenceProjection: TypeAlias = (
+    EnumerationProjection | ComparisonProjection | FactProjection | MechanismProjection
+)
+
+
+@dataclass(frozen=True)
 class EvidenceAnalysis:
-    """Evidence Analysis 节点对一条已登记 Evidence 的完整处理结果。"""
+    """一条 Evidence 的聚合评估；projections 是正式语义结果 authority。"""
 
     evidence_id: str
     status: EvidenceAnalysisStatus
     digest: str | None = None
     claims: tuple[EvidenceClaim, ...] = ()
-    covered_targets: frozenset[EvidenceTarget] = frozenset()
-    addressed_information: tuple[str, ...] = ()
+    # Claims/digest are read-only compatibility data for pre-Projection checkpoints.
+    # Legacy input/alias: singleton only; multi-projection results never expose a first item.
+    projection: EvidenceProjection | None = None
+    # Additive Phase-3.1 audit data.  It records deterministic projection
+    # filtering; it is never used for Requirement completion or stop logic.
+    projection_rejections: tuple[str, ...] = ()
     error_code: str | None = None
+
+    # Successful semantic evaluation scope, distinct from verified support.
+    # Historical checkpoints leave this empty; never infer it from other fields.
+    evaluated_requirement_ids: tuple[str, ...] = ()
+    # Authoritative retained semantic results across successful Requirement groups.
+    projections: tuple[EvidenceProjection, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence_id", _text(self.evidence_id, "evidence_id"))
         status = EvidenceAnalysisStatus(self.status)
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "claims", tuple(self.claims))
+        projections = tuple(self.projections)
+        if self.projection is not None:
+            if not projections:
+                projections = (self.projection,)
+            elif len(projections) != 1 or projections[0] != self.projection:
+                raise ValueError("Conflicting legacy projection and authoritative projections.")
+        if any(item.evidence_id != self.evidence_id for item in projections):
+            raise ValueError("projection evidence_id must match analysis evidence_id.")
+        object.__setattr__(self, "projections", projections)
+        object.__setattr__(self, "projection", projections[0] if len(projections) == 1 else None)
+        object.__setattr__(self, "evaluated_requirement_ids", _unique_texts(self.evaluated_requirement_ids))
+        if status in {EvidenceAnalysisStatus.PENDING, EvidenceAnalysisStatus.FAILED} and self.evaluated_requirement_ids:
+            raise ValueError("Unsuccessful analysis cannot attest an evaluated scope.")
         object.__setattr__(
-            self,
-            "covered_targets",
-            frozenset(EvidenceTarget(value) for value in self.covered_targets),
-        )
-        object.__setattr__(
-            self,
-            "addressed_information",
-            tuple(
-                dict.fromkeys(
-                    _text(value, "addressed_information")
-                    for value in self.addressed_information
-                )
-            ),
+            self, "projection_rejections", _unique_texts(self.projection_rejections)
         )
         if self.digest is not None:
             object.__setattr__(self, "digest", _text(self.digest, "digest"))
@@ -461,16 +820,16 @@ class EvidenceAnalysis:
                 self, "error_code", _text(self.error_code, "error_code")
             )
         if status is EvidenceAnalysisStatus.QUALIFIED:
-            if self.digest is None or not self.claims:
-                raise ValueError("qualified evidence requires digest and claims.")
+            if self.projections and (self.claims or self.digest is not None):
+                raise ValueError("projected assessment must not duplicate facts in legacy claims or digest.")
+            if not self.projections and (self.digest is None or not self.claims):
+                raise ValueError("legacy qualified evidence requires digest and claims.")
             if self.error_code is not None:
                 raise ValueError("qualified evidence cannot contain error_code.")
         elif status is EvidenceAnalysisStatus.IRRELEVANT:
             if (
-                self.digest is None
-                or self.claims
-                or self.covered_targets
-                or self.addressed_information
+                self.claims
+                or self.projections
             ):
                 raise ValueError(
                     "irrelevant evidence requires digest and empty coverage fields."
@@ -481,8 +840,7 @@ class EvidenceAnalysis:
             if (
                 self.error_code is None
                 or self.claims
-                or self.covered_targets
-                or self.addressed_information
+                or self.projections
             ):
                 raise ValueError(
                     "failed evidence requires error_code and empty analysis output."
@@ -490,8 +848,7 @@ class EvidenceAnalysis:
         elif (
             self.digest is not None
             or self.claims
-            or self.covered_targets
-            or self.addressed_information
+            or self.projections
             or self.error_code is not None
         ):
             raise ValueError("pending evidence cannot contain analysis output.")
@@ -505,18 +862,11 @@ class EvidenceRecord:
     first_seen_iteration: int
     last_seen_iteration: int
     originating_tools: tuple[str, ...] = ()
-    target_subtask_ids: tuple[str, ...] = ()
     fingerprint: str | None = None
+    # Derived Plan intent for audit/compatibility; not a support authority.
     requested_evidence_targets: frozenset[EvidenceTarget] = frozenset()
-    requested_missing_information: tuple[str, ...] = ()
-    analysis_status: EvidenceAnalysisStatus = EvidenceAnalysisStatus.PENDING
-    digest: str | None = None
-    claims: tuple[EvidenceClaim, ...] = ()
-    covered_targets: frozenset[EvidenceTarget] = frozenset()
-    addressed_information: tuple[str, ...] = ()
-    analysis_error: str | None = None
-    # Phase 3 旧 checkpoint 的兼容字段；新链路只写入 Claim 级分析结果。
-    qualification: EvidenceQualification | None = None
+    requested_requirement_ids: tuple[str, ...] = ()
+    assessment: EvidenceAnalysis | None = None
 
     def __post_init__(self) -> None:
         fingerprint = self.fingerprint or build_evidence_fingerprint(self.evidence)
@@ -532,73 +882,81 @@ class EvidenceRecord:
         )
         object.__setattr__(
             self,
-            "requested_missing_information",
-            tuple(
-                dict.fromkeys(
-                    _text(value, "requested_missing_information")
-                    for value in self.requested_missing_information
-                )
-            ),
+            "requested_requirement_ids",
+            _unique_texts(self.requested_requirement_ids),
         )
-        status = EvidenceAnalysisStatus(self.analysis_status)
-        claims = tuple(self.claims)
-        digest = self.digest
-        error = self.analysis_error
-        # 旧测试与 checkpoint 可能只有 Evidence 级 Qualification。加载时把它提升为
-        # 单 Claim，避免历史数据在新 fail-closed Selector 中被静默丢弃。
-        if self.qualification is not None and status is EvidenceAnalysisStatus.PENDING:
-            legacy = self.qualification
-            status = (
-                EvidenceAnalysisStatus.IRRELEVANT
-                if legacy.relation is EvidenceRelation.IRRELEVANT
-                else EvidenceAnalysisStatus.QUALIFIED
-            )
-            digest = self.evidence.content[:500]
-            if status is EvidenceAnalysisStatus.QUALIFIED:
-                claims = (
-                    EvidenceClaim(
-                        claim_id=f"{self.evidence_id}:C1",
-                        statement=self.evidence.content[:500],
-                        relation=legacy.relation,
-                        ownership=legacy.ownership,
-                        rationale=legacy.rationale,
-                        source_excerpt=self.evidence.content[:300],
-                    ),
-                )
-        object.__setattr__(self, "analysis_status", status)
-        object.__setattr__(self, "claims", claims)
-        object.__setattr__(
-            self,
-            "covered_targets",
-            frozenset(EvidenceTarget(value) for value in self.covered_targets),
+        assessment = self.assessment or EvidenceAnalysis(
+            evidence_id=self.evidence_id, status=EvidenceAnalysisStatus.PENDING
         )
-        object.__setattr__(
-            self,
-            "addressed_information",
-            tuple(
-                dict.fromkeys(
-                    _text(value, "addressed_information")
-                    for value in self.addressed_information
-                )
-            ),
-        )
-        object.__setattr__(self, "digest", digest)
-        object.__setattr__(self, "analysis_error", error)
-        EvidenceAnalysis(
-            evidence_id=self.evidence_id,
-            status=status,
-            digest=digest,
-            claims=claims,
-            covered_targets=self.covered_targets,
-            addressed_information=self.addressed_information,
-            error_code=error,
-        )
+        if not isinstance(assessment, EvidenceAnalysis):
+            raise TypeError("assessment must be an EvidenceAnalysis.")
+        if assessment.evidence_id != self.evidence_id:
+            raise ValueError("assessment evidence_id must match record evidence_id.")
+        object.__setattr__(self, "assessment", assessment)
+
+    @property
+    def analysis_status(self) -> EvidenceAnalysisStatus:
+        return self.assessment.status
+
+    @property
+    def digest(self) -> str | None:
+        return self.assessment.digest
+
+    @property
+    def claims(self) -> tuple[EvidenceClaim, ...]:
+        return self.assessment.claims
+
+    @property
+    def projection(self) -> EvidenceProjection | None:
+        return self.assessment.projection
+
+    @property
+    def projections(self) -> tuple[EvidenceProjection, ...]:
+        return self.assessment.projections
+
+    @property
+    def covered_targets(self) -> frozenset[EvidenceTarget]:
+        """Deprecated telemetry; target intent never proves any completion."""
+        return frozenset()
+
+    @property
+    def covered_requirement_ids(self) -> tuple[str, ...]:
+        from .grounding import verified_support_ids
+
+        return verified_support_ids(self)
+
+    @property
+    def method_entities(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(entity.canonical_name for projection in self.projections
+            if isinstance(projection, EnumerationProjection) for entity in projection.entities
+            if entity.role in {ProjectedEntityRole.PROPOSED, ProjectedEntityRole.ADOPTED}))
+
+    @property
+    def method_families(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(entity.canonical_name for projection in self.projections
+            if isinstance(projection, EnumerationProjection) for entity in projection.entities
+            if entity.entity_type == "method_family"))
+
+    @property
+    def baseline_entities(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(entity.canonical_name for projection in self.projections
+            if isinstance(projection, EnumerationProjection) for entity in projection.entities
+            if entity.role is ProjectedEntityRole.BASELINE))
+
+    @property
+    def projection_rejections(self) -> tuple[str, ...]:
+        return self.assessment.projection_rejections
+
+    @property
+    def analysis_error(self) -> str | None:
+        return self.assessment.error_code
 
 
 @dataclass(frozen=True)
 class RegistryDelta:
     added_ids: tuple[str, ...] = ()
     reused_ids: tuple[str, ...] = ()
+    analysis_required_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -619,7 +977,12 @@ class EvidenceFilterDecision:
     source_chunk_ids: tuple[str, ...]
     decision: str
     reasons: tuple[str, ...]
+    # Deprecated compatibility field for old Observation/checkpoint payloads.
     score: float | None = None
+    raw_score: float | None = None
+    score_kind: ScoreKind = ScoreKind.LEGACY_UNKNOWN
+    score_direction: ScoreDirection = ScoreDirection.NOT_APPLICABLE
+    retrieval_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -657,8 +1020,7 @@ class PaperSearchAttempt:
     query: str
     lexical_terms: tuple[str, ...] = ()
     evidence_targets: frozenset[EvidenceTarget] = frozenset()
-    missing_information: tuple[str, ...] = ()
-    target_subtask_id: str | None = None
+    requirement_ids: tuple[str, ...] = ()
     status: str = ""
     error_code: str | None = None
 
@@ -670,14 +1032,31 @@ class ResearchObservation:
     tool_status: ToolStatus
     added_evidence_ids: tuple[str, ...]
     reused_evidence_ids: tuple[str, ...]
-    paper_statuses: tuple[tuple[str, str], ...] = ()
     queries_by_paper: tuple[tuple[str, str], ...] = ()
     error_codes: tuple[str, ...] = ()
-    no_new_evidence: bool = False
-    remaining_budget: dict[str, int] = field(default_factory=dict)
+    goal_progress: bool = False
+    new_goal_items: tuple[str, ...] = ()
+    # Tool-specific, JSON-safe arguments for audit.  It deliberately excludes
+    # legacy Subtask fields and any retrieved document content.
+    action_arguments: dict[str, object] = field(default_factory=dict)
     search_attempts: tuple[PaperSearchAttempt, ...] = ()
     evidence_filter_report: EvidenceFilterReport | None = None
     evidence_analysis_cache: EvidenceAnalysisCacheStats | None = None
+    requirement_progress_before: tuple[tuple[str, str], ...] = ()
+    requirement_progress_after: tuple[tuple[str, str], ...] = ()
+    # Deterministic post-projection search delta.  It is observability only:
+    # RequirementState remains the formal completion source.
+    new_supporting_evidence_count: int = 0
+    newly_supported_requirement_ids: tuple[str, ...] = ()
+    newly_exposed_section_ids: tuple[str, ...] = ()
+    action_canonicalization: ActionCanonicalization | None = None
+    raw_action_arguments: dict[str, object] = field(default_factory=dict)
+    canonical_effective_requests: tuple[dict[str, object], ...] = ()
+    request_identities: tuple[str, ...] = ()
+    request_executions: tuple[dict[str, object], ...] = ()
+    request_contract_version: str = "legacy"
+    # Plan-derived audit rows only; search_index/paper_id retain batch attribution.
+    requirement_target_bindings: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -696,9 +1075,12 @@ class GuardState:
 
     usage: BudgetUsage = field(default_factory=BudgetUsage)
     no_new_per_paper: tuple[tuple[str, int], ...] = ()
+    no_goal_progress_per_paper: tuple[tuple[str, int], ...] = ()
     suppressed_paper_ids: tuple[str, ...] = ()
     executed_action_fingerprints: tuple[str, ...] = ()
     executed_paper_query_fingerprints: tuple[str, ...] = ()
+    request_executions: tuple[dict[str, object], ...] = ()
+    legacy_request_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -719,6 +1101,8 @@ class ResearchAnswer:
     insufficient_evidence: bool = False
     partial_answer: bool = False
     coverage_note: str | None = None
+    requirement_coverage: tuple[AnswerRequirementCoverage, ...] = ()
+    overall_status: str | None = None
     llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
     def __post_init__(self) -> None:
@@ -753,15 +1137,12 @@ class CoverageState:
     assessments: tuple[PaperAssessment, ...]
     strategy: CoverageStrategy
     candidate_paper_ids: tuple[str, ...] = ()
-    screened_paper_ids: tuple[str, ...] = ()
     uncertain_paper_ids: tuple[str, ...] = ()
     excluded_paper_ids: tuple[str, ...] = ()
-    discovery_completed: bool = False
 
     def __post_init__(self) -> None:
         scope_ids = _unique_texts(self.scope_paper_ids)
         candidate_ids = _unique_texts(self.candidate_paper_ids)
-        screened_ids = _unique_texts(self.screened_paper_ids)
         uncertain_ids = _unique_texts(self.uncertain_paper_ids)
         excluded_ids = _unique_texts(self.excluded_paper_ids)
         partitions = (set(candidate_ids), set(uncertain_ids), set(excluded_ids))
@@ -769,8 +1150,6 @@ class CoverageState:
             raise ValueError("Coverage screening partitions must stay inside Scope.")
         if any(partitions[i].intersection(partitions[j]) for i in range(3) for j in range(i + 1, 3)):
             raise ValueError("Coverage screening partitions must be mutually exclusive.")
-        if set(screened_ids) != set().union(*partitions):
-            raise ValueError("screened_paper_ids must equal all screening partitions.")
         assessment_ids = tuple(item.paper_id for item in self.assessments)
         if len(set(assessment_ids)) != len(assessment_ids):
             raise ValueError("Coverage assessments must not contain duplicate paper IDs.")
@@ -778,7 +1157,6 @@ class CoverageState:
             raise ValueError("Coverage assessments must stay inside scope_paper_ids.")
         object.__setattr__(self, "scope_paper_ids", scope_ids)
         object.__setattr__(self, "candidate_paper_ids", candidate_ids)
-        object.__setattr__(self, "screened_paper_ids", screened_ids)
         object.__setattr__(self, "uncertain_paper_ids", uncertain_ids)
         object.__setattr__(self, "excluded_paper_ids", excluded_ids)
         object.__setattr__(self, "strategy", CoverageStrategy(self.strategy))
@@ -793,6 +1171,13 @@ class CoverageState:
         return tuple(
             item.paper_id for item in self.assessments if item.status in terminal
         )
+
+    @property
+    def screened_paper_ids(self) -> tuple[str, ...]:
+        screened = set(self.candidate_paper_ids).union(
+            self.uncertain_paper_ids, self.excluded_paper_ids
+        )
+        return tuple(paper_id for paper_id in self.scope_paper_ids if paper_id in screened)
 
     @property
     def positive_paper_ids(self) -> tuple[str, ...]:
@@ -842,6 +1227,19 @@ class ResearchRunResult:
     error_codes: tuple[str, ...] = ()
     clarification: str | None = None
     llm_diagnostics: tuple[LLMCallRecord, ...] = ()
+    # Phase 1 canonical completion-state projection.  Empty is valid for a
+    # historical checkpoint/result that predates RequirementState.
+    requirement_states: tuple[RequirementState, ...] = ()
+    action_rejections: tuple[ActionRejectionContext, ...] = ()
+    # Read-only compatibility for results persisted before the unified field.
+    guard_rejections: tuple[ActionRejectionContext, ...] = ()
+
+    def __post_init__(self) -> None:
+        states = tuple(self.requirement_states)
+        ids = [item.requirement_id for item in states]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Requirement states must not contain duplicate requirement IDs.")
+        object.__setattr__(self, "requirement_states", states)
 
 
 def _text(value: object, name: str) -> str:

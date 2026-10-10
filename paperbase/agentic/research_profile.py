@@ -8,9 +8,14 @@ from .contracts import (
     EvidenceAnalysisStatus,
     EvidenceRecord,
     EvidenceTarget,
+    CoverageState,
+    QueryContext,
+    ResearchGoal,
     ResearchObservation,
     ResearchPlan,
 )
+from .grounding import projection_facts, verified_support_ids
+from .requirement_targets import targets_for_requirement_ids
 
 
 @dataclass(frozen=True)
@@ -19,16 +24,19 @@ class PaperResearchProfile:
 
     paper_id: str
     queries_tried: tuple[str, ...]
+    # EvidenceTarget is a retrieval hint, not an answer-completion state.
     requested_targets: frozenset[EvidenceTarget]
     covered_targets: frozenset[EvidenceTarget]
-    remaining_targets: frozenset[EvidenceTarget]
-    requested_information: tuple[str, ...]
-    addressed_information: tuple[str, ...]
-    remaining_information: tuple[str, ...]
+    supported_requirement_ids: tuple[str, ...]
     sections_seen: tuple[str, ...]
     qualified_digests: tuple[str, ...]
     qualified_claims: tuple[str, ...]
     empty_search_count: int = 0
+    unresolved_targets: frozenset[EvidenceTarget] = frozenset()
+
+    @property
+    def remaining_targets(self) -> frozenset[EvidenceTarget]:
+        return self.unresolved_targets
 
 
 def build_research_profiles(
@@ -40,6 +48,14 @@ def build_research_profiles(
     default_targets: frozenset[EvidenceTarget] = frozenset(),
 ) -> tuple[PaperResearchProfile, ...]:
     """用 Registry 与 Observation 重算 Profile，避免维护第二份可漂移状态。"""
+    # Remaining routing intent is Requirement-level across the current State,
+    # not a per-paper completeness claim. Local gaps stay in support boundaries.
+    globally_supported_ids = {
+        rid for record in evidence for rid in verified_support_ids(record, plan.requirements)
+    }
+    unresolved_targets = targets_for_requirement_ids(plan, tuple(
+        item.requirement_id for item in plan.requirements
+        if item.requirement_id not in globally_supported_ids))
     profiles: list[PaperResearchProfile] = []
     for paper_id in dict.fromkeys(paper_ids):
         records = tuple(
@@ -66,56 +82,20 @@ def build_research_profiles(
                 )
             )
         )
-        planned_targets = frozenset(
-            target
-            for subtask in plan.subtasks
-            if not subtask.target_paper_ids or paper_id in subtask.target_paper_ids
-            for target in subtask.evidence_targets
-        )
-        requested_targets = frozenset(
-            (
-                *default_targets,
-                *planned_targets,
-                *(target for attempt in attempts for target in attempt.evidence_targets),
-                *(
-                    target
-                    for record in records
-                    for target in record.requested_evidence_targets
-                ),
-            )
-        )
-        requested_information = tuple(
-            dict.fromkeys(
-                (
-                    *(
-                        item
-                        for attempt in attempts
-                        for item in attempt.missing_information
-                    ),
-                    *(
-                        item
-                        for record in records
-                        for item in record.requested_missing_information
-                    ),
-                )
-            )
-        )
+        # Plan declares intent; wire/default/Registry target fields are telemetry.
+        requested_targets = targets_for_requirement_ids(
+            plan, tuple(item.requirement_id for item in plan.requirements))
         qualified = tuple(
             record
             for record in records
             if record.analysis_status is EvidenceAnalysisStatus.QUALIFIED
         )
-        covered_targets = frozenset(
-            target for record in qualified for target in record.covered_targets
-        )
-        addressed_information = tuple(
-            dict.fromkeys(
-                item
-                for record in qualified
-                for item in record.addressed_information
-            )
-        )
-        addressed_set = set(addressed_information)
+        covered_targets = frozenset()  # deprecated compatibility telemetry
+        supported_ids = {
+            requirement_id
+            for record in qualified
+            for requirement_id in verified_support_ids(record, plan.requirements)
+        }
         sections_seen = tuple(
             dict.fromkeys(
                 value
@@ -130,22 +110,23 @@ def build_research_profiles(
                 queries_tried=queries,
                 requested_targets=requested_targets,
                 covered_targets=covered_targets,
-                remaining_targets=requested_targets - covered_targets,
-                requested_information=requested_information,
-                addressed_information=addressed_information,
-                remaining_information=tuple(
-                    item
-                    for item in requested_information
-                    if item not in addressed_set
+                unresolved_targets=unresolved_targets,
+                supported_requirement_ids=tuple(
+                    item.requirement_id for item in plan.requirements
+                    if item.requirement_id in supported_ids
                 ),
                 sections_seen=sections_seen,
                 qualified_digests=tuple(
                     record.digest for record in qualified if record.digest
                 )[-4:],
                 qualified_claims=tuple(
-                    claim.statement
+                    statement
                     for record in qualified
-                    for claim in record.claims
+                    for statement in (
+                        tuple(value for projection in record.projections for value in projection_facts(projection))
+                        if record.projections
+                        else tuple(claim.statement for claim in record.claims)
+                    )
                 )[-8:],
                 empty_search_count=sum(
                     attempt.status == "empty" for attempt in attempts
@@ -153,3 +134,48 @@ def build_research_profiles(
             )
         )
     return tuple(profiles)
+
+
+def goal_is_sufficient(
+    *,
+    context: QueryContext,
+    plan: ResearchPlan,
+    coverage: CoverageState,
+    evidence: tuple[EvidenceRecord, ...],
+    observations: tuple[ResearchObservation, ...] = (),
+) -> bool:
+    """Formal stop gate: scope complete and every required state terminal."""
+    from .requirement_state import finalize_requirement_states, required_requirements_terminal
+
+    # Existing non-enumeration flows retain their explicit FinishAction path;
+    # this automatic stop gate is the exhaustive-enumeration convergence path.
+    if context.retrieval_goal is not ResearchGoal.EXHAUSTIVE_ENUMERATION:
+        return False
+    if not coverage.coverage_complete:
+        return False
+    states = finalize_requirement_states(
+        plan=plan,
+        evidence=evidence,
+        observations=observations,
+    ).states
+    return required_requirements_terminal(plan, states)
+
+
+def goal_signal_items(evidence: tuple[EvidenceRecord, ...]) -> frozenset[str]:
+    """用于 no_goal_progress 的稳定集合，只统计用户可见的方法信息。"""
+    return frozenset(
+        f"{kind}:{_normalize_entity(value)}"
+        for record in evidence
+        if record.analysis_status is EvidenceAnalysisStatus.QUALIFIED
+        for kind, values in (
+            ("method", record.method_entities),
+            ("family", record.method_families),
+            ("baseline", record.baseline_entities),
+        )
+        for value in values
+        if _normalize_entity(value)
+    )
+
+
+def _normalize_entity(value: str) -> str:
+    return " ".join(value.casefold().replace("_", " ").split())

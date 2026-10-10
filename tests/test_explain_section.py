@@ -168,6 +168,65 @@ class ExplainSectionTests(unittest.TestCase):
                 )
 
 
+    def test_supplied_chunks_can_be_semantically_insufficient(self) -> None:
+        with TemporaryDirectory() as directory:
+            repository, workspace_id = _repository(Path(directory))
+            snapshot = repository.load(workspace_id)
+            client = _FakeExplainClient(dict(explanation="当前正文不足以建立章节机制。",
+                key_points=[], source_chunk_ids=[], insufficient_evidence=True))
+            outcome = create_explain_section(snapshot=snapshot, section_id=snapshot.sections[1].section_id,
+                settings=_settings(), client=client)
+            self.assertTrue(outcome.explanation.insufficient_evidence)
+            self.assertEqual(outcome.explanation.source_chunk_ids, [])
+            self.assertEqual(outcome.explanation.key_points, [])
+            persisted = json.loads(outcome.explanation_path.read_text(encoding="utf-8"))
+            self.assertTrue(persisted["insufficient_evidence"])
+
+    def test_insufficient_explanation_cannot_also_submit_facts_or_sources(self) -> None:
+        with TemporaryDirectory() as directory:
+            repository, workspace_id = _repository(Path(directory))
+            snapshot = repository.load(workspace_id)
+            for points, ids in ((["Unsupported claim"], []), ([], ["chunk_010"]), ([], ["forged"])):
+                with self.subTest(points=points, ids=ids), self.assertRaises(ExplainSectionError):
+                    create_explain_section(snapshot=snapshot, section_id=snapshot.sections[1].section_id,
+                        settings=_settings(), client=_FakeExplainClient(dict(explanation="证据不足。",
+                            key_points=points,source_chunk_ids=ids,insufficient_evidence=True)))
+
+    def test_paragraphs_and_configured_point_limit_reach_actual_request_and_artifact(self) -> None:
+        with TemporaryDirectory() as directory:
+            repository, workspace_id = _repository(Path(directory))
+            snapshot = repository.load(workspace_id)
+            settings = _settings().model_copy(update={"max_key_points": 1})
+            text = "  本节任务：识别极值。\r\n\r\n关键对象与输入输出：极值序列。  "
+            client = _FakeExplainClient(dict(explanation=text,key_points=["极值序列。"],
+                source_chunk_ids=["chunk_010"],insufficient_evidence=False))
+            outcome = create_explain_section(snapshot=snapshot,section_id=snapshot.sections[1].section_id,
+                settings=settings,client=client)
+            expected = "本节任务：识别极值。\n\n关键对象与输入输出：极值序列。"
+            self.assertEqual(outcome.explanation.explanation, expected)
+            self.assertIn("max_key_points: 1", client.user_prompt)
+            self.assertEqual(json.loads(outcome.explanation_path.read_text(encoding="utf-8"))["explanation"],expected)
+            client.response["key_points"] = ["要点一。", "要点二。"]
+            with self.assertRaises(ExplainSectionError):
+                create_explain_section(snapshot=snapshot,section_id=snapshot.sections[1].section_id,
+                    settings=settings,client=client)
+
+    def test_empty_context_still_requires_uncited_insufficient_result(self) -> None:
+        with TemporaryDirectory() as directory:
+            repository, workspace_id = _repository(Path(directory))
+            snapshot = repository.load(workspace_id)
+            (snapshot.root_dir / "chunks/chunks.jsonl").write_text("",encoding="utf-8")
+            snapshot = repository.load(workspace_id)
+            response = dict(explanation="无正文。",key_points=[],source_chunk_ids=[],insufficient_evidence=True)
+            output = create_explain_section(snapshot=snapshot,section_id=snapshot.sections[1].section_id,
+                settings=_settings(),client=_FakeExplainClient(response))
+            self.assertTrue(output.explanation.insufficient_evidence)
+            response["insufficient_evidence"] = False
+            with self.assertRaises(ExplainSectionError):
+                create_explain_section(snapshot=snapshot,section_id=snapshot.sections[1].section_id,
+                    settings=_settings(),client=_FakeExplainClient(response))
+
+
 def _settings() -> ExplainSectionSettings:
     return ExplainSectionSettings(
         max_tokens_per_chunk=300,

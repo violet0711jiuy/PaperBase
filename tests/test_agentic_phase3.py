@@ -13,6 +13,9 @@ from paperbase.agentic.contracts import (
     CandidateSelection,
     CoverageStrategy,
     CorpusScopeSnapshot,
+    EvidenceAnalysis,
+    EvidenceAnalysisStatus,
+    EvidenceClaim,
     EvidenceOwnership,
     EvidenceQualification,
     EvidenceRecord,
@@ -26,10 +29,9 @@ from paperbase.agentic.contracts import (
     ResearchGoal,
     ResearchObservation,
     ResearchPlan,
-    ResearchSubtask,
     ScopeSource,
 )
-from paperbase.agentic.coverage import CoverageManager, CoveragePolicy
+from paperbase.agentic.coverage import CoverageManager
 from paperbase.agentic.decision import DecisionState, _visible_evidence
 from paperbase.agentic.evidence_registry import EvidenceRegistry
 from paperbase.agentic.selector import FinalEvidenceSelector
@@ -40,6 +42,8 @@ from paperbase.overview.service import OverviewField, PaperOverview
 from paperbase.retrieval.contracts import (
     EvidenceSourceType,
     RetrievedEvidence,
+    ScoreKind,
+    ScoreDirection,
     ToolStatus,
 )
 
@@ -58,7 +62,6 @@ def _context(*, exhaustive: bool = False) -> QueryContext:
             else ResearchGoal.COMPARISON_SUPPORT
         ),
         default_evidence_targets=frozenset({EvidenceTarget.METHOD}),
-        requires_complete_coverage=exhaustive,
     )
 
 
@@ -70,6 +73,7 @@ def _record(
     ownership: EvidenceOwnership = EvidenceOwnership.THIS_PAPER,
     score: float = 0.5,
     section_id: str | None = None,
+    retrieval_rank: int = 1,
 ) -> EvidenceRecord:
     qualification = (
         EvidenceQualification(evidence_id, relation, ownership, "测试标注")
@@ -86,13 +90,28 @@ def _record(
             seed_chunk_ids=(f"{paper_id}-{evidence_id}",),
             source_chunk_ids=(f"{paper_id}-{evidence_id}",),
             content=f"{paper_id} evidence",
-            score=score,
+            raw_score=score,
+            score_kind=ScoreKind.RERANKER,
+            score_direction=ScoreDirection.HIGHER_IS_BETTER,
+            retrieval_rank=retrieval_rank,
         ),
         supporting_queries=("method",),
         first_seen_iteration=1,
         last_seen_iteration=1,
-        target_subtask_ids=(f"S{paper_id}",),
-        qualification=qualification,
+        assessment=(
+            EvidenceAnalysis(
+                evidence_id=evidence_id,
+                status=(EvidenceAnalysisStatus.IRRELEVANT if relation is EvidenceRelation.IRRELEVANT else EvidenceAnalysisStatus.QUALIFIED),
+                digest=f"{paper_id} evidence",
+                claims=() if relation is EvidenceRelation.IRRELEVANT else (
+                    EvidenceClaim(
+                        f"{evidence_id}:C1", f"{paper_id} evidence", relation,
+                        ownership, "测试标注", f"{paper_id} evidence",
+                    ),
+                ),
+            )
+            if qualification is not None else None
+        ),
     )
 
 
@@ -146,17 +165,12 @@ class _OverviewClient:
 
 
 class AgenticPhase3Tests(unittest.TestCase):
-    def test_qualification_rejects_unknown_evidence(self) -> None:
+    def test_analysis_rejects_unknown_evidence(self) -> None:
         registry = EvidenceRegistry()
         with self.assertRaisesRegex(ValueError, "未知 Evidence"):
-            registry.apply_qualifications(
+            registry.apply_analyses(
                 (
-                    EvidenceQualification(
-                        "E404",
-                        EvidenceRelation.SUPPORTS,
-                        EvidenceOwnership.THIS_PAPER,
-                        "不存在",
-                    ),
+                    EvidenceAnalysis("E404", EvidenceAnalysisStatus.IRRELEVANT),
                 )
             )
 
@@ -177,25 +191,34 @@ class AgenticPhase3Tests(unittest.TestCase):
         )
         self.assertIn("不代表事实不存在", coverage.assessments[1].rationale)
 
-    def test_exhaustive_coverage_requires_alternate_query(self) -> None:
-        manager = CoverageManager(CoveragePolicy(exhaustive_min_queries_per_paper=2))
-        first = manager.evaluate(
+    def test_direct_qualified_claim_does_not_require_fixed_query_count(self) -> None:
+        coverage = CoverageManager().evaluate(
+            context=_context(),
+            corpus_snapshot=None,
+            evidence=(_record("E1", "A", relation=EvidenceRelation.SUPPORTS),),
+            observations=(),
+        )
+
+        self.assertEqual(
+            coverage.assessments[0].status,
+            PaperAssessmentStatus.POSITIVE,
+        )
+
+    def test_exhaustive_coverage_uses_evidence_state_not_fixed_query_count(self) -> None:
+        coverage = CoverageManager().evaluate(
             context=_context(exhaustive=True),
             corpus_snapshot=None,
             evidence=(),
             observations=(_observation(("A", "direct"), ("B", "direct")),),
         )
-        self.assertFalse(first.coverage_complete)
-        second = manager.evaluate(
-            context=_context(exhaustive=True),
-            corpus_snapshot=None,
-            evidence=(),
-            observations=(
-                _observation(("A", "direct"), ("B", "direct")),
-                _observation(("A", "alternate"), ("B", "alternate")),
-            ),
+        self.assertTrue(coverage.coverage_complete)
+        self.assertEqual(
+            [item.status for item in coverage.assessments],
+            [
+                PaperAssessmentStatus.NO_SUPPORT_FOUND,
+                PaperAssessmentStatus.NO_SUPPORT_FOUND,
+            ],
         )
-        self.assertTrue(second.coverage_complete)
 
     def test_candidate_selection_does_not_count_as_body_verification(self) -> None:
         context = QueryContext(
@@ -270,7 +293,6 @@ class AgenticPhase3Tests(unittest.TestCase):
             scope_source=ScopeSource.KNOWLEDGE_BASE_ALL,
             retrieval_goal=ResearchGoal.EXHAUSTIVE_ENUMERATION,
             default_evidence_targets=frozenset({EvidenceTarget.METHOD}),
-            requires_complete_coverage=True,
         )
         snapshot = CorpusScopeSnapshot.create(("A", "B"))
         selection = CandidateSelection(
@@ -280,9 +302,7 @@ class AgenticPhase3Tests(unittest.TestCase):
                 CandidateAssessment("B", CandidateDisposition.EXCLUDED, "主题无关"),
             ),
         )
-        coverage = CoverageManager(
-            CoveragePolicy(exhaustive_min_queries_per_paper=2)
-        ).evaluate(
+        coverage = CoverageManager().evaluate(
             context=context,
             corpus_snapshot=snapshot,
             candidate_selection=selection,
@@ -312,13 +332,7 @@ class AgenticPhase3Tests(unittest.TestCase):
             ),
             observations=(_observation(("A", "method A"), ("B", "method B")),),
         )
-        plan = ResearchPlan(
-            "compare",
-            (
-                ResearchSubtask("SA", "A", ("A",), frozenset({EvidenceTarget.METHOD}), "A"),
-                ResearchSubtask("SB", "B", ("B",), frozenset({EvidenceTarget.METHOD}), "B"),
-            ),
-        )
+        plan = ResearchPlan("compare")
         selected = FinalEvidenceSelector(max_units=2).select(
             plan=plan, coverage=coverage, evidence=tuple(
                 [
@@ -345,11 +359,11 @@ class AgenticPhase3Tests(unittest.TestCase):
         )
         method_medium = _record(
             "E2", "A", relation=EvidenceRelation.SUPPORTS,
-            score=0.8, section_id="method",
+            score=0.8, section_id="method", retrieval_rank=2,
         )
         results_low = _record(
             "E3", "A", relation=EvidenceRelation.SUPPORTS,
-            score=0.3, section_id="results",
+            score=0.3, section_id="results", retrieval_rank=3,
         )
         coverage = CoverageManager().evaluate(
             context=_context(),
@@ -357,16 +371,9 @@ class AgenticPhase3Tests(unittest.TestCase):
             evidence=(method_high, method_medium, results_low),
             observations=(_observation(("A", "method"), ("B", "method")),),
         )
-        plan = ResearchPlan(
-            "collect complementary evidence",
-            (
-                ResearchSubtask(
-                    "SA", "A", ("A",), frozenset({EvidenceTarget.METHOD}), "A"
-                ),
-            ),
-        )
+        plan = ResearchPlan("collect complementary evidence")
 
-        selected = FinalEvidenceSelector(max_units=2, max_per_paper=2).select(
+        selected = FinalEvidenceSelector(max_units=2).select(
             plan=plan,
             coverage=coverage,
             evidence=(method_high, method_medium, results_low),
@@ -387,14 +394,7 @@ class AgenticPhase3Tests(unittest.TestCase):
             "E3", "A", relation=EvidenceRelation.SUPPORTS,
             score=0.3, section_id="results",
         )
-        plan = ResearchPlan(
-            "inspect sections",
-            (
-                ResearchSubtask(
-                    "SA", "A", ("A",), frozenset({EvidenceTarget.METHOD}), "A"
-                ),
-            ),
-        )
+        plan = ResearchPlan("inspect sections")
 
         visible = _visible_evidence(
             DecisionState(

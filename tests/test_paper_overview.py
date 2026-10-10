@@ -80,7 +80,7 @@ class PaperOverviewTests(unittest.TestCase):
             self.assertEqual(outcome.overview.datasets.content, "在 BenchSet 数据集上评估。")
             self.assertEqual(outcome.overview.datasets.source_sections, ["4 Experiments"])
             self.assertEqual(outcome.overview.main_results.content, "Accuracy 达到 91.2%。")
-            self.assertEqual(outcome.overview.limitations.content, "论文未明确说明")
+            self.assertEqual(outcome.overview.limitations.content, "当前速览证据未覆盖")
             self.assertEqual(outcome.overview.limitations.source_chunk_ids, [])
             self.assertTrue(outcome.overview_path.is_file())
             self.assertTrue(outcome.context_path.is_file())
@@ -155,6 +155,43 @@ class PaperOverviewTests(unittest.TestCase):
         self.assertEqual(shared.max_tokens, 500)
         self.assertEqual(overview.max_tokens, 1_600)
         self.assertEqual(overview.model, shared.model)
+
+
+    def test_missing_content_uses_context_scope_and_accepts_legacy_sentinel(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = _write_workspace(Path(directory)/"paper")
+            for missing in ("论文未明确说明", "当前速览证据未覆盖"):
+                response = _valid_response()
+                response["limitations"]["content"] = missing
+                output = create_paper_overview(workspace_root=workspace,settings=_overview_settings(),
+                    client=_FakeOverviewClient(response))
+                self.assertEqual(output.overview.limitations.content,"当前速览证据未覆盖")
+                self.assertEqual(output.overview.limitations.source_chunk_ids,[])
+                response["limitations"]["source_chunk_ids"] = ["chunk_005"]
+                with self.assertRaises(PaperOverviewError):
+                    create_paper_overview(workspace_root=workspace,settings=_overview_settings(),
+                        client=_FakeOverviewClient(response))
+
+    def test_missing_title_is_separate_from_missing_body_fields(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = _write_workspace(Path(directory)/"paper")
+            (workspace/"parsed/parsed_paper.json").write_text("{}",encoding="utf-8")
+            for missing_title in ("未提供论文标题", "论文未明确说明"):
+                response = _valid_response()
+                response["paper_title"] = missing_title
+                output = create_paper_overview(workspace_root=workspace,settings=_overview_settings(),
+                    client=_FakeOverviewClient(response))
+                self.assertEqual(output.overview.paper_title,"未提供论文标题")
+                self.assertEqual(output.overview.limitations.content,"当前速览证据未覆盖")
+
+    def test_uncited_nonmissing_content_still_rejected(self) -> None:
+        with TemporaryDirectory() as directory:
+            workspace = _write_workspace(Path(directory)/"paper")
+            response = _valid_response()
+            response["limitations"]["content"] = "The paper has no limitations."
+            with self.assertRaises(PaperOverviewError):
+                create_paper_overview(workspace_root=workspace,settings=_overview_settings(),
+                    client=_FakeOverviewClient(response))
 
 
 def _write_workspace(root: Path) -> Path:

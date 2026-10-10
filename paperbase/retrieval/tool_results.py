@@ -12,11 +12,14 @@ from .contracts import (
     PaperSearchStatus,
     QueryOrigin,
     RetrievedEvidence,
+    ScoreKind,
+    ScoreDirection,
     SearchPapersPayload,
     ToolName,
     ToolResult,
     ToolStatus,
 )
+from .evidence_scores import chunk_score_fields
 
 
 def build_search_papers_tool_result(
@@ -44,35 +47,20 @@ def _execution_to_outcome(execution: PaperBatchExecution) -> PaperSearchOutcome:
             else PaperSearchStatus.ERROR
         )
         return PaperSearchOutcome(
-            paper_id=execution.paper_id,
+            search=execution.search,
             status=status,
-            query=execution.query,
-            lexical_terms=execution.lexical_terms,
-            evidence_targets=execution.evidence_targets,
-            missing_information=execution.missing_information,
-            target_subtask_id=execution.target_subtask_id,
             error_code=execution.error_code,
         )
     if not isinstance(execution.result, PaperRetrievalSnapshot):
         return PaperSearchOutcome(
-            paper_id=execution.paper_id,
+            search=execution.search,
             status=PaperSearchStatus.ERROR,
-            query=execution.query,
-            lexical_terms=execution.lexical_terms,
-            evidence_targets=execution.evidence_targets,
-            missing_information=execution.missing_information,
-            target_subtask_id=execution.target_subtask_id,
             error_code="InvalidAdapterResult",
         )
     evidence = _snapshot_to_evidence(execution.result)
     return PaperSearchOutcome(
-        paper_id=execution.paper_id,
+        search=execution.search,
         status=PaperSearchStatus.OK if evidence else PaperSearchStatus.EMPTY,
-        query=execution.query,
-        lexical_terms=execution.lexical_terms,
-        evidence_targets=execution.evidence_targets,
-        missing_information=execution.missing_information,
-        target_subtask_id=execution.target_subtask_id,
         evidence_candidates=evidence,
     )
 
@@ -86,13 +74,17 @@ def _snapshot_to_evidence(
     if snapshot.expansion is not None:
         evidence: list[RetrievedEvidence] = []
         for unit in snapshot.expansion.evidence:
-            seed_scores = [
-                chunks_by_id[chunk_id].rerank_score
-                if chunks_by_id[chunk_id].rerank_score is not None
-                else chunks_by_id[chunk_id].fused_score
+            seeds = [
+                chunks_by_id[chunk_id]
                 for chunk_id in unit.seed_chunk_ids
                 if chunk_id in chunks_by_id
             ]
+            # An expanded window is not reranked itself. Inherit the best
+            # returned seed's contract, never max heterogeneous seed scores.
+            best_seed = min(seeds, key=lambda chunk: chunk.rank) if seeds else None
+            score_fields = (chunk_score_fields(best_seed) if best_seed is not None else
+                            dict(raw_score=None, score_kind=ScoreKind.NON_RANKED,
+                                 score_direction=ScoreDirection.NOT_APPLICABLE, retrieval_rank=None))
             evidence.append(
                 RetrievedEvidence(
                     source_type=EvidenceSourceType(unit.kind),
@@ -105,10 +97,13 @@ def _snapshot_to_evidence(
                     page_start=unit.page_start,
                     page_end=unit.page_end,
                     content=unit.text,
-                    score=max(seed_scores) if seed_scores else None,
+                    **score_fields,
                     retrieval_metadata={
                         "reranking_status": snapshot.retrieval.reranking_status,
                         "expanded": True,
+                        "score_scope": "best_seed_chunk" if best_seed is not None else "non_ranked",
+                        "score_seed_chunk_id": best_seed.chunk_id if best_seed is not None else None,
+                        "rerank_score_normalized": getattr(best_seed, "rerank_score_normalized", None),
                     },
                 )
             )
@@ -125,11 +120,12 @@ def _snapshot_to_evidence(
             page_start=chunk.page_start,
             page_end=chunk.page_end,
             content=chunk.raw_text,
-            score=chunk.rerank_score if chunk.rerank_score is not None else chunk.fused_score,
+            **chunk_score_fields(chunk),
             retrieval_metadata={
                 "rank": chunk.rank,
                 "pre_rerank_rank": chunk.pre_rerank_rank,
                 "reranking_status": snapshot.retrieval.reranking_status,
+                "rerank_score_normalized": getattr(chunk, "rerank_score_normalized", None),
                 "expanded": False,
                 "source_matches": tuple(
                     {
@@ -137,6 +133,8 @@ def _snapshot_to_evidence(
                         "query": match.query,
                         "rank": match.rank,
                         "raw_score": match.raw_score,
+                        "score_kind": match.score_kind.value,
+                        "score_direction": match.score_direction.value,
                         "effective_weight": match.effective_weight,
                     }
                     for match in chunk.source_matches

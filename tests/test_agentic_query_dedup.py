@@ -9,7 +9,7 @@ from paperbase.agentic.contracts import (
     QueryScope,
     ResearchGoal,
     ResearchPlan,
-    ResearchSubtask,
+    ResearchRequirement,
     ScopeSource,
     SearchPapersAction,
 )
@@ -33,14 +33,11 @@ def _context() -> QueryContext:
 
 def _plan() -> ResearchPlan:
     return ResearchPlan(
-        "比较方法",
-        (
-            ResearchSubtask(
-                "S1",
-                "比较方法",
-                ("A", "B"),
-                frozenset({EvidenceTarget.METHOD}),
-                "获得两篇方法证据",
+        goal="比较方法",
+        requirements=(
+            ResearchRequirement(
+                "R1", "比较方法",
+                evidence_targets=frozenset({EvidenceTarget.METHOD}),
             ),
         ),
     )
@@ -51,16 +48,14 @@ class PerPaperQueryDedupTests(unittest.TestCase):
         tracker = BudgetAndGuardTracker(AgenticResearchSettings())
         first = SearchPapersAction(
             (
-                PaperSearchSpec("A", "Temporal   Encoder", target_subtask_id="S1"),
-                PaperSearchSpec("B", "Graph decoder", target_subtask_id="S1"),
+                PaperSearchSpec("A", "Temporal   Encoder", requirement_ids=("R1",)),
+                PaperSearchSpec("B", "Graph decoder", requirement_ids=("R1",)),
             ),
-            "S1",
         )
         repeated_in_new_batch = SearchPapersAction(
             (
-                PaperSearchSpec("A", " temporal encoder ", target_subtask_id="S1"),
+                PaperSearchSpec("A", " Temporal Encoder ", requirement_ids=("R1",)),
             ),
-            "S1",
         )
 
         accepted = tracker.validate_action(
@@ -69,6 +64,7 @@ class PerPaperQueryDedupTests(unittest.TestCase):
             plan=_plan(),
             snapshot=None,
         )
+        tracker.record_tool_call(first)
         rejected = tracker.validate_action(
             repeated_in_new_batch,
             context=_context(),
@@ -87,8 +83,8 @@ class PerPaperQueryDedupTests(unittest.TestCase):
         first_tracker = BudgetAndGuardTracker(AgenticResearchSettings())
         action = SearchPapersAction(
             (
-                PaperSearchSpec("A", "method"),
-                PaperSearchSpec("B", "decoder"),
+                PaperSearchSpec("A", "method", requirement_ids=("R1",)),
+                PaperSearchSpec("B", "decoder", requirement_ids=("R1",)),
             )
         )
         self.assertTrue(
@@ -100,11 +96,12 @@ class PerPaperQueryDedupTests(unittest.TestCase):
             ).accepted
         )
 
+        first_tracker.record_tool_call(action)
         restored = BudgetAndGuardTracker(
             AgenticResearchSettings(), state=first_tracker.snapshot()
         )
         decision = restored.validate_action(
-            SearchPapersAction((PaperSearchSpec("A", "METHOD"),)),
+            SearchPapersAction((PaperSearchSpec("A", "method", requirement_ids=("R1",)),)),
             context=_context(),
             plan=_plan(),
             snapshot=None,
