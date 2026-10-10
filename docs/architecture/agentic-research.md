@@ -33,7 +33,7 @@ flowchart TD
 | Tools | canonical request | 原始 `RetrievedEvidence` 与真实执行回执 |
 | Evidence Registry | Tool Evidence | 稳定 E#/REF#、provenance、检索来源和 Requirement 请求绑定；不判断语义支持 |
 | Grounded Answerer | 原问题、全部 Registry Evidence、required Requirements、已接受答案 | 每项 `answer + citations` 或 `remaining_gap` |
-| Span validator | citation IDs | 检查 Evidence 存在、span 存在、顺序和连续性，恢复逐字原文 |
+| Span validator | citation IDs | 检查 Evidence 存在、span 存在与顺序；有序稀疏选择拆为多个连续 anchor，恢复逐字原文 |
 | Graph | Answer attempt | complete 时结束；有 gap 时反馈 Decision；同一 Evidence 快照最多一次聚焦重读 |
 | Renderer | 已校验 RequirementAnswer | 确定性 `ResearchAnswer`，不新增事实 |
 
@@ -51,7 +51,7 @@ flowchart TD
 
 - `ResearchRequirement` 保持宽粒度。`evidence_targets` 是检索意图提示，不是支持结论。
 - `EvidenceRecord.requested_requirement_ids` 只记录这条 Evidence 因何被找到；Answerer 可以把它用于任何 Requirement。
-- `GroundedCitation` 保存 `evidence_id`、连续 `source_span_ids` 和程序恢复的 `source_excerpt`。
+- `GroundedCitation` 保存 `evidence_id`、连续 `source_span_ids` 和程序恢复的 `source_excerpt`。模型若在同一 Evidence 中选择多个有序但分离的区间，程序只按 gap 拆成多条 citation；不扩张、重排或补 span。未知、重复、乱序及过度碎片化仍为硬失败。
 - `RequirementAnswer` 二选一：有 answer 时必须有 citation；无 answer 时必须有非空 `remaining_gap` 且不能带 citation。
 - `GroundedAnswerAttempt.evidence_ids` 仅表示实际引用的 Evidence；完整输入快照另存于 `ResearchRunResult.answer_input_evidence_ids`。
 - `selected_evidence` 是实际引用集，不再表示一个独立 Selector 的产物。

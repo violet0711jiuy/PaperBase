@@ -19,6 +19,7 @@ _SENTENCE_END = re.compile(
 _DISPLAY_MATH = re.compile(r"(?:\\begin\{|\\frac|\\sum|\\int|\$\$|\\\[|\\\])")
 _MAX_ENVELOPE_CHARS = 2400
 _MAX_ENVELOPE_SPANS = 16
+_MAX_CITATION_RUNS = 8
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,46 @@ def resolve_source_span_ids(content: str, span_ids: Iterable[str]) -> str:
     ):
         raise SourceSpanResolutionError("source_spans_too_broad")
     return content[first.start:last.end]
+
+
+def partition_source_span_ids(
+    content: str, span_ids: Iterable[str]
+) -> tuple[tuple[str, ...], ...]:
+    """Split an ordered selection into independently contiguous anchors.
+
+    A model may select two relevant passages from the same Evidence while
+    omitting unrelated sentences between them.  Expanding to the enclosing
+    range would silently cite those sentences, while rejecting the answer
+    loses otherwise valid grounding.  This function preserves the exact IDs
+    and their order, splitting only at gaps.  Unknown, duplicate, or
+    out-of-order IDs remain hard failures.
+    """
+    requested = tuple(span_ids)
+    if not requested:
+        raise SourceSpanResolutionError("source_span_missing")
+    if len(set(requested)) != len(requested):
+        raise SourceSpanResolutionError("source_spans_duplicate")
+    spans = build_source_spans(content)
+    by_id = {span.span_id: index for index, span in enumerate(spans)}
+    if any(span_id not in by_id for span_id in requested):
+        raise SourceSpanResolutionError("source_span_not_found")
+    indices = [by_id[span_id] for span_id in requested]
+    if indices != sorted(indices):
+        raise SourceSpanResolutionError("source_spans_out_of_order")
+
+    runs: list[list[str]] = [[requested[0]]]
+    for previous, current, span_id in zip(indices, indices[1:], requested[1:]):
+        if current == previous + 1:
+            runs[-1].append(span_id)
+        else:
+            runs.append([span_id])
+    if len(runs) > _MAX_CITATION_RUNS:
+        raise SourceSpanResolutionError("source_spans_too_fragmented")
+    result = tuple(tuple(run) for run in runs)
+    # Reuse the canonical envelope checks for each independently cited run.
+    for run in result:
+        resolve_source_span_ids(content, run)
+    return result
 
 
 def source_span_ids_for_excerpt(content: str, excerpt: str) -> tuple[str, ...]:

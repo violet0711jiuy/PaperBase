@@ -27,7 +27,7 @@ class CompactDecisionLimits:
     recent_queries: int = 3
     recent_actions: int = 3
     sections: int = 10
-    support_scope_chars: int = 600
+    support_scope_chars: int = 160
     unresolved_aspects: int = 6
     unresolved_aspect_chars: int = 240
     entity_hints: int = 12
@@ -193,14 +193,11 @@ def build_compact_decision_view(
                 requirement.evidence_targets, capabilities.available_tools
             ),
             "accepted_answer": ({
-                "text": answer.answer,
-                "citations": [
-                    {
-                        "evidence_id": citation.evidence_id,
-                        "source_span_ids": citation.source_span_ids,
-                    }
-                    for citation in answer.citations
-                ],
+                "status": ("complete" if answer.complete else
+                           "partial" if answer.answer is not None else "gap"),
+                "cited_evidence_ids": tuple(dict.fromkeys(
+                    citation.evidence_id for citation in answer.citations
+                )),
                 "remaining_gap": answer.remaining_gap,
             } if answer is not None else None),
         })
@@ -213,7 +210,7 @@ def build_compact_decision_view(
     visible = ordered[:catalog_limit]
     newest_iteration = max((record.last_seen_iteration for record in ordered), default=0)
     catalog: list[dict[str, object]] = []
-    latest: list[dict[str, object]] = []
+    latest_ids: list[str] = []
     for record in visible:
         source = record.evidence
         row = {
@@ -222,15 +219,26 @@ def build_compact_decision_view(
             "section_id": source.section_id,
             "section": _clip(source.section or "", 240),
             "source_chunk_ids": source.source_chunk_ids,
-            "retrieved_by_queries": record.supporting_queries,
             "last_seen_iteration": record.last_seen_iteration,
+            "source_preview": _clip(source.content, limits.support_scope_chars),
         }
         catalog.append(row)
         if record.last_seen_iteration == newest_iteration:
-            latest.append({**row, "source_preview": _clip(source.content, limits.support_scope_chars)})
+            latest_ids.append(record.evidence_id)
 
     coverage = state.coverage
     events = build_recent_research_events(state)
+    recovery = _action_recovery_constraint(state)
+    if state.last_action_rejection is not None:
+        rejection = state.last_action_rejection
+        events = [
+            event for event in events
+            if not (
+                event["iteration"] == rejection.iteration
+                and event["tool"] == rejection.action_name
+                and event["outcome"] == rejection.rejection_code
+            )
+        ]
     payload: dict[str, object] = {
         "view_type": "GroundedAnswerDecisionView",
         "question": state.context.resolved_query,
@@ -238,9 +246,9 @@ def build_compact_decision_view(
         "scope": state.context.scope.value,
         "trusted_paper_ids": state.context.target_paper_ids,
         "runtime_action_capabilities": _runtime_decision_view(capabilities),
-        "action_recovery": _action_recovery_constraint(state),
+        "action_recovery": recovery,
         "requirements": requirements,
-        "latest_tool_evidence": latest,
+        "latest_tool_evidence_ids": latest_ids,
         "evidence_catalog": catalog,
         "evidence_catalog_omitted": max(0, len(ordered) - len(visible)),
         "recent_research_events": events[-max(
@@ -260,7 +268,10 @@ def build_compact_decision_view(
                 if state.max_agent_iterations is not None else None
             ),
         },
-        "previous_validation_errors": [_repair_payload(error) for error in errors[-1:]],
+        "previous_validation_errors": (
+            [] if recovery is not None
+            else [_repair_payload(error) for error in errors[-1:]]
+        ),
     }
     if not state.observations and not state.action_rejections:
         payload["initial_search_hints"] = build_initial_search_hints(state.context)

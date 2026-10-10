@@ -36,7 +36,7 @@ required Requirement 只有同时具备 answer 与 citation 才算 grounded comp
 
 ## Span 校验
 
-Answerer 只能引用为每条 Evidence 预切分的 span ID。本地校验要求 ID 存在、顺序正确、组合连续，并从源文本恢复 excerpt。乱序、不连续、未知 Evidence 或未知 span 都是硬失败；程序不模糊匹配模型复制文本。
+Answerer 只能引用为每条 Evidence 预切分的 span ID。本地校验要求 ID 存在且顺序正确，并从源文本恢复 excerpt。有序但不连续的选择按 gap 确定性拆成多个连续 anchor，不扩张引用范围；乱序、重复、未知 Evidence、未知 span 或过度碎片化仍是硬失败。程序不模糊匹配模型复制文本。
 
 ## 解释边界
 

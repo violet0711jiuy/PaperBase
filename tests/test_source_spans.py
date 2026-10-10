@@ -5,6 +5,7 @@ import pytest
 from paperbase.agentic.source_spans import (
     SourceSpanResolutionError,
     build_source_spans,
+    partition_source_span_ids,
     resolve_source_span_ids,
 )
 
@@ -36,6 +37,19 @@ def test_sparse_or_out_of_order_span_ids_are_rejected(span_ids, code) -> None:
     with pytest.raises(SourceSpanResolutionError) as caught:
         resolve_source_span_ids(content, span_ids)
     assert caught.value.code == code
+
+
+def test_ordered_sparse_span_ids_are_partitioned_without_expanding_source() -> None:
+    content = "First fact. Unrelated sentence. Third fact. Fourth fact."
+    assert partition_source_span_ids(content, ("S1", "S3", "S4")) == (
+        ("S1",), ("S3", "S4"),
+    )
+
+
+def test_partition_keeps_out_of_order_ids_as_hard_failure() -> None:
+    with pytest.raises(SourceSpanResolutionError) as caught:
+        partition_source_span_ids("First fact. Second fact. Third fact.", ("S3", "S1"))
+    assert caught.value.code == "source_spans_out_of_order"
 
 
 @pytest.mark.parametrize(

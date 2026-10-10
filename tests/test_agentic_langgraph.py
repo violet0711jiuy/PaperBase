@@ -11,11 +11,13 @@ from paperbase.agentic.contracts import (
     TryAnswerAction,
 )
 from paperbase.agentic.decision import ScriptedDecisionAgent
+from paperbase.agentic.grounded_answer import GroundedAnswerAttemptsExhausted
 from paperbase.agentic.graph import LangGraphResearchWorkflow
 from paperbase.agentic.planner import ResearchPlanner
 from paperbase.agentic.query_understanding import QueryUnderstandingService
 from paperbase.agentic.scope_resolver import ScopeResolver
 from paperbase.config import AgenticResearchSettings
+from paperbase.llm.client import LLMCallRecord
 from paperbase.retrieval.contracts import (
     EvidenceSourceType,
     PaperSearchOutcome,
@@ -140,3 +142,22 @@ def test_stop_research_uses_answerer_to_return_explicit_gap() -> None:
     )
     assert result.status is ResearchRunStatus.NO_EVIDENCE
     assert result.answer is not None and result.answer.insufficient_evidence
+
+
+def test_failed_answer_attempts_remain_auditable_without_selecting_all_evidence() -> None:
+    class InvalidAnswerer:
+        def answer(self, *, question, plan, evidence, accepted_answers=()):
+            diagnostic = LLMCallRecord(
+                node="grounded_answer", attempt=2, success=False,
+                error_stage="domain_validation", recovery_action="fallback",
+            )
+            raise GroundedAnswerAttemptsExhausted(ValueError("invalid spans"), (diagnostic,))
+
+    result = _workflow(
+        (_search(), TryAnswerAction("evidence retrieved")), InvalidAnswerer()
+    ).run("Paper One 的方法是什么？", selected_paper_ids=("P1",))
+
+    assert result.stop_reason is StopReason.FATAL_ERROR
+    assert result.selected_evidence == ()
+    assert result.answer_input_evidence_ids == ("E1",)
+    assert result.llm_diagnostics[-1].node == "grounded_answer"

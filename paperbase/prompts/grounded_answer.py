@@ -16,6 +16,7 @@ GROUNDED_ANSWER_SYSTEM_PROMPT = """\
 
 对每个 Requirement 必须且只能输出一项，顺序与输入一致：
 - 能回答时：answer 写实际回答，citations 至少一项，且每项只选择同一 Evidence 中直接支持该回答的 source_span_ids。
+- 同一 citation 内的 source_span_ids 必须按原文顺序连续；若同一 Evidence 的支持位于多个分离区间，重复 evidence_id 并输出多条 citation，每条只含一个连续区间。
 - 只能部分回答时：仍输出有引用的 answer，并在 remaining_gap 明确写尚缺的关键信息。
 - 完全无法回答时：answer=null、citations=[]，remaining_gap 明确写当前还缺什么。
 

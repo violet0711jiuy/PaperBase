@@ -101,6 +101,21 @@ def test_answer_text_without_source_spans_never_becomes_grounded():
     assert len(client.calls) == 2
 
 
+def test_ordered_non_contiguous_spans_become_separate_exact_citations():
+    payload = complete_payload()
+    payload["answers"][0]["citations"] = [
+        {"evidence_id": "E1", "source_span_ids": ["S1", "S3"]}
+    ]
+    result = LLMGroundedAnswerer(QueueClient(payload)).answer(
+        question="How does the method work?", plan=plan(), evidence=(evidence(),)
+    )
+
+    citations = result.requirements[0].citations
+    assert [item.source_span_ids for item in citations] == [("S1",), ("S3",)]
+    assert citations[0].source_excerpt.startswith("MPIWcapt")
+    assert citations[1].source_excerpt.startswith("C_i")
+
+
 def test_unanswered_requirement_must_expose_a_gap():
     partial = complete_payload()
     partial["answers"][1] = {

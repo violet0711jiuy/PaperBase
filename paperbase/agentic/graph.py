@@ -44,7 +44,11 @@ from .contracts import (
     ScopeResolutionStatus,
     StopReason,
 )
-from .grounded_answer import GroundedAnswerer, render_grounded_answer
+from .grounded_answer import (
+    GroundedAnswerAttemptsExhausted,
+    GroundedAnswerer,
+    render_grounded_answer,
+)
 from .candidate_selection import CandidateSelector
 from .checkpoint_serde import (
     CheckpointValue,
@@ -1210,6 +1214,9 @@ def _generate_answer(
         tracker.record_preparation_llm_calls(len(attempt.llm_diagnostics))
         answer = render_grounded_answer(attempt, plan)
     except Exception as error:
+        diagnostics = tuple(getattr(error, "diagnostics", ()) or ())
+        tracker.record_preparation_llm_calls(len(diagnostics))
+        root_error = error.cause if isinstance(error, GroundedAnswerAttemptsExhausted) else error
         fallback = ResearchAnswer(
             status="fallback",
             answer="回答生成未完成；系统保留了已检索到的原始论文证据，供重新尝试。",
@@ -1218,9 +1225,12 @@ def _generate_answer(
         )
         return {
             "answer": dump_contract(fallback, ResearchAnswer),
-            "selected_evidence": dump_contract(registry.records, tuple[EvidenceRecord, ...]),
+            "selected_evidence": dump_contract((), tuple[EvidenceRecord, ...]),
+            "answer_evidence_ids": [record.evidence_id for record in registry.records],
+            "llm_diagnostics": _append_llm_diagnostics(state, diagnostics),
             "error_codes": list(dict.fromkeys(
-                (*state.get("error_codes", []), f"GroundedAnswer:{type(error).__name__}")
+                (*state.get("error_codes", []),
+                 f"GroundedAnswer:{type(root_error).__name__}")
             )),
             "guard_state": dump_contract(tracker.snapshot(), GuardState),
             "terminal_status": _partial_or_no_evidence(registry).value,

@@ -34,6 +34,7 @@ from .contracts import (
 from .schemas import GroundedAnswerDraft
 from .source_spans import (
     SourceSpanResolutionError,
+    partition_source_span_ids,
     resolve_source_span_ids,
     source_spans_payload,
 )
@@ -45,6 +46,15 @@ class GroundedAnswerValidationError(ValueError):
         self.code = code
         self.field_path = field_path
         self.safe_reason = safe_reason
+
+
+class GroundedAnswerAttemptsExhausted(RuntimeError):
+    """All provider attempts failed, with safe diagnostics retained."""
+
+    def __init__(self, cause: Exception, diagnostics: Sequence[LLMCallRecord]) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.diagnostics = tuple(diagnostics)
 
 
 class GroundedAnswerer(Protocol):
@@ -175,7 +185,7 @@ class LLMGroundedAnswerer:
                 ))
                 errors = [_safe_error(error)]
                 if not can_retry:
-                    raise
+                    raise GroundedAnswerAttemptsExhausted(error, diagnostics) from error
         raise RuntimeError("Grounded Answer attempts exhausted.")
 
 
@@ -313,24 +323,33 @@ def _convert_grounded_answer(
                     f"answers[{index}].citations[{citation_index}].evidence_id",
                     "Citation Evidence must belong to the supplied Evidence Pack.",
                 )
-            span_ids = tuple(citation.source_span_ids)
-            identity = (citation.evidence_id, span_ids)
-            if identity in seen:
-                raise GroundedAnswerValidationError(
-                    "ANSWER_DUPLICATE_CITATION",
-                    f"answers[{index}].citations[{citation_index}]",
-                    "Duplicate citations are not allowed.",
-                )
-            seen.add(identity)
             try:
-                excerpt = resolve_source_span_ids(record.evidence.content, span_ids)
+                runs = partition_source_span_ids(
+                    record.evidence.content, citation.source_span_ids
+                )
             except SourceSpanResolutionError as error:
                 raise GroundedAnswerValidationError(
                     f"ANSWER_{error.code.upper()}",
                     f"answers[{index}].citations[{citation_index}].source_span_ids",
-                    "Citation span IDs must be known, ordered, contiguous and locally bounded.",
+                    "Citation span IDs must be known, ordered and locally bounded.",
                 ) from error
-            citations.append(GroundedCitation(citation.evidence_id, span_ids, excerpt))
+            for span_ids in runs:
+                identity = (citation.evidence_id, span_ids)
+                if identity in seen:
+                    raise GroundedAnswerValidationError(
+                        "ANSWER_DUPLICATE_CITATION",
+                        f"answers[{index}].citations[{citation_index}]",
+                        "Duplicate citations are not allowed.",
+                    )
+                seen.add(identity)
+                excerpt = resolve_source_span_ids(record.evidence.content, span_ids)
+                citations.append(GroundedCitation(citation.evidence_id, span_ids, excerpt))
+        if len(citations) > 8:
+            raise GroundedAnswerValidationError(
+                "ANSWER_CITATIONS_TOO_FRAGMENTED",
+                f"answers[{index}].citations",
+                "A Requirement answer may use at most eight contiguous citation anchors.",
+            )
         converted.append(RequirementAnswer(item.requirement_id, answer, tuple(citations), gap))
     accepted_by_id = {item.requirement_id: item for item in accepted_answers}
     for index, item in enumerate(converted):
