@@ -1,4 +1,4 @@
-"""E1 evaluation DTOs; no execution policy or semantic judging lives here."""
+"""Typed deterministic evaluation contracts for the Grounded Answer architecture."""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass
@@ -6,22 +6,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Protocol
 
-EVALUATION_SCHEMA_VERSION = "agentic-eval-v2"
+EVALUATION_SCHEMA_VERSION = "agentic-grounded-answer-eval-v3"
 
 
 def json_safe(value):
     if is_dataclass(value):
         return {f.name: json_safe(getattr(value, f.name)) for f in fields(value)}
-    if isinstance(value, Enum):
-        return value.value
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, Enum): return value.value
+    if isinstance(value, Path): return str(value)
+    if isinstance(value, Mapping): return {str(k): json_safe(v) for k, v in value.items()}
     if isinstance(value, (tuple, list, set, frozenset)):
-        return [json_safe(v) for v in (sorted(value) if isinstance(value, (set, frozenset)) else value)]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
+        values = sorted(value) if isinstance(value, (set, frozenset)) else value
+        return [json_safe(v) for v in values]
+    if value is None or isinstance(value, (str, int, float, bool)): return value
     raise TypeError(f"Unsupported evaluation value: {type(value).__name__}")
 
 
@@ -38,10 +35,8 @@ class GoldenValidation:
     issues: tuple[DatasetIssue, ...]
     actual_fields: tuple[str, ...]
     database_checked: bool
-
     @property
-    def valid(self):
-        return not self.issues
+    def valid(self): return not self.issues
 
 
 @dataclass(frozen=True)
@@ -50,10 +45,8 @@ class EvidenceTrace:
     paper_id: str | None
     source_chunk_ids: tuple[str, ...] | None
     seed_chunk_ids: tuple[str, ...] = ()
-    qualified: bool | None = None
-    projected: bool | None = None
-    verified_requirement_ids: tuple[str, ...] | None = None
-    projection_types: tuple[str, ...] | None = None
+    presented_to_answerer: bool | None = None
+    cited_requirement_ids: tuple[str, ...] | None = None
     selected: bool | None = None
     cited: bool | None = None
 
@@ -74,7 +67,7 @@ class ResearchStep:
     retrieval_executed: bool | None
     executed_queries: int | None
     candidates: tuple[RetrievalCandidate, ...] | None
-    new_verified_support: int | None
+    new_evidence_count: int | None
 
 
 @dataclass(frozen=True)
@@ -82,8 +75,10 @@ class RequirementTrace:
     requirement_id: str
     description: str
     required: bool
-    projection_type: str | None
     status: str | None
+    answer_present: bool | None = None
+    citation_evidence_ids: tuple[str, ...] | None = None
+    remaining_gap: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,31 +128,29 @@ class EvidenceFunnelEvaluation:
     gold_chunk_ids: tuple[str, ...]
     gold_retrieved_chunk_ids: tuple[str, ...] | None
     gold_registered_chunk_ids: tuple[str, ...] | None
-    gold_projected_chunk_ids: tuple[str, ...] | None
-    gold_verified_chunk_ids: tuple[str, ...] | None
-    gold_selected_chunk_ids: tuple[str, ...] | None
+    gold_answer_input_chunk_ids: tuple[str, ...] | None
     gold_cited_chunk_ids: tuple[str, ...] | None
     observed_gold_retrieved_chunk_ids: tuple[str, ...]
-    gold_verified_selected_chunk_ids: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
 class RequirementEvaluation:
     requirement_id: str
     description: str
-    projection_type: str | None
     status: str | None
     required: bool
-    verified_supporting_evidence_ids: tuple[str, ...] | None
+    answer_present: bool | None
+    citation_evidence_ids: tuple[str, ...] | None
+    remaining_gap: str | None
 
 
 @dataclass(frozen=True)
 class ResearchEvaluation:
     planned_requirement_count: int | None
     required_requirement_count: int | None
-    verified_supported_requirement_count: int | None
-    unsupported_requirement_count: int | None
-    requirement_support_rate: float | None
+    answered_requirement_count: int | None
+    open_gap_requirement_count: int | None
+    requirement_answer_rate: float | None
     requirements: tuple[RequirementEvaluation, ...]
 
 
@@ -169,7 +162,7 @@ class AnswerEvaluation:
     citation_count: int | None
     citation_validity: float | None
     invalid_citation_ids: tuple[str, ...] | None
-    selected_evidence_citation_coverage: float | None
+    answer_input_citation_coverage: float | None
     gold_citation_coverage: float | None
     correct_abstention: bool | None
     unsafe_non_abstention: bool | None
@@ -187,8 +180,8 @@ class EfficiencyEvaluation:
     iterations: int | None
     llm_calls: int | None
     executed_actions: int | None
-    zero_support_actions: int | None
-    actions_until_first_verified_support: int | None
+    zero_new_evidence_actions: int | None
+    actions_until_first_new_evidence: int | None
     consecutive_no_progress_peak: int | None
     decision_llm_calls: int | None
 
@@ -210,13 +203,9 @@ class AgenticCaseEvaluation:
     observability_gaps: tuple[str, ...]
     dataset_issues: tuple[DatasetIssue, ...] = ()
     evaluation_schema_version: str = EVALUATION_SCHEMA_VERSION
-
     @property
-    def observability_gap(self):
-        return bool(self.observability_gaps)
-
-    def to_dict(self):
-        return {**json_safe(self), "observability_gap": self.observability_gap}
+    def observability_gap(self): return bool(self.observability_gaps)
+    def to_dict(self): return {**json_safe(self), "observability_gap": self.observability_gap}
 
 
 @dataclass(frozen=True)
@@ -247,5 +236,5 @@ class SemanticJudgeResult:
 
 
 class SemanticAnswerJudge(Protocol):
-    """E2 extension point only. E1 never invokes a judge."""
+    """Optional E2 extension point. The deterministic E1 evaluator never invokes it."""
     def judge(self, case, answer, evidence) -> SemanticJudgeResult: ...

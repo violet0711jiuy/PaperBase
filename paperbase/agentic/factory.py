@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from paperbase.config import load_settings
 from paperbase.database import MetadataDatabase
 from paperbase.generation.section_expander import SectionAwareNeighborExpander
-from paperbase.generation.answer_generator import GroundedAnswerGenerator
 from paperbase.llm.client import (
     ChatCompletionClient,
     create_chat_completion_client,
@@ -24,8 +23,7 @@ from paperbase.retrieval.service import create_hybrid_retriever
 from .decision import LLMDecisionAgent
 from .decision_view import CompactDecisionLimits
 from .candidate_selection import FormalPaperMetadataRepository, LLMCandidateSelector
-from .evidence_projection import LLMEvidenceProjector
-from .evidence_analysis_cache import SQLiteEvidenceAnalysisCache
+from .grounded_answer import LLMGroundedAnswerer
 from .graph import LangGraphResearchWorkflow
 from .persistence import SQLiteCheckpointStore
 from .planner import ResearchPlanner
@@ -110,15 +108,6 @@ def create_agentic_research_service(
         active_client, temperature=temperature_for("planner"),
         structured_output_mode=critical_mode,
     ))
-    evidence_client = sampling_view(structured_client_view(
-        active_client, temperature=temperature_for("projector"),
-        structured_output_mode=critical_mode,
-    ))
-    with_evidence_timeout = getattr(evidence_client, "with_timeout_seconds", None)
-    if callable(with_evidence_timeout):
-        evidence_client = with_evidence_timeout(
-            settings.agentic_research.evidence_analysis_timeout_seconds
-        )
     answer_client = sampling_view(structured_client_view(
         active_client, temperature=temperature_for("answer"),
         structured_output_mode=critical_mode,
@@ -173,7 +162,6 @@ def create_agentic_research_service(
             temperature=temperature_for("decision", settings.agentic_research.decision_thinking_enabled),
             thinking_enabled=settings.agentic_research.decision_thinking_enabled,
             max_attempts=settings.agentic_research.node_max_attempts,
-            view_mode=settings.agentic_research.decision_view_mode,
             view_limits=CompactDecisionLimits(
                 support_entries_per_requirement=settings.agentic_research.decision_view_support_limit,
                 recent_observations=settings.agentic_research.decision_view_recent_observations,
@@ -194,22 +182,13 @@ def create_agentic_research_service(
             ),
             max_attempts=settings.agentic_research.node_max_attempts,
         ),
-        evidence_analyzer=LLMEvidenceProjector(
-            evidence_client,
-            max_attempts=settings.agentic_research.node_max_attempts,
-            batch_size=settings.agentic_research.evidence_projector_batch_size,
-            temperature=temperature_for("projector"),
-            cache=SQLiteEvidenceAnalysisCache(
-                settings.agentic_research.evidence_analysis_cache_path
-            ),
-        ),
         tool_executor=tool_executor,
         settings=settings.agentic_research,
-        answer_generator=(
-            GroundedAnswerGenerator(
-                settings=settings.answer_generation,
-                client=answer_client,
-                agentic_temperature=temperature_for("answer"),
+        grounded_answerer=(
+            LLMGroundedAnswerer(
+                answer_client,
+                max_attempts=settings.agentic_research.node_max_attempts,
+                temperature=temperature_for("answer"),
             )
             if settings.answer_generation.enabled
             else None

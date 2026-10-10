@@ -13,7 +13,6 @@ from .contracts import (
     AgentAction,
     ActionCanonicalization,
     EvidenceFilterReport,
-    EvidenceAnalysisCacheStats,
     EvidenceTarget,
     PaperSearchAttempt,
     RegistryDelta,
@@ -37,7 +36,6 @@ def build_observation(
     action: AgentAction | None = None,
     plan: ResearchPlan | None = None,
     evidence_filter_report: EvidenceFilterReport | None = None,
-    evidence_analysis_cache: EvidenceAnalysisCacheStats | None = None,
     action_canonicalization: ActionCanonicalization | None = None,
 ) -> ResearchObservation:
     queries_by_paper: list[tuple[str, str]] = []
@@ -93,7 +91,6 @@ def build_observation(
         action_arguments=_action_arguments(action),
         search_attempts=tuple(search_attempts),
         evidence_filter_report=evidence_filter_report,
-        evidence_analysis_cache=evidence_analysis_cache,
         action_canonicalization=action_canonicalization,
     )
 

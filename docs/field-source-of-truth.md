@@ -1,34 +1,27 @@
 # 字段事实源与语义边界
 
-核对日期：2026-10-08。完整流程见[当前架构](architecture/agentic-research.md)。派生视图不能成为另一份权威状态。
+核对日期：2026-10-10。派生视图只用于传输或展示，不得成为第二份权威状态。
 
-| 信息 | 权威 | 派生或使用边界 |
+| 信息 | 权威字段 / 模块 | 含义与边界 |
 |---|---|---|
-| 论文原文、section/page、chunk 定位 | SQLite 或隔离 workspace | embedding_text 用于检索，不取代 raw_text |
-| 用户原问题与范围 | 用户输入 + ScopeResolver | 全库使用本轮冻结快照；模型不得扩大范围 |
-| 问题解释与冷启动 hints | 校验后的 QueryContext | 提供建议，不自动注入 Retriever |
-| 全库候选筛选 | CandidateSelection.assessments | ID 分区派生；screening_complete 只表示筛选 |
-| 回答义务 | ResearchPlan.requirements | ID/description/required/evidence_targets/projection_type 的正式定义 |
-| 工具输入 | 通过 Schema/local/Guard 的 AgentAction | 模型原始 JSON 不可执行；requirement_ids 不等于支持 |
-| 有效检索请求与重复身份 | CanonicalSearchRequest 编译器 | Guard 与执行器同一 identity；trace raw query 不一定参与有效请求 |
-| 预算、成功请求与禁止动作 | GuardState + execution receipts | capabilities/View 是投影；failed 不冒充 successful |
-| 证据分数 | raw_score/score_kind/score_direction/retrieval_rank | 来源内解释；无统一 calibration；legacy score deprecated |
-| Evidence ID、请求目标、来源与出现历史 | EvidenceRegistry | E#/REF# 是引用空间，R# 仅 Requirement |
-| 当前 assessment | EvidenceRecord.assessment.projections[] | legacy singleton alias 不代表多个投影组 |
-| 已评估 scope | 显式 evaluated_requirement_ids | 请求 IDs 与 Plan IDs 的交集；历史缺失不推断 |
-| 有效局部支持 | Integrity 核验后的 verified_support_ids | suggested supported IDs 和 requested IDs 均不是已核验支持 |
-| Projector cache 命中 | semantic request fingerprint + Evidence identity | 绑定 scoped Requirement/type/问题/goal/schema/prompt；旧无指纹数据不猜测命中 |
-| Requirement 局部支持状态 | RequirementState | SATISFIED 仅表示有 valid support |
-| Critical anchor coverage | RequirementCoverage | complete 是 anchor 覆盖，不是语义完整性 |
-| Decision 输入与 no-progress | Graph State 派生的 factored View | builder 不调 LLM、不改 State；信号不进入 Guard |
-| 当前 rejection 与历史 | last_action_rejection / action_rejections | 当前指针按执行结果清除；历史不重新激活 |
-| 最终 Evidence 与允许支持 | Selector + CompletionView | 使用选中且经核验的支持，不推断 Answer complete |
-| Answer 语义 complete/partial/unsupported | 校验后的 AnswerSemanticDraft.requirement_status | Answer LLM 可判断局部支持不足以回答核心；程序不猜测语义完整性，不修改上游 assessment |
-| unsupported、coverage evidence IDs 与 overall | Coverage Compiler + 引用 parser | 无 selected support 时补 unsupported；有映射时保留 Answer 的语义否决，unsupported 引用集为空，全部 unsupported 则 insufficient |
-| 对外答案 | ResearchAnswer | 公开 DTO 不等于 provider draft；Classic/Agentic 独立 draft |
-| 未完成任务持久化状态 | LangGraph checkpoint，当前 v4 | v2/v3 只读审计，禁止当前 resume；不迁移旧 support |
-| 已完成 KB 回合 | ConversationStore 的 answer/evidence/audit/metadata | pending task 仅指向 checkpoint；历史 sidecar 只读兼容 |
+| 原问题与范围 | 用户输入 + `ScopeResolver` | 模型不可扩大可信 corpus |
+| 冷启动理解 | `QueryContext` | advisory，不自动成为后续检索请求 |
+| 回答义务 | `ResearchPlan.requirements` | `requirement_id/description/required/evidence_targets`；保持宽粒度 |
+| Decision 动作 | 校验后的 `AgentAction` | 一轮只选择一个工具或答案控制动作 |
+| 实际检索请求 | `CanonicalSearchRequest` | effective query、lexical tokens、identity 的唯一事实源 |
+| 执行合法性与预算 | `GuardState` + receipts | 区分 attempted/executed/successful/failed |
+| 原始检索结果 | `RetrievedEvidence` | 保存正文、chunk/window、section/page 和 score 语义 |
+| Evidence 身份与 provenance | `EvidenceRegistry` / `EvidenceRecord` | E#/REF#、检索 query、请求绑定和首次出现；不判断支持 |
+| Answerer 完整输入 | `ResearchRunResult.answer_input_evidence_ids` | 某次答案阶段看到的整个 Registry 快照 |
+| Requirement 答案 | `GroundedAnswerAttempt.requirements` | 每项 answer+citation 或 remaining_gap |
+| 引用锚点 | `GroundedCitation` | Evidence ID + source span IDs；excerpt 由程序恢复 |
+| 实际引用集 | `GroundedAnswerAttempt.evidence_ids` | 只含真正被答案引用的 Evidence |
+| accepted answers | Graph state | 已通过本地引用校验的完成项，后续尝试不得修改 |
+| Requirement 状态 | `RequirementState` | satisfied 只表示已有已校验答案；否则按实际 gap/尝试状态派生 |
+| 对外答案 | `ResearchAnswer` | renderer 从已校验 RequirementAnswer 确定性生成 |
+| 当前 checkpoint | `paperbase-agentic-grounded-answer-v1` | 旧语义版本不迁移执行 |
+| 完成回合审计 | `AgenticAuditSnapshot` | `grounded-answer-v1`，包含 retrieval、answer input、citation 与成本信息 |
 
-兼容入口保留部分旧 Claims、score、singleton projection 或审计字段以解析历史数据。这些字段不产生新生产权威，也不允许旧 semantic state 无声进入当前执行链。新写入和历史读取必须分别说明。
+关键区别：`requested_requirement_ids` 不是支持；`answer_input_evidence_ids` 不是引用；`selected_evidence` 当前等于实际引用 Evidence；span 校验通过只证明引用可追溯，不证明自然语言推断必然正确。
 
-实现入口：[retrieval contracts](../paperbase/retrieval/contracts.py)、[canonical requests](../paperbase/retrieval/requests.py)、[Registry](../paperbase/agentic/evidence_registry.py)、[Projector](../paperbase/agentic/evidence_projection.py)、[Analyzer Protocol](../paperbase/agentic/evidence_analysis.py)、[Integrity](../paperbase/agentic/grounding.py)、[RequirementState](../paperbase/agentic/requirement_state.py)、[Selector](../paperbase/agentic/selector.py)、[Answer compiler](../paperbase/generation/answer_coverage.py)、[Graph](../paperbase/agentic/graph.py)。
+实现入口：[retrieval contracts](../paperbase/retrieval/contracts.py)、[canonical requests](../paperbase/retrieval/requests.py)、[Registry](../paperbase/agentic/evidence_registry.py)、[Grounded Answerer](../paperbase/agentic/grounded_answer.py)、[Graph](../paperbase/agentic/graph.py)、[Audit](../paperbase/agentic/audit.py)。

@@ -206,8 +206,6 @@ agentic_research:
   enabled: true
   # 当前 v4 SQLite checkpoint；旧语义版本只读，不执行 resume。
   checkpoint_path: storage/agentic_checkpoints.sqlite3
-  # Evidence Analysis 使用独立 SQLite，不与正式 KB 或 checkpoint 混表。
-  evidence_analysis_cache_path: storage/evidence_analysis_cache.sqlite3
   checkpoint_retention_days: 30
   # 桌面版默认串行执行，避免本地模型、SQLite 与向量检索争抢资源。
   max_concurrent_runs: 1
@@ -217,10 +215,7 @@ agentic_research:
   # 结构化节点尝试上限，也用于累计非法 iteration 的停止保护。
   node_max_attempts: 2
   planner_temperature: 0.7
-  projector_temperature: 0.7
   answer_temperature: 0.7
-  # Compact / shadow 从同一 Graph State 构建视图，共享当前 System Prompt。
-  decision_view_mode: compact
   decision_view_support_limit: 6
   decision_view_recent_observations: 2
   decision_view_recent_queries: 3
@@ -232,19 +227,12 @@ agentic_research:
   decision_view_entity_limit: 12
   # 当前 ModelScope/Qwen schema-critical 节点使用 json_schema。
   schema_critical_output_mode: json_schema
-  # Batch execution only; cache/projection/integrity remain per Evidence.
-  evidence_projector_batch_size: 4
-  evidence_analysis_timeout_seconds: 60
-  # Agentic 不发送应用层输出 cap；旧配置兼容字段见 docs/configuration.md。
   top_k_per_paper: 5
   # Agentic 专用 Evidence 准入：只在 reranker 成功时应用分数阈值。
   evidence_admission_enabled: true
   evidence_min_rerank_score: 0.05
   # source chunk 集合达到该 Jaccard 重叠度时只保留更强的一条。
   evidence_source_overlap_threshold: 0.8
-  # 最终送入答案阶段的 Evidence 总数。
-  final_evidence_max_units: 8
-
 # Step 6：Query Planning、Dense 和 FTS5/BM25 混合检索配置。
 retrieval:
   # 兼容后端标识；当前生产工厂固定创建 HybridRetriever。

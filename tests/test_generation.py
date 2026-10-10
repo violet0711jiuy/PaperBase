@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import unittest
-import json
-from dataclasses import replace
 
 from paperbase.config import AnswerGenerationSettings, ContextExpansionSettings
 from paperbase.generation.answer_generator import GroundedAnswerGenerator
@@ -13,19 +11,6 @@ from paperbase.prompts.answer_generation import (
     ANSWER_GENERATION_SYSTEM_PROMPT, build_answer_generation_user_prompt,
 )
 
-
-def test_classic_and_agentic_supply_the_same_exact_citation_id_namespace():
-    evidence = tuple(EvidenceUnit(evidence_id=eid,kind='content' if eid=='E1' else 'bibliography',
-        paper_id='P',paper_title='P',section='s',page_start=1,page_end=1,
-        seed_chunk_ids=('c',),chunk_ids=('c',),text='A source fact.',token_count=4)
-        for eid in ('E1','REF1'))
-    for requirements, supports in (((), {}), ((('R1','a fact'),), {'R1':('E1','REF1')})):
-        prompt = build_answer_generation_user_prompt(query='a fact', evidence=evidence,
-            research_requirements=requirements, support_by_requirement=supports)
-        assert prompt.count('<allowed_evidence_ids>') == 1
-        allowed = json.loads(prompt.split('<allowed_evidence_ids>\n',1)[1].split('\n</allowed_evidence_ids>',1)[0])
-        assert allowed == ['E1','REF1']
-        assert ('<requirements_with_verified_support>' in prompt) == bool(requirements)
 from paperbase.retrieval.hybrid_retriever import RetrievedChunk, RetrievalResult
 from paperbase.retrieval.query_rewriter import QueryRewritePlan
 
@@ -234,22 +219,6 @@ class GroundedAnswerGeneratorTests(unittest.TestCase):
                 token_count=30,
             ),
         )
-
-    def test_agentic_citation_bindings_use_selected_ids_and_preserve_source_numbers(self) -> None:
-        reference = replace(self._evidence()[0], evidence_id="REF7", kind="bibliography",
-                            text="[2] Review 2009. [3] SVR 2015.")
-        prompt = build_answer_generation_user_prompt(
-            query="Which papers?", evidence=(reference,),
-            research_requirements=(("R1", "Review"), ("R2", "SVR")),
-            support_by_requirement={"R1": ("REF7",), "R2": ("REF7",)},
-        )
-        binding_json = prompt.split("<evidence_citation_bindings>\n", 1)[1].split(
-            "\n</evidence_citation_bindings>", 1)[0]
-        self.assertEqual(json.loads(binding_json), [{"evidence_id": "REF7", "in_text_citation": "[REF7]"}])
-        self.assertIn("[2] Review 2009. [3] SVR 2015.", prompt)
-        # Classic input rendering is outside this Agentic change.
-        classic = build_answer_generation_user_prompt(query="Which papers?", evidence=(reference,))
-        self.assertNotIn("<evidence_citation_bindings>", classic)
 
     def test_uses_json_schema_and_accepts_only_known_citations(self) -> None:
         client = _FakeClient(

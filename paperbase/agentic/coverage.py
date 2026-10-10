@@ -1,4 +1,4 @@
-"""从 Scope、检索历史和 Qualification 推导论文覆盖状态。"""
+"""Derive paper-level retrieval coverage without judging answer support."""
 
 from __future__ import annotations
 
@@ -9,17 +9,13 @@ from .contracts import (
     CorpusScopeSnapshot,
     CoverageState,
     CoverageStrategy,
-    EvidenceAnalysisStatus,
-    EvidenceOwnership,
     EvidenceRecord,
-    EvidenceRelation,
     PaperAssessment,
     PaperAssessmentStatus,
     QueryContext,
     QueryScope,
     ResearchObservation,
 )
-from .grounding import verified_support_ids
 
 
 class CoverageManager:
@@ -112,43 +108,16 @@ class CoverageManager:
                 if observed_paper_id == paper_id
             )
         )
-        direct = tuple(
-            record
-            for record in records
-            if any(
-                claim.ownership is EvidenceOwnership.THIS_PAPER
-                and claim.relation
-                in {EvidenceRelation.SUPPORTS, EvidenceRelation.CONTRADICTS}
-                for claim in record.claims
-            )
-        )
-        direct_verified_outside_discovery = any(
-            not record.originating_tools
-            or any(tool != "search_knowledge_base" for tool in record.originating_tools)
-            for record in direct
-        )
-        projected_support = tuple(
-            record
-            for record in records
-            if record.analysis_status is EvidenceAnalysisStatus.QUALIFIED
-            and bool(record.projections)
-            and verified_support_ids(record)
-        )
-        if direct and direct_verified_outside_discovery:
+        # Coverage answers only whether a candidate paper was actually queried
+        # and yielded raw material. Semantic answer support belongs exclusively
+        # to the Grounded Answerer and its validated citations.
+        if records and queries:
             return PaperAssessment(
                 paper_id=paper_id,
                 status=PaperAssessmentStatus.POSITIVE,
                 queries_tried=queries,
-                evidence_ids=tuple(record.evidence_id for record in direct),
-                rationale="已找到并标注为本文直接证据的内容。",
-            )
-        if projected_support:
-            return PaperAssessment(
-                paper_id=paper_id,
-                status=PaperAssessmentStatus.POSITIVE,
-                queries_tried=queries,
-                evidence_ids=tuple(record.evidence_id for record in projected_support),
-                rationale="已找到支持当前 Requirement 的结构化 Projection。",
+                evidence_ids=tuple(record.evidence_id for record in records),
+                rationale="论文级检索已返回原始 Evidence；尚未据此推断答案支持。",
             )
         all_evidence_ids = tuple(record.evidence_id for record in records)
         if not queries:
@@ -162,24 +131,6 @@ class CoverageManager:
                 queries_tried=queries,
                 evidence_ids=all_evidence_ids,
                 rationale="尚未执行论文级正文查询。",
-            )
-        uncertain = any(
-            record.analysis_status
-            in {EvidenceAnalysisStatus.PENDING, EvidenceAnalysisStatus.FAILED}
-            or any(
-                claim.relation is EvidenceRelation.UNCERTAIN
-                or claim.ownership is EvidenceOwnership.UNKNOWN
-                for claim in record.claims
-            )
-            for record in records
-        ) or bool(direct)
-        if uncertain:
-            return PaperAssessment(
-                paper_id=paper_id,
-                status=PaperAssessmentStatus.UNCERTAIN,
-                queries_tried=queries,
-                evidence_ids=all_evidence_ids,
-                rationale="已按策略检索，但现有证据仍无法确定归属或关系。",
             )
         return PaperAssessment(
             paper_id=paper_id,

@@ -152,13 +152,19 @@ class NonStreamExtractionTests(unittest.TestCase):
 
     def test_strict_wire_schema_materializes_defaulted_fields_without_mutating_dto(self) -> None:
         from paperbase.llm.client import _strict_response_schema
-        from paperbase.agentic.schemas import MechanismProjectionBatchDraft
-        schema=MechanismProjectionBatchDraft.model_json_schema()
-        original_required=list(schema['$defs']['QualifiedMechanismProjectionDraft']['required'])
+        from paperbase.agentic.schemas import GroundedAnswerDraft
+        schema=GroundedAnswerDraft.model_json_schema()
+        original_required=list(schema['$defs']['GroundedRequirementAnswerDraft']['required'])
         strict=_strict_response_schema(schema)
-        self.assertNotIn('support_candidates',original_required)
-        self.assertIn('support_candidates',strict['$defs']['QualifiedMechanismProjectionDraft']['required'])
-        self.assertEqual(schema['$defs']['QualifiedMechanismProjectionDraft']['required'],original_required)
+        self.assertIn('remaining_gap', original_required)
+        self.assertEqual(
+            strict['$defs']['GroundedRequirementAnswerDraft']['required'],
+            original_required,
+        )
+        self.assertEqual(
+            schema['$defs']['GroundedRequirementAnswerDraft']['required'],
+            original_required,
+        )
 
     def test_zhipu_official_request_is_non_streaming_and_disables_thinking(self) -> None:
         completions = _FakeCompletions()

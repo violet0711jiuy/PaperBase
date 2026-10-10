@@ -22,18 +22,8 @@ requirements 是本轮研究唯一正式的回答义务定义：
 - Requirement 描述“需要知道什么”，不描述“如何检索”；
 - 不判断当前 Requirement 是否已经满足。
 
-每个 Requirement 必须声明且只声明一个 projection_type，与 evidence_targets 独立：
-- fact：离散事实、属性、方法名称、结果、数值、主张、reference/overview 信息。
-- mechanism：how/why/process、步骤、因果、实现方式、工作原理。
-- comparison：该义务本身要求比较、区别、相同点、优劣维度或 A-vs-B 关系。
-- enumeration：完整或集合式列举方法、模型或方法族；当前实体 Schema 仅支持 method/model/method_family。
-数据集、作者、指标、文献条目等其他对象的集合用 fact 表达，可由多条事实共同列出；
-仍保留用户要求的完整列举范围，不得把这些对象错误标为方法或模型。
-all/which/list/exhaustive 描述覆盖范围，本身不决定 projection_type。
-同一问题可以有不同类型的 Requirements。方法是什么、为什么这样设计、效果是多少
-应分别拆为 FACT、MECHANISM、FACT；不要给一个 Requirement 多个类型。
 evidence_targets 仅是检索/routing hints，不是支持或完成判断；
-不要由 METHOD/RESULT 等检索 target 决定 semantic shape，也不要由全局 intent 覆盖子义务类型。
+不要由 METHOD/RESULT 等检索 target 推断 Requirement 已经满足。
 
 对于 exhaustive_enumeration，
 核心是完整枚举并区分用户要求的目标实体，而不是复现论文全部实验。

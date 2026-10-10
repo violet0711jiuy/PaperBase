@@ -13,7 +13,6 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.runtime import Runtime
 
 from paperbase.config import AgenticResearchSettings
-from paperbase.generation.answer_coverage import compile_answer_requirement_coverage
 from paperbase.retrieval.contracts import ToolResult, ToolStatus
 
 from .contracts import (
@@ -23,11 +22,11 @@ from .contracts import (
     CandidateSelection,
     CorpusScopeSnapshot,
     CoverageState,
-    EvidenceAnalysis,
-    EvidenceAnalysisStatus,
     EvidenceFilterReport,
     EvidenceRecord,
-    FinishAction,
+    GroundedAnswerAttempt,
+    TryAnswerAction,
+    StopResearchAction,
     ActionRejectionContext,
     GuardState,
     LLMCallRecord,
@@ -38,15 +37,14 @@ from .contracts import (
     ResearchObservation,
     ResearchPlan,
     RequirementState,
+    RequirementStatus,
     ResearchRunResult,
     ResearchRunStatus,
     ScopeResolution,
     ScopeResolutionStatus,
     StopReason,
 )
-from .answering import (
-    AgenticAnswerGenerator, build_completion_view, generate_agentic_answer,
-)
+from .grounded_answer import GroundedAnswerer, render_grounded_answer
 from .candidate_selection import CandidateSelector
 from .checkpoint_serde import (
     CheckpointValue,
@@ -56,10 +54,6 @@ from .checkpoint_serde import (
 )
 from .coverage import CoverageManager
 from .decision import DecisionAgent, DecisionError, DecisionState
-from .evidence_analysis import (
-    EvidenceAnalyzer, EvidenceAnalysisRequest, EvidenceAnalysisResult,
-    projection_requirement_scope, requires_analysis,
-)
 from .evidence_admission import EvidenceAdmissionFilter, fail_open_admission
 from .evidence_registry import EvidenceRegistry
 from .events import ResearchProgressEvent, progress_event_for_node
@@ -69,20 +63,13 @@ from .guards import (
     action_requirement_ids,
     queries_for_paper,
 )
-from .grounding import verified_support_ids
 from .observation import _action_arguments, build_observation
 from .planner import ResearchPlanner
 from .query_understanding import QueryUnderstandingService
-from .research_profile import goal_signal_items
-from .requirement_state import (
-    derive_requirement_states,
-    finalize_requirement_states,
-    required_requirements_researched,
-)
+from .requirement_state import derive_requirement_states
 from .tools import ToolExecutor
 from .search_requests import compile_action_requests
 from paperbase.retrieval.requests import CanonicalSearchRequest, request_trace
-from .selector import FinalEvidenceSelector
 from .scope_resolver import ScopeResolver, TrustedWorkspaceScope
 
 
@@ -96,7 +83,6 @@ NextNode = Literal[
     "execute_tool",
     "filter_evidence",
     "register_and_observe",
-    "analyze_evidence",
     "generate_answer",
     "finish_run",
 ]
@@ -122,7 +108,6 @@ class AgentGraphState(TypedDict, total=False):
     action_canonicalization: CheckpointValue
     tool_result: CheckpointValue
     evidence_filter_report: CheckpointValue
-    pending_analysis_ids: list[str]
     registry_state: CheckpointValue
     guard_state: CheckpointValue
     # New checkpoints use these names.  The helpers below read Phase A.1
@@ -136,13 +121,17 @@ class AgentGraphState(TypedDict, total=False):
     clarification: str | None
     error_codes: list[str]
     selected_evidence: CheckpointValue
+    grounded_answer_attempt: CheckpointValue
+    answer_evidence_ids: list[str]
+    answer_attempt_count: int
+    answer_mode: str
     answer: CheckpointValue
     next_node: NextNode
     result: CheckpointValue
     llm_diagnostics: CheckpointValue
 
 
-_SEMANTIC_AUTHORITY_VERSION = "projector-requirement-directed-multi-projection-v4"
+_SEMANTIC_AUTHORITY_VERSION = "raw-evidence-grounded-answer-v1"
 
 
 def _require_current_semantic_authority(values: dict[str, object]) -> None:
@@ -150,8 +139,8 @@ def _require_current_semantic_authority(values: dict[str, object]) -> None:
         raise ValueError(
             "Incompatible checkpoint semantic authority: "
             f"{values.get('semantic_authority_version')!r}; expected "
-            f"{_SEMANTIC_AUTHORITY_VERSION!r}. Evidence-local Requirement scope "
-            "cannot safely reuse legacy support; start a new research thread "
+            f"{_SEMANTIC_AUTHORITY_VERSION!r}. Grounded Answer state "
+            "cannot safely reuse legacy Projector checkpoints; start a new research thread "
             "instead of resuming it."
         )
 
@@ -163,10 +152,9 @@ class AgentGraphContext:
     planner: ResearchPlanner
     decision_agent: DecisionAgent
     candidate_selector: CandidateSelector | None
-    evidence_analyzer: EvidenceAnalyzer
     evidence_filter: EvidenceAdmissionFilter
     tool_executor: ToolExecutor
-    answer_generator: AgenticAnswerGenerator | None
+    grounded_answerer: GroundedAnswerer | None
     settings: AgenticResearchSettings
 
 
@@ -189,12 +177,11 @@ class LangGraphResearchWorkflow:
         query_understanding: QueryUnderstandingService,
         planner: ResearchPlanner,
         decision_agent: DecisionAgent,
-        evidence_analyzer: EvidenceAnalyzer,
         evidence_filter: EvidenceAdmissionFilter | None = None,
         tool_executor: ToolExecutor,
         settings: AgenticResearchSettings,
         candidate_selector: CandidateSelector | None = None,
-        answer_generator: AgenticAnswerGenerator | None = None,
+        grounded_answerer: GroundedAnswerer | None = None,
         checkpointer: BaseCheckpointSaver | None = None,
     ) -> None:
         self._context = AgentGraphContext(
@@ -203,14 +190,13 @@ class LangGraphResearchWorkflow:
             planner=planner,
             decision_agent=decision_agent,
             candidate_selector=candidate_selector,
-            evidence_analyzer=evidence_analyzer,
             evidence_filter=evidence_filter or EvidenceAdmissionFilter(
                 enabled=settings.evidence_admission_enabled,
                 min_rerank_score=settings.evidence_min_rerank_score,
                 source_overlap_threshold=settings.evidence_source_overlap_threshold,
             ),
             tool_executor=tool_executor,
-            answer_generator=answer_generator,
+            grounded_answerer=grounded_answerer,
             settings=settings,
         )
         self._checkpointer = checkpointer or InMemorySaver()
@@ -463,7 +449,6 @@ def build_agentic_research_graph() -> StateGraph:
     graph.add_node("execute_tool", _execute_tool)
     graph.add_node("filter_evidence", _filter_evidence)
     graph.add_node("register_and_observe", _register_and_observe)
-    graph.add_node("analyze_evidence", _analyze_evidence)
     graph.add_node("generate_answer", _generate_answer)
     graph.add_node("finish_run", _finish_run)
 
@@ -510,12 +495,7 @@ def build_agentic_research_graph() -> StateGraph:
             "generate_answer": "generate_answer",
         },
     )
-    graph.add_edge("register_and_observe", "analyze_evidence")
-    graph.add_conditional_edges(
-        "analyze_evidence",
-        _route,
-        {"decide_action": "decide_action", "generate_answer": "generate_answer"},
-    )
+    graph.add_edge("register_and_observe", "decide_action")
     graph.add_conditional_edges(
         "validate_action",
         _route,
@@ -534,7 +514,11 @@ def build_agentic_research_graph() -> StateGraph:
         },
     )
     graph.add_edge("filter_evidence", "register_and_observe")
-    graph.add_edge("generate_answer", "finish_run")
+    graph.add_conditional_edges(
+        "generate_answer",
+        _route,
+        {"decide_action": "decide_action", "finish_run": "finish_run"},
+    )
     graph.add_edge("finish_run", END)
     return graph
 
@@ -689,6 +673,12 @@ def _decide_action(
                 coverage=coverage,
                 candidate_selection=candidate_selection,
                 requirement_states=_state_requirement_states(state),
+                grounded_answer=(
+                    load_contract(state["grounded_answer_attempt"], GroundedAnswerAttempt)
+                    if state.get("grounded_answer_attempt") is not None else None
+                ),
+                answer_evidence_ids=tuple(state.get("answer_evidence_ids", ())),
+                answer_attempt_count=int(state.get("answer_attempt_count", 0)),
                 last_action_rejection=_last_action_rejection(state),
                 action_rejections=_action_rejections(state),
                 per_paper_query_limit=runtime.context.settings.max_queries_per_paper,
@@ -806,115 +796,44 @@ def _assess_action(
         context=query_context,
         registry=registry,
     )
-    if isinstance(action, FinishAction):
-        progress_states = derive_requirement_states(
-            plan=plan, evidence=registry.records, observations=_observations(state),
-            context=query_context, coverage=coverage,
-            previous_states=_state_requirement_states(state),
-        )
-        if not coverage.coverage_complete or not required_requirements_researched(
-            plan, progress_states
+    if isinstance(action, (TryAnswerAction, StopResearchAction)):
+        evidence_ids = tuple(record.evidence_id for record in registry.records)
+        if (
+            isinstance(action, TryAnswerAction)
+            and state.get("grounded_answer_attempt") is not None
+            and tuple(state.get("answer_evidence_ids", ())) == evidence_ids
+            and int(state.get("answer_attempt_count", 0)) >= 2
         ):
-            blockers = tuple(
-                value
-                for value, blocked in (
-                    ({"type": "required_requirement_untouched"}, not required_requirements_researched(plan, progress_states)),
-                    ({"type": "candidate_coverage_incomplete"}, not coverage.coverage_complete),
-                )
-                if blocked
-            )
             rejection = ActionRejectionContext(
-                action_name="finish", action_arguments={}, requirement_ids=(),
-                rejection_code="FinishClosureIncomplete",
-                rejection_reason="Runtime finish closure validation is incomplete.",
-                guard_name="finish_closure", iteration=tracker.iterations,
-            rejection_stage="finish_validation", blockers=blockers,
-                validator_name="finish_closure_validation",
+                action_name="try_answer",
+                action_arguments={"reason": action.reason},
+                requirement_ids=(),
+                rejection_code="AnswerRetryBudgetExhausted",
+                rejection_reason="No new Evidence was added and the one focused answer retry is exhausted.",
+                guard_name="answer_attempt_guard",
+                iteration=tracker.iterations,
+                rejection_stage="answer_admission",
+                validator_name="answer_attempt_guard",
                 action_canonicalization=_action_canonicalization(state),
             )
-            rejections = (*_action_rejections(state), rejection)
-            traces = _append_trace(
-                state,
-                ActionTrace(
-                    tracker.iterations,
-                    action.action_name,
-                    False,
-                    (
-                        "RequirementResearchIncomplete"
-                        if not required_requirements_researched(plan, progress_states)
-                        else "CoverageIncomplete: "
-                        + ", ".join(coverage.remaining_paper_ids)
-                    ),
-                ),
-            )
-            invalid_limit = tracker.record_invalid_action()
-            guard_diagnostic = _guard_rejection_record(
-                tracker, can_retry=not invalid_limit
-            )
-            if invalid_limit:
-                update = _terminal_update(
-                    state,
-                    tracker=tracker,
-                    traces=traces,
-                    status=_partial_or_no_evidence(registry),
-                    reason=StopReason.INVALID_ACTION_LIMIT,
-                )
-                update["llm_diagnostics"] = _append_llm_diagnostics(
-                    state, (guard_diagnostic,)
-                )
-                update["last_action_rejection"] = dump_contract(rejection, ActionRejectionContext)
-                update["action_rejections"] = dump_contract(rejections, tuple[ActionRejectionContext, ...])
-                return update
             return {
-                "registry_state": dump_contract(registry.snapshot(), RegistryState),
-                "guard_state": dump_contract(tracker.snapshot(), GuardState),
-                "traces": traces,
                 "last_action_rejection": dump_contract(rejection, ActionRejectionContext),
-                "action_rejections": dump_contract(rejections, tuple[ActionRejectionContext, ...]),
-                "llm_diagnostics": _append_llm_diagnostics(
-                    state, (guard_diagnostic,)
+                "action_rejections": dump_contract(
+                    (*_action_rejections(state), rejection), tuple[ActionRejectionContext, ...]
+                ),
+                "traces": _append_trace(
+                    state, ActionTrace(tracker.iterations, action.action_name, False, rejection.rejection_code)
                 ),
                 "next_node": "decide_action",
             }
-        traces = _append_trace(
-            state,
-            ActionTrace(
-                tracker.iterations,
-                action.action_name,
-                True,
-                action.reason,
+        return {
+            "answer_mode": action.action_name,
+            "traces": _append_trace(
+                state, ActionTrace(tracker.iterations, action.action_name, True, action.reason)
             ),
-        )
-        finalized_states = finalize_requirement_states(
-            plan=plan,
-            evidence=registry.records,
-            observations=_observations(state),
-            previous_states=_state_requirement_states(state),
-        ).states
-        selected = FinalEvidenceSelector(
-            max_units=runtime.context.settings.final_evidence_max_units,
-        ).select(
-            context=query_context,
-            plan=plan,
-            coverage=coverage,
-            evidence=registry.records,
-            requirement_states=finalized_states,
-        )
-        update = _terminal_update(
-            state,
-            tracker=tracker,
-            traces=traces,
-            status=(
-                ResearchRunStatus.COMPLETED
-                if selected
-                else ResearchRunStatus.NO_EVIDENCE
-            ),
-            reason=StopReason.AGENT_FINISHED,
-        )
-        update["registry_state"] = dump_contract(registry.snapshot(), RegistryState)
-        update["requirement_states"] = dump_contract(finalized_states, tuple[RequirementState, ...])
-        update["last_action_rejection"] = None
-        return update
+            "last_action_rejection": None,
+            "next_node": "generate_answer",
+        }
     return {
         "next_node": "validate_action",
     }
@@ -1229,7 +1148,6 @@ def _register_and_observe(
             tuple[ResearchObservation, ...],
         ),
         "traces": traces,
-        "pending_analysis_ids": list(delta.analysis_required_ids),
         "requirement_states": dump_contract(
             derive_requirement_states(
                 plan=load_contract(state["plan"], ResearchPlan),
@@ -1241,323 +1159,135 @@ def _register_and_observe(
             ),
             tuple[RequirementState, ...],
         ),
-        "next_node": "analyze_evidence",
-    }
-
-
-def _analyze_evidence(
-    state: AgentGraphState, runtime: Runtime[AgentGraphContext]
-) -> AgentGraphState:
-    """Analyze/reanalyze Registry-routed Evidence; preserve verified support on failure."""
-    registry = _registry(state)
-    pending_ids = tuple(state.get("pending_analysis_ids", []))
-    plan = load_contract(state["plan"], ResearchPlan)
-    pending = tuple(
-        record
-        for evidence_id in pending_ids
-        if (record := registry.get(evidence_id)) is not None
-        and requires_analysis(record, plan)
-    )
-    if not pending:
-        return {"pending_analysis_ids": [], "next_node": "decide_action"}
-    tracker = _tracker(state, runtime.context.settings)
-    query_context = load_contract(state["query_context"], QueryContext)
-    previous_goal_items = goal_signal_items(registry.records)
-    previous_support = {record.evidence_id: set(verified_support_ids(record, plan.requirements))
-                        for record in pending}
-    scoped = tuple(record for record in pending if projection_requirement_scope(record, plan))
-    unbound_failures = tuple(EvidenceAnalysis(record.evidence_id, EvidenceAnalysisStatus.FAILED,
-        error_code="MissingEvidenceProjectionScope") for record in pending if record not in scoped)
-    try:
-        request = EvidenceAnalysisRequest(
-            question=query_context.resolved_query, evidence=scoped,
-            context=query_context, plan=plan,
-            requirement_scopes=tuple((record.evidence_id, projection_requirement_scope(record, plan))
-                                     for record in scoped),
-        )
-        result = (runtime.context.evidence_analyzer.analyze(request=request)
-                  if scoped else EvidenceAnalysisResult((), 0))
-        analyses = (*result.analyses, *unbound_failures)
-        llm_calls = result.llm_calls
-        llm_diagnostics = result.llm_diagnostics
-        cache_stats = result.cache_stats
-    except Exception as error:
-        analyses = tuple(
-            EvidenceAnalysis(
-                evidence_id=record.evidence_id,
-                status=EvidenceAnalysisStatus.FAILED,
-                error_code=f"{type(error).__name__}: {error}"[:300],
-            )
-            for record in pending
-        )
-        llm_calls = 0
-        llm_diagnostics = ()
-        cache_stats = None
-    try:
-        registry.apply_analyses(analyses, plan=plan)
-    except ValueError as error:
-        return _fatal_update(state, "analyze_evidence", error)
-    # apply_analyses replaces immutable records; do not calculate the search
-    # outcome from the pre-projection `pending` snapshot.
-    analyzed_records = tuple(
-        record
-        for evidence_id in pending_ids
-        if (record := registry.get(evidence_id)) is not None
-    )
-    tracker.record_preparation_llm_calls(llm_calls)
-    current_goal_items = goal_signal_items(registry.records)
-    new_goal_items = tuple(sorted(current_goal_items - previous_goal_items))
-    newly_supported_requirement_ids = tuple(
-        sorted(
-            {
-                requirement_id
-                for record in analyzed_records
-                if bool(record.projections)
-                for requirement_id in set(verified_support_ids(record, plan.requirements)) - previous_support.get(record.evidence_id, set())
-            }
-        )
-    )
-    new_supporting_evidence_count = sum(
-        1
-        for record in analyzed_records
-        if bool(record.projections)
-        and set(verified_support_ids(record, plan.requirements)) - previous_support.get(record.evidence_id, set())
-    )
-    newly_exposed_section_ids = tuple(
-        dict.fromkeys(
-            record.evidence.section_id
-            for record in analyzed_records
-            if record.evidence.section_id
-        )
-    )
-    if query_context.retrieval_goal.value == "exhaustive_enumeration":
-        tracker.record_goal_progress(
-            tuple(record.evidence.paper_id for record in pending),
-            progressed=bool(new_goal_items),
-        )
-    update: AgentGraphState = {
-        "registry_state": dump_contract(registry.snapshot(), RegistryState),
-        "guard_state": dump_contract(tracker.snapshot(), GuardState),
-        "pending_analysis_ids": [],
         "next_node": "decide_action",
-        "llm_diagnostics": _append_llm_diagnostics(
-            state, llm_diagnostics
-        ),
     }
-    observations = _observations(state)
-    if observations:
-        update["observations"] = dump_contract(
-            (
-                *observations[:-1],
-                replace(
-                    observations[-1],
-                    evidence_analysis_cache=cache_stats,
-                    goal_progress=bool(new_goal_items),
-                    new_goal_items=new_goal_items,
-                    new_supporting_evidence_count=new_supporting_evidence_count,
-                    newly_supported_requirement_ids=newly_supported_requirement_ids,
-                    newly_exposed_section_ids=newly_exposed_section_ids,
-                    requirement_progress_after=tuple(
-                        (item.requirement_id, item.status.value)
-                        for item in derive_requirement_states(
-                            plan=load_contract(state["plan"], ResearchPlan),
-                            evidence=registry.records,
-                            observations=observations,
-                            context=query_context,
-                            # The post-projection coverage snapshot is built
-                            # below, after this observation is updated.  The
-                            # progress tracker does not use coverage to infer
-                            # a terminal state during the research loop.
-                            coverage=None,
-                            previous_states=_state_requirement_states(state),
-                        )
-                    ),
-                ),
-            ),
-            tuple[ResearchObservation, ...],
-        )
-    plan = load_contract(state["plan"], ResearchPlan)
-    updated_observations = (
-        load_contract(update["observations"], tuple[ResearchObservation, ...])
-        if update.get("observations") is not None
-        else observations
-    )
-    updated_coverage = CoverageManager().evaluate(
-        context=query_context,
-        corpus_snapshot=(
-            load_contract(state["corpus_snapshot"], CorpusScopeSnapshot)
-            if state.get("corpus_snapshot") is not None
-            else None
-        ),
-        candidate_selection=_candidate_selection(state),
-        evidence=registry.records,
-        observations=updated_observations,
-    )
-    update["requirement_states"] = dump_contract(
-        derive_requirement_states(
-            plan=plan,
-            evidence=registry.records,
-            observations=updated_observations,
-            context=query_context,
-            coverage=updated_coverage,
-            previous_states=_state_requirement_states(state),
-        ),
-        tuple[RequirementState, ...],
-    )
-    return update
 
 
 def _generate_answer(
     state: AgentGraphState, runtime: Runtime[AgentGraphContext]
 ) -> AgentGraphState:
-    """在 Agent 循环终止后，统一选择证据并生成用户可见回答。"""
-    status = ResearchRunStatus(
-        state.get("terminal_status", ResearchRunStatus.FAILED.value)
-    )
+    """Attempt a span-grounded answer; unresolved gaps return to Decision."""
     registry = _registry(state)
-    coverage: CoverageState | None = None
-    selected: tuple[EvidenceRecord, ...] = ()
-    context: QueryContext | None = None
-    plan: ResearchPlan | None = None
-    requirement_states: tuple[RequirementState, ...] = ()
-    terminal_requirement_update: AgentGraphState = {}
-
-    if state.get("query_context") is not None:
-        context = load_contract(state["query_context"], QueryContext)
-        coverage = _evaluate_coverage(
-            state,
-            context=context,
-            registry=registry,
-        )
-    if state.get("plan") is not None:
-        plan = load_contract(state["plan"], ResearchPlan)
-    if coverage is not None and plan is not None:
-        requirement_states = load_contract(
-            state["requirement_states"], tuple[RequirementState, ...]
-        ) if state.get("requirement_states") is not None else derive_requirement_states(
-            plan=plan, evidence=registry.records, observations=_observations(state),
-            context=context, coverage=coverage,
-        )
-        # Refresh research progress against integrity-valid Projector support.
-        requirement_states = derive_requirement_states(
-            plan=plan, evidence=registry.records, observations=_observations(state),
-            context=context, coverage=coverage, previous_states=requirement_states,
-        )
-        if state.get("stop_reason") in {
-            StopReason.AGENT_FINISHED.value, StopReason.BUDGET_EXHAUSTED.value,
-        }:
-            requirement_states = finalize_requirement_states(
-                plan=plan,
-                evidence=registry.records,
-                observations=_observations(state),
-                previous_states=requirement_states,
-                research_complete=state.get("stop_reason") == StopReason.AGENT_FINISHED.value,
-            ).states
-            terminal_requirement_update["requirement_states"] = dump_contract(
-                requirement_states, tuple[RequirementState, ...]
-            )
-        selected = FinalEvidenceSelector(
-            max_units=runtime.context.settings.final_evidence_max_units,
-        ).select(
-            context=context,
-            plan=plan,
-            coverage=coverage,
-            evidence=registry.records,
-            requirement_states=requirement_states,
-        )
-    completion_view = (
-        build_completion_view(plan=plan, states=requirement_states, selected=selected)
-        if plan is not None else None
-    )
-
+    tracker = _tracker(state, runtime.context.settings)
+    status = ResearchRunStatus(state.get("terminal_status", ResearchRunStatus.FAILED.value))
+    context = (load_contract(state["query_context"], QueryContext)
+               if state.get("query_context") is not None else None)
+    plan = (load_contract(state["plan"], ResearchPlan)
+            if state.get("plan") is not None else None)
     if status is ResearchRunStatus.NEEDS_CLARIFICATION:
         answer = ResearchAnswer(
             status="needs_clarification",
             answer=state.get("clarification") or "请补充需要检索的论文范围。",
             insufficient_evidence=True,
         )
-    elif status is ResearchRunStatus.FAILED:
+        return {"answer": dump_contract(answer, ResearchAnswer), "next_node": "finish_run"}
+    if context is None or plan is None:
         answer = ResearchAnswer(
             status="failed",
             answer="研究流程未能完成；请稍后重试，或缩小问题与论文范围。",
             insufficient_evidence=True,
         )
-    elif not selected or context is None or (
-        completion_view is not None
-        and completion_view.required_requirement_ids
-        and not completion_view.supported_requirement_ids
-    ):
-        answer = ResearchAnswer(
-            status="insufficient_evidence",
-            answer="当前检索到的论文证据不足以回答该问题。",
-            insufficient_evidence=True,
-            overall_status="insufficient" if plan is not None else None,
-            requirement_coverage=compile_answer_requirement_coverage(
-                required_requirement_ids=tuple(item.requirement_id for item in plan.requirements if item.required),
-                allowed_support_by_requirement={}, semantic_status_by_requirement={},
-                inline_citations=(),
-            ) if plan is not None else (),
-        )
-    elif runtime.context.answer_generator is None:
+        return {"answer": dump_contract(answer, ResearchAnswer), "next_node": "finish_run"}
+    if runtime.context.grounded_answerer is None:
         answer = ResearchAnswer(
             status="disabled",
             answer="回答生成功能当前未启用；请查看已检索到的论文证据。",
             insufficient_evidence=True,
             coverage_note="系统已完成证据检索，但未配置最终回答生成器。",
         )
-    else:
-        tracker = _tracker(state, runtime.context.settings)
-        tracker.record_preparation_llm_calls(1)
-        try:
-            answer = generate_agentic_answer(
-                generator=runtime.context.answer_generator,
-                query=context.resolved_query,
-                evidence=selected,
-                completion_view=completion_view,
-                plan=plan,
-                stopped_by_budget=(
-                    state.get("stop_reason") == StopReason.BUDGET_EXHAUSTED.value
-                ),
-            )
-        except Exception as error:
-            error_codes = list(
-                dict.fromkeys(
-                    (*state.get("error_codes", []), f"AnswerGeneration:{type(error).__name__}")
-                )
-            )
-            return {
-                **terminal_requirement_update,
-                "selected_evidence": dump_contract(
-                    selected, tuple[EvidenceRecord, ...]
-                ),
-                "answer": dump_contract(
-                    ResearchAnswer(
-                        status="fallback",
-                        answer="回答生成未完成；系统保留了已检索到的论文证据，供你核验或重新提问。",
-                        insufficient_evidence=True,
-                        coverage_note="最终回答生成失败，但检索证据与来源信息仍然可用。",
-                    ),
-                    ResearchAnswer,
-                ),
-                "error_codes": error_codes,
-                "guard_state": dump_contract(tracker.snapshot(), GuardState),
-                "next_node": "finish_run",
-            }
+        return {"answer": dump_contract(answer, ResearchAnswer), "next_node": "finish_run"}
 
-    return {
-        **terminal_requirement_update,
-        "selected_evidence": dump_contract(selected, tuple[EvidenceRecord, ...]),
+    previous = (load_contract(state["grounded_answer_attempt"], GroundedAnswerAttempt)
+                if state.get("grounded_answer_attempt") is not None else None)
+    accepted = tuple(item for item in previous.requirements if item.complete) if previous else ()
+    try:
+        attempt = runtime.context.grounded_answerer.answer(
+            question=context.resolved_query,
+            plan=plan,
+            evidence=registry.records,
+            accepted_answers=accepted,
+        )
+        tracker.record_preparation_llm_calls(len(attempt.llm_diagnostics))
+        answer = render_grounded_answer(attempt, plan)
+    except Exception as error:
+        fallback = ResearchAnswer(
+            status="fallback",
+            answer="回答生成未完成；系统保留了已检索到的原始论文证据，供重新尝试。",
+            insufficient_evidence=True,
+            coverage_note="Grounded Answer 未通过结构或 source-span 引用校验。",
+        )
+        return {
+            "answer": dump_contract(fallback, ResearchAnswer),
+            "selected_evidence": dump_contract(registry.records, tuple[EvidenceRecord, ...]),
+            "error_codes": list(dict.fromkeys(
+                (*state.get("error_codes", []), f"GroundedAnswer:{type(error).__name__}")
+            )),
+            "guard_state": dump_contract(tracker.snapshot(), GuardState),
+            "terminal_status": _partial_or_no_evidence(registry).value,
+            "stop_reason": StopReason.FATAL_ERROR.value,
+            "next_node": "finish_run",
+        }
+
+    by_id = {record.evidence_id: record for record in registry.records}
+    selected = tuple(by_id[eid] for eid in attempt.evidence_ids if eid in by_id)
+    terminal_requested = (
+        state.get("answer_mode") == "stop_research"
+        or state.get("terminal_status") is not None
+        or not tracker.can_decide().accepted
+    )
+    requirement_states = _states_from_grounded_answer(plan, attempt, terminal=terminal_requested)
+    update: AgentGraphState = {
+        "grounded_answer_attempt": dump_contract(attempt, GroundedAnswerAttempt),
+        "answer_evidence_ids": [record.evidence_id for record in registry.records],
+        "answer_attempt_count": (
+            int(state.get("answer_attempt_count", 0)) + 1
+            if tuple(state.get("answer_evidence_ids", ()))
+            == tuple(record.evidence_id for record in registry.records)
+            else 1
+        ),
         "answer": dump_contract(answer, ResearchAnswer),
-        "llm_diagnostics": _append_llm_diagnostics(
-            state, answer.llm_diagnostics
-        ),
-        "guard_state": (
-            dump_contract(tracker.snapshot(), GuardState)
-            if runtime.context.answer_generator is not None and selected and context
-            else state.get("guard_state")
-        ),
-        "next_node": "finish_run",
+        "selected_evidence": dump_contract(selected, tuple[EvidenceRecord, ...]),
+        "requirement_states": dump_contract(requirement_states, tuple[RequirementState, ...]),
+        "llm_diagnostics": _append_llm_diagnostics(state, attempt.llm_diagnostics),
+        "guard_state": dump_contract(tracker.snapshot(), GuardState),
+        "answer_mode": "",
     }
+    if attempt.complete:
+        update.update(
+            terminal_status=ResearchRunStatus.COMPLETED.value,
+            stop_reason=StopReason.AGENT_FINISHED.value,
+            next_node="finish_run",
+        )
+    elif terminal_requested:
+        update.update(
+            terminal_status=(ResearchRunStatus.PARTIAL.value
+                             if attempt.has_grounded_answer else ResearchRunStatus.NO_EVIDENCE.value),
+            stop_reason=state.get("stop_reason", StopReason.AGENT_FINISHED.value),
+            next_node="finish_run",
+        )
+    else:
+        update["next_node"] = "decide_action"
+    return update
+
+
+def _states_from_grounded_answer(
+    plan: ResearchPlan, attempt: GroundedAnswerAttempt, *, terminal: bool,
+) -> tuple[RequirementState, ...]:
+    by_id = {item.requirement_id: item for item in attempt.requirements}
+    states = []
+    for requirement in plan.requirements:
+        answer = by_id.get(requirement.requirement_id)
+        evidence_ids = tuple(dict.fromkeys(
+            citation.evidence_id for citation in answer.citations
+        )) if answer else ()
+        if answer is not None and answer.complete:
+            status = RequirementStatus.SATISFIED
+        elif terminal:
+            status = RequirementStatus.UNCERTAIN if answer and answer.remaining_gap else RequirementStatus.NO_SUPPORT_FOUND
+        else:
+            status = RequirementStatus.IN_PROGRESS
+        states.append(RequirementState(requirement.requirement_id, status, evidence_ids))
+    return tuple(states)
 
 
 def _finish_run(
@@ -1582,8 +1312,8 @@ def _finish_run(
         else None
     )
     # A checkpoint created before Phase 1 has no requirement_states key.  The
-    # final projection is therefore regenerated from its still-compatible
-    # plan/evidence/observation fields instead of rejecting the task.
+    # Regenerate progress from the current plan and retrieval history when a
+    # fresh Grounded Answer checkpoint has not stored it yet.
     requirement_states = (
         _state_requirement_states(state)
         if state.get("requirement_states") is not None
@@ -1632,6 +1362,7 @@ def _finish_run(
         llm_diagnostics=_llm_diagnostics(state),
         requirement_states=requirement_states,
         action_rejections=_action_rejections(state),
+        answer_input_evidence_ids=tuple(state.get("answer_evidence_ids", ())),
     )
     return {"result": dump_contract(result, ResearchRunResult)}
 

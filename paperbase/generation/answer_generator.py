@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import json
 from pathlib import Path
 import re
 import time
-from typing import Literal, Mapping, Sequence
+from typing import Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -22,7 +21,6 @@ from paperbase.llm.client import (
     create_chat_completion_client,
     load_llm_runtime_settings,
     complete_json_with_diagnostics,
-    structured_client_view,
 )
 from paperbase.llm.diagnostics import (
     REQUEST_ERROR_STAGES,
@@ -32,27 +30,13 @@ from paperbase.llm.diagnostics import (
 )
 from paperbase.prompts.answer_generation import (
     ANSWER_GENERATION_SYSTEM_PROMPT,
-    ANSWER_SEMANTIC_SYSTEM_PROMPT,
     build_answer_generation_user_prompt,
 )
 
 from .section_expander import EvidenceUnit
 from .answer_coverage import (
     AnswerRequirementCoverage, AnswerDomainValidationError,
-    compile_answer_requirement_coverage, derive_overall_answer_status,
-    ANSWER_SEMANTIC_SCHEMA_VERSION,
 )
-
-
-class AnswerSemanticDraft(BaseModel):
-    """Agentic provider authors text and completeness, never bookkeeping."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-    direct_answer: str = Field(min_length=1)
-    evidence_explanation: str = Field(min_length=1)
-    reading_interpretation: str | None
-    requirement_status: dict[str, Literal["complete", "partial", "unsupported"]]
-    coverage_note: str | None
 
 
 class AnswerGenerationDraft(BaseModel):
@@ -129,7 +113,7 @@ def _answer_validation_diagnostics(
             error_code=codes.get(str(item.get("type")), "ANSWER_SCHEMA_VALIDATION_FAILED"),
             field_path=".".join(str(part) for part in item.get("loc", ())) or "root",
             validator_name=(error.title if error.title in {
-                "AnswerSemanticDraft", "AnswerGenerationDraft", "AnswerGenerationResult"
+            "AnswerGenerationDraft", "AnswerGenerationResult"
             } else "AnswerSchema"),
             safe_reason="回答草稿未通过现有 JSON Schema 校验。",
             expected_constraint="Follow the current node response JSON Schema.",
@@ -158,11 +142,9 @@ class GroundedAnswerGenerator:
         *,
         settings: AnswerGenerationSettings,
         client: ChatCompletionClient,
-        agentic_temperature: float = 0,
     ) -> None:
         self._settings = settings
         self._client = client
-        self._agentic_temperature = agentic_temperature
 
     def generate(
         self,
@@ -170,15 +152,9 @@ class GroundedAnswerGenerator:
         query: str,
         evidence: Sequence[EvidenceUnit],
         conversation_context: Sequence[str] | None = None,
-        research_requirements: Sequence[tuple[str, str]] = (),
-        support_by_requirement: Mapping[str, Sequence[str]] | None = None,
     ) -> AnswerGenerationOutcome:
         """生成可追溯回答；模型、Schema 或引用校验失败时仅返回安全降级状态。"""
-        # Agentic selector has already applied its evidence budget and protected
-        # unique Requirement support; a second truncation would silently drop it.
-        bounded_evidence = tuple(
-            evidence if research_requirements else evidence[: self._settings.max_evidence_units]
-        )
+        bounded_evidence = tuple(evidence[: self._settings.max_evidence_units])
         if not self._settings.enabled:
             return AnswerGenerationOutcome(
                 status="disabled",
@@ -194,29 +170,8 @@ class GroundedAnswerGenerator:
                 answer="当前检索到的论文证据不足以回答该问题。",
                 citations=(),
                 insufficient_evidence=True,
-                requirement_coverage=compile_answer_requirement_coverage(
-                    required_requirement_ids=tuple(rid for rid, _ in research_requirements),
-                    allowed_support_by_requirement={}, semantic_status_by_requirement={},
-                    inline_citations=(),
-                ),
             )
         allowed_ids = {item.evidence_id for item in bounded_evidence}
-        allowed_coverage = {
-            rid: tuple(item.evidence_id for item in bounded_evidence
-                       if item.evidence_id in (support_by_requirement or {}).get(rid, ()))
-            for rid, _ in research_requirements
-        }
-        if research_requirements and not any(allowed_coverage.values()):
-            return AnswerGenerationOutcome(
-                status="insufficient_evidence",
-                answer="当前检索到的论文证据不足以回答该问题。",
-                citations=(), insufficient_evidence=True,
-                requirement_coverage=compile_answer_requirement_coverage(
-                    required_requirement_ids=tuple(rid for rid, _ in research_requirements),
-                    allowed_support_by_requirement=allowed_coverage,
-                    semantic_status_by_requirement={}, inline_citations=(),
-                ),
-            )
         normalized_context = tuple(
             " ".join(item.split())
             for item in (conversation_context or ())
@@ -239,49 +194,26 @@ class GroundedAnswerGenerator:
             query=query,
             evidence=bounded_evidence,
             conversation_context=normalized_context,
-            research_requirements=research_requirements,
-            support_by_requirement=support_by_requirement,
         )
         diagnostics: list[LLMCallRecord] = []
-        # Only Agentic coverage generation changes configuration; Classic is unchanged.
-        generation_client = structured_client_view(
-            self._client, temperature=self._agentic_temperature, structured_output_mode="json_schema"
-        ) if research_requirements else self._client
-        citation_repair_used = False
-        original_draft = None
         request_retries = 0
         max_attempts = 1 + self._settings.request_error_retries
         response_schema = _answer_response_schema(
-            research_requirements,
-            allowed_coverage,
-            tuple(item.evidence_id for item in bounded_evidence),
+            tuple(item.evidence_id for item in bounded_evidence)
         )
-        # One citation repair in addition to the pre-existing bounded transport retries.
-        for attempt in range(1, max_attempts + 1 + bool(research_requirements)):
+        for attempt in range(1, max_attempts + 1):
             completion: LLMCompletion | None = None
             try:
                 completion = complete_json_with_diagnostics(
-                    generation_client,
-                    system_prompt=(ANSWER_SEMANTIC_SYSTEM_PROMPT
-                                   if research_requirements else ANSWER_GENERATION_SYSTEM_PROMPT),
+                    self._client,
+                    system_prompt=ANSWER_GENERATION_SYSTEM_PROMPT,
                     user_prompt=user_prompt,
                     json_schema=response_schema,
-                    schema_name=("paperbase_grounded_answer_semantic_v3"
-                                 if research_requirements else "paperbase_grounded_answer"),
+                    schema_name="paperbase_grounded_answer",
                 )
-                draft = (
-                    AnswerSemanticDraft.model_validate_json(completion.content)
-                    if research_requirements else AnswerGenerationDraft.model_validate_json(completion.content)
-                )
-                if original_draft is not None:
-                    _validate_citation_repair(original_draft, draft)
-                result = (
-                    _compile_semantic_answer(
-                        draft, allowed_evidence_ids=allowed_ids,
-                        research_requirements=research_requirements,
-                        support_by_requirement=allowed_coverage,
-                    ) if research_requirements else
-                    _normalize_and_validate_answer(_compose_answer(draft), allowed_evidence_ids=allowed_ids)
+                draft = AnswerGenerationDraft.model_validate_json(completion.content)
+                result = _normalize_and_validate_answer(
+                    _compose_answer(draft), allowed_evidence_ids=allowed_ids
                 )
                 diagnostics.append(
                     success_record(
@@ -292,7 +224,7 @@ class GroundedAnswerGenerator:
                 )
                 return _to_outcome(
                     result,
-                    status=("insufficient_evidence" if research_requirements and result.insufficient_evidence else "success"),
+                    status="success",
                     llm_diagnostics=tuple(diagnostics),
                 )
             except (LLMRequestError, ValidationError, ValueError, TypeError) as error:
@@ -301,23 +233,14 @@ class GroundedAnswerGenerator:
                     and error.error_stage in REQUEST_ERROR_STAGES
                     and request_retries < self._settings.request_error_retries
                 )
-                repair_source = _semantic_repair_source(completion) if research_requirements else None
-                repairable_citation = (
-                    bool(research_requirements) and not citation_repair_used and repair_source is not None
-                    and (isinstance(error, ValidationError) or (
-                        isinstance(error, AnswerDomainValidationError)
-                        and error.code in {"ANSWER_UNKNOWN_CITATION", "ANSWER_CITATION_INVALID",
-                                           "ANSWER_REQUIREMENT_STATUS_INVALID"}
-                    ))
-                )
-                recovery = "retry_request" if retryable_request else "repair_citation" if repairable_citation else "fallback"
+                recovery = "retry_request" if retryable_request else "fallback"
                 diagnostics.append(
                     replace(failure_record(
                         node="generate_answer",
                         attempt=attempt,
                         error=error,
                         completion=completion,
-                        can_retry=retryable_request or repairable_citation,
+                        can_retry=retryable_request,
                         validation_diagnostics=_answer_validation_diagnostics(
                             error, attempt=attempt,
                             recovery_action=recovery,
@@ -327,14 +250,6 @@ class GroundedAnswerGenerator:
                 if retryable_request:
                     request_retries += 1
                     time.sleep(0.5 * (2 ** (attempt - 1)))
-                    continue
-                if repairable_citation:
-                    citation_repair_used = True
-                    original_draft = repair_source
-                    user_prompt = _citation_repair_prompt(
-                        user_prompt, original_draft, diagnostics[-1].validation_diagnostics,
-                        allowed_ids, allowed_coverage,
-                    )
                     continue
             # Repair is never a bypass: schema, provenance and body preservation
             # are checked again. A second domain failure falls back.
@@ -358,111 +273,14 @@ class GroundedAnswerGenerator:
         )
 
 
-def _answer_response_schema(requirements, allowed_coverage, allowed_evidence_ids=()):
-    if not requirements:
-        # Classic RAG keeps its established provider contract.
-        schema = AnswerGenerationDraft.model_json_schema()
-        ids = list(dict.fromkeys(allowed_evidence_ids))
-        schema["properties"]["citations"] = (
-            {"type": "array", "items": {"type": "string", "enum": ids}} if ids
-            else {"type": "array", "maxItems": 0, "items": {"type": "string"}}
-        )
-        return schema
-    schema = AnswerSemanticDraft.model_json_schema()
-    schema["title"] = ANSWER_SEMANTIC_SCHEMA_VERSION
-    judged = [rid for rid, _ in requirements if allowed_coverage.get(rid)]
-    schema["properties"]["requirement_status"] = {
-        "type": "object",
-        "properties": {rid: {"type": "string", "enum": ["complete", "partial", "unsupported"]} for rid in judged},
-        "required": judged, "additionalProperties": False,
-    }
+def _answer_response_schema(allowed_evidence_ids=()):
+    schema = AnswerGenerationDraft.model_json_schema()
+    ids = list(dict.fromkeys(allowed_evidence_ids))
+    schema["properties"]["citations"] = (
+        {"type": "array", "items": {"type": "string", "enum": ids}} if ids
+        else {"type": "array", "maxItems": 0, "items": {"type": "string"}}
+    )
     return schema
-
-
-def _semantic_repair_source(completion):
-    """Preservation snapshot only, never an alternate accepted provider parser.
-
-    A schema failure is repairable only if original fact fields can be retained.
-    Invalid JSON or absent/ill-typed fact text has no safe repair snapshot.
-    """
-    if completion is None:
-        return None
-    try:
-        raw = json.loads(completion.content)
-        if not isinstance(raw, dict) or any(
-            not isinstance(raw.get(field), str) or not raw[field].strip()
-            for field in ("direct_answer", "evidence_explanation")
-        ):
-            return None
-        reading = raw.get("reading_interpretation")
-        if reading is not None and not isinstance(reading, str):
-            return None
-        statuses = raw.get("requirement_status", {})
-        statuses = statuses if isinstance(statuses, dict) else {}
-        return AnswerSemanticDraft.model_construct(
-            direct_answer=raw["direct_answer"], evidence_explanation=raw["evidence_explanation"],
-            reading_interpretation=reading, requirement_status=statuses,
-            coverage_note=raw.get("coverage_note") if isinstance(raw.get("coverage_note"), str) else None,
-        )
-    except (ValueError, TypeError):
-        return None
-
-
-def _citation_repair_prompt(prompt, draft, errors, allowed_ids, allowed_coverage):
-    """Return original Evidence context plus an explicit structural repair contract."""
-    payload = {
-        "instruction": (
-            "仅修复 citation/domain 结构。不得增加事实，不得使用输入外的新 Evidence。"
-            "修正正文 inline citation、requirement_status 的精确 keys/complete或partial或unsupported、结构字段；"
-            "事实正文保持原字句，只允许删除完整句子或段落。若事实没有合法支持则删除。"
-            "可将 complete 降为 partial/unsupported，partial 可降为 unsupported，不得升级或制造引用；"
-            "无支持映射的 Requirement 由程序设为 unsupported，不得输出其 status key。coverage_note 与缺口一致。"
-            "requirement_id 是义务 ID，不是 citation；只能从每项 allowed_coverage_evidence_ids 选择。"
-            "返回完整原 Schema JSON。"
-        ),
-        "original_answer_json": draft.model_dump(),
-        "validation_errors": [{"code": e.error_code, "field_path": e.field_path,
-                               "expected_constraint": e.expected_constraint} for e in errors],
-        "allowed_evidence_ids": sorted(allowed_ids),
-        "allowed_coverage_evidence_ids": allowed_coverage,
-    }
-    return prompt + "\n\n<answer_citation_repair>\n" + json.dumps(payload, ensure_ascii=False) + "\n</answer_citation_repair>"
-
-
-def _validate_citation_repair(original, repaired):
-    """Structural edit guard, not an LLM/lexical semantic judge.
-
-    Citation edits and whole-sentence deletions may retain existing wording;
-    additions/rephrasings cannot quietly introduce facts in a repair request.
-    """
-    def plain(value):
-        return re.sub(r"\[(?:E\d+|REF\d+|(?:REQ:)?R\d+)\]", "", value or "")
-    for field in ("direct_answer", "evidence_explanation", "reading_interpretation"):
-        before = plain(getattr(original, field)); after = " ".join(plain(getattr(repaired, field)).split())
-        units = re.split(r"(?<=[。！？!?])\s*|\n+|(?<=\.)\s+", before)
-        remaining = after
-        for unit in units:
-            normalized = " ".join(unit.split())
-            if normalized and remaining.startswith(normalized) and (
-                len(remaining) == len(normalized) or remaining[len(normalized)].isspace()
-            ):
-                remaining = remaining[len(normalized):].lstrip()
-        if remaining:
-            raise AnswerDomainValidationError(
-                "ANSWER_REPAIR_CONTENT_CHANGED", field,
-                "引用修复不得增加或改写事实正文，只允许引用编辑或完整句子删除。",
-                "non_citation_text_changed", "Preserve original fact wording; only delete complete sentences."
-            )
-    ranks = {"unsupported": 0, "partial": 1, "complete": 2}
-    original_statuses = original.requirement_status
-    if any(status in ranks and isinstance(original_statuses.get(rid), str)
-           and original_statuses.get(rid) in ranks
-           and ranks[status] > ranks[original_statuses[rid]]
-           for rid, status in repaired.requirement_status.items()):
-        raise AnswerDomainValidationError(
-            "ANSWER_REPAIR_COVERAGE_UPGRADED", "requirement_status",
-            "引用修复不得升级原答案覆盖状态。", "coverage_upgraded", "Only preserve or downgrade coverage."
-        )
 
 
 def create_answer_generator(
@@ -490,44 +308,6 @@ def _with_answer_runtime_settings(
         runtime_settings,
         max_tokens=settings.max_output_tokens,
         timeout_seconds=settings.timeout_seconds,
-    )
-
-
-def _compile_semantic_answer(
-    draft: AnswerSemanticDraft, *, allowed_evidence_ids: set[str],
-    research_requirements: Sequence[tuple[str, str]],
-    support_by_requirement: Mapping[str, Sequence[str]],
-) -> AnswerGenerationResult:
-    # Only these three fields establish citations/support; a note cannot supply it.
-    body = _compose_body(draft.direct_answer, draft.evidence_explanation, draft.reading_interpretation)
-    citations = _validated_inline_citations(
-        body, allowed_evidence_ids=allowed_evidence_ids,
-    )
-    # Notes may explain gaps but cannot smuggle an unknown citation.
-    note_citations = _validated_inline_citations(draft.coverage_note or "", allowed_evidence_ids=allowed_evidence_ids)
-    coverage = compile_answer_requirement_coverage(
-        required_requirement_ids=tuple(rid for rid, _ in research_requirements),
-        allowed_support_by_requirement=support_by_requirement,
-        semantic_status_by_requirement=draft.requirement_status,
-        inline_citations=citations,
-    )
-    overall = derive_overall_answer_status(coverage, tuple(citations))
-    if overall == "insufficient" and (citations or note_citations):
-        raise AnswerDomainValidationError(
-            "ANSWER_CITATION_INVALID", "answer", "无支持的回答不得引用证据作答。",
-            "unsupported_answer_with_citations", "An insufficient answer must not cite evidence.",
-        )
-    note = (draft.coverage_note or "").strip() or None
-    if overall == "partial":
-        note = note or _DEFAULT_PARTIAL_COVERAGE_NOTE
-    elif overall == "complete":
-        note = None
-    answer = body
-    if note:
-        answer += "\n\n### 证据覆盖说明\n" + note
-    return AnswerGenerationResult(
-        answer=answer, citations=citations, insufficient_evidence=overall == "insufficient",
-        partial_answer=overall == "partial", coverage_note=note, requirement_coverage=coverage,
     )
 
 

@@ -9,23 +9,13 @@ from .contracts import (
     CorpusScopeSnapshot,
     CoverageState,
     CoverageStrategy,
-    EvidenceAnalysis,
-    EvidenceAnalysisCacheStats,
-    EvidenceAnalysisStatus,
-    EvidenceClaim,
-    EvidenceOwnership,
-    EvidenceProjectionType,
-    EnumerationProjection,
-    ComparisonProjection,
-    FactProjection,
-    MechanismProjection,
-    ProjectedEntity,
-    ProjectedEntityRole,
-    EvidenceQualification,
-    EvidenceRelation,
     EvidenceRecord,
     EvidenceTarget,
-    FinishAction,
+    TryAnswerAction,
+    StopResearchAction,
+    GroundedCitation,
+    RequirementAnswer,
+    GroundedAnswerAttempt,
     GetPaperOverviewAction,
     GetSectionContextAction,
     Intent,
@@ -57,11 +47,9 @@ from .candidate_selection import (
     PaperMetadata,
 )
 from .decision import LLMDecisionAgent, ScriptedDecisionAgent
+from .grounded_answer import EvidencePackBuilder, LLMGroundedAnswerer
 from .coverage import CoverageManager
 from .evidence_registry import EvidenceRegistry
-from .evidence_analysis import EvidenceAnalysisRequest, EvidenceAnalysisResult, EvidenceAnalyzer, LegacyEvidenceAnalyzerAdapter
-from .evidence_projection import LLMEvidenceProjector, ProjectionRequest
-from .evidence_analysis_cache import SQLiteEvidenceAnalysisCache
 from .evaluation import AgenticEvaluationReport, evaluate_research_result
 from .events import ResearchProgressEvent
 from .audit import (
@@ -81,7 +69,6 @@ from .graph import (
 from .planner import ResearchPlanner
 from .query_understanding import QueryUnderstandingService
 from .scope_resolver import ScopeResolver, TrustedWorkspaceScope
-from .selector import FinalEvidenceSelector
 from .service import AgenticResearchBusyError, AgenticResearchService
 from .tools import ResearchToolExecutor
 
@@ -96,28 +83,15 @@ __all__ = [
     "CoverageManager",
     "CoverageState",
     "CoverageStrategy",
-    "EvidenceAnalysis",
-    "EvidenceAnalysisCacheStats",
-    "EvidenceAnalysisResult",
-    "EvidenceAnalysisRequest",
-    "EvidenceAnalyzer",
-    "LegacyEvidenceAnalyzerAdapter",
-    "EvidenceAnalysisStatus",
-    "EvidenceClaim",
-    "EvidenceOwnership",
-    "EvidenceProjectionType",
-    "EnumerationProjection",
-    "ComparisonProjection",
-    "FactProjection",
-    "MechanismProjection",
-    "ProjectedEntity",
-    "ProjectedEntityRole",
-    "EvidenceQualification",
-    "EvidenceRelation",
     "EvidenceRecord",
     "EvidenceTarget",
-    "FinishAction",
-    "FinalEvidenceSelector",
+    "TryAnswerAction",
+    "StopResearchAction",
+    "GroundedCitation",
+    "RequirementAnswer",
+    "GroundedAnswerAttempt",
+    "EvidencePackBuilder",
+    "LLMGroundedAnswerer",
     "FormalPaperMetadataRepository",
     "GetPaperOverviewAction",
     "GetSectionContextAction",
@@ -153,9 +127,6 @@ __all__ = [
     "LangGraphResearchWorkflow",
     "LLMDecisionAgent",
     "LLMCandidateSelector",
-    "LLMEvidenceProjector",
-    "ProjectionRequest",
-    "SQLiteEvidenceAnalysisCache",
     "PaperMetadata",
     "QueryUnderstandingService",
     "ResearchPlanner",

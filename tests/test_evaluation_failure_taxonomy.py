@@ -21,17 +21,18 @@ def codes(row: dict[str, object]) -> set[str]:
 def test_sufficient_evidence_answer_domain_failure_is_not_false_no_support() -> None:
     audit = {
         "requirements": [
-            {"requirement_id": "R1", "required": True, "status": "satisfied"},
-            {"requirement_id": "R2", "required": True, "status": "satisfied"},
+            {"requirement_id": "R1", "required": True, "status": "satisfied",
+             "answer": "answer", "citations": [{"evidence_id": "E1"}]},
+            {"requirement_id": "R2", "required": True, "status": "satisfied",
+             "answer": "answer", "citations": [{"evidence_id": "E1"}]},
         ],
-        "evidence": [{
-            "evidence_id": "E1", "analysis_status": "qualified", "selected": True,
-            "verified_supports_requirement_ids": ["R1", "R2"],
-        }],
+        "evidence": [{"evidence_id": "E1", "selected": True, "cited": True}],
+        "answer_input_evidence_ids": ["E1"],
+        "cited_evidence_ids": ["E1"],
         "llm_calls": [{"node": "generate_answer", "error_stage": "domain_validation"}],
         "validation_errors": [{
-            "node": "generate_answer", "stage": "domain_validation",
-            "code": "ANSWER_UNKNOWN_CITATION", "field_path": "answer",
+            "node": "generate_answer", "error_stage": "domain_validation",
+            "error_code": "ANSWER_UNKNOWN_CITATION", "field_path": "answer",
         }],
     }
     row = evaluate_case_metrics(
@@ -49,7 +50,7 @@ def test_sufficient_evidence_answer_domain_failure_is_not_false_no_support() -> 
     assert "false_no_support" not in row["failure_labels"]
 
 
-def test_gold_retrieval_miss_is_distinct_from_projection_failure() -> None:
+def test_gold_retrieval_miss_is_a_retrieval_failure() -> None:
     row = evaluate_case_metrics(
         case("g1", "g2"), ranked_chunk_ids=None, run_status="partial",
         stop_reason="budget_exhausted", audit={},
@@ -60,12 +61,14 @@ def test_gold_retrieval_miss_is_distinct_from_projection_failure() -> None:
     assert row["false_no_support"] is True
 
 
-def test_gold_miss_does_not_relabel_sufficient_selected_support_answer_failure() -> None:
+def test_gold_miss_does_not_relabel_grounded_support_as_false_no_support() -> None:
     audit = {
         "requirements": [{"requirement_id": "R1", "required": True,
-                          "status": "satisfied"}],
-        "evidence": [{"evidence_id": "E1", "selected": True,
-                      "verified_supports_requirement_ids": ["R1"]}],
+                          "status": "satisfied", "answer": "answer",
+                          "citations": [{"evidence_id": "E1"}]}],
+        "evidence": [{"evidence_id": "E1", "selected": True, "cited": True}],
+        "answer_input_evidence_ids": ["E1"],
+        "cited_evidence_ids": ["E1"],
         "llm_calls": [{"node": "generate_answer", "error_stage": "domain_validation"}],
     }
     row = evaluate_case_metrics(
@@ -79,44 +82,43 @@ def test_gold_miss_does_not_relabel_sufficient_selected_support_answer_failure()
     assert row["false_no_support"] is False
 
 
-def test_gold_projection_failure_no_support_and_integrity_rejection() -> None:
-    audit = {"evidence": [
-        {"evidence_id": "E1", "analysis_status": "failed"},
-        {"evidence_id": "E2", "analysis_status": "irrelevant"},
-        {"evidence_id": "E3", "analysis_status": "qualified",
-         "projection_rejections": ["support_rejected:R1:source_anchor_not_found"]},
-    ]}
+def test_registered_gold_missing_from_answer_input_is_attributed() -> None:
+    audit = {
+        "evidence": [{"evidence_id": "E1", "selected": False, "cited": False}],
+        "answer_input_evidence_ids": [],
+        "cited_evidence_ids": [],
+    }
     row = evaluate_case_metrics(
-        case("g1", "g2", "g3"), ranked_chunk_ids=None, run_status="completed",
+        case("g1"), ranked_chunk_ids=None, run_status="completed",
         stop_reason="agent_finished", audit=audit,
-        agent_retrieved_source_chunk_ids=["g1", "g2", "g3"],
-        evidence_source_chunk_ids={"E1": ["g1"], "E2": ["g2"], "E3": ["g3"]},
+        agent_retrieved_source_chunk_ids=["g1"],
+        evidence_source_chunk_ids={"E1": ["g1"]},
         answer={"insufficient_evidence": True},
     )
-    assert {"PROJECTOR_FAILED", "PROJECTOR_NO_SUPPORT",
-            "INTEGRITY_INVALID"} <= codes(row)
+    assert "GOLD_EVIDENCE_NOT_SHOWN_TO_ANSWERER" in codes(row)
     assert row["false_no_support"] is True
     assert all(item["stage"] in {
-        "retrieval", "projection", "integrity", "selection", "control",
+        "retrieval", "registry", "answer_input", "grounding", "control",
         "answer_generation", "answer_validation",
     } for item in row["failure_diagnostics"])
-    assert next(item for item in row["failure_diagnostics"]
-                if item["code"] == "INTEGRITY_INVALID")["requirement_ids"] == ["R1"]
 
 
-def test_verified_support_not_selected_and_invalid_action_stop() -> None:
+def test_gold_shown_to_answerer_but_not_cited_is_attributed() -> None:
     audit = {
-        "requirements": [{"requirement_id": "R1", "required": True, "status": "in_progress"}],
-        "evidence": [{"evidence_id": "E1", "selected": False,
-                      "verified_supports_requirement_ids": ["R1"]}],
+        "requirements": [{"requirement_id": "R1", "required": True,
+                          "status": "in_progress", "remaining_gap": "missing"}],
+        "evidence": [{"evidence_id": "E1", "selected": False, "cited": False}],
+        "answer_input_evidence_ids": ["E1"],
+        "cited_evidence_ids": [],
     }
     row = evaluate_case_metrics(
         case("g"), ranked_chunk_ids=None, run_status="partial",
-        stop_reason="invalid_action_limit", audit=audit,
+        stop_reason="agent_finished", audit=audit,
         agent_retrieved_source_chunk_ids=["g"],
+        evidence_source_chunk_ids={"E1": ["g"]},
         answer={"insufficient_evidence": True},
     )
-    assert {"VERIFIED_SUPPORT_NOT_SELECTED", "INVALID_ACTION_STOP"} <= codes(row)
+    assert {"GOLD_ANSWER_INPUT_NOT_CITED", "REQUIRED_REQUIREMENT_GAP"} <= codes(row)
 
 
 def test_correct_unanswerable_abstention_has_no_false_no_support() -> None:

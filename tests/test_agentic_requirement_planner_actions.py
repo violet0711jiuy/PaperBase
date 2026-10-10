@@ -109,21 +109,21 @@ def test_enumeration_planner_does_not_expand_to_unasked_research_dimensions() ->
 def test_exhaustive_model_plan_keeps_only_user_requested_obligations():
     raw = {"goal":"只列出核心方法", "requirements":[{
         "description":"只识别用户要求的核心方法，不包含 baseline 或 prior work",
-        "required":True, "evidence_targets":["method"], "projection_type":"enumeration"}]}
+        "required":True, "evidence_targets":["method"]}]}
     result = ResearchPlanner(_QueuedClient((json.dumps(raw),))).plan(_context(exhaustive=True))
     assert not result.used_fallback
     assert result.plan.planning_mode is PlanningMode.MODEL
     assert len(result.plan.requirements) == 1
     requirement = result.plan.requirements[0]
     assert requirement.description == raw['requirements'][0]['description']
-    assert requirement.required and requirement.projection_type.value == 'enumeration'
+    assert requirement.required
     assert requirement.evidence_targets == frozenset({EvidenceTarget.METHOD})
 
 
 def test_exhaustive_scope_validation_is_not_bypassed_by_a_template():
     raw = {"goal":"列出方法", "requirements":[{
         "description":"列出每个数据集的完整预处理和超参数",
-        "required":True, "evidence_targets":["method"], "projection_type":"enumeration"}]}
+        "required":True, "evidence_targets":["method"]}]}
     result = ResearchPlanner(_QueuedClient((json.dumps(raw),)), max_attempts=1).plan(_context(exhaustive=True))
     assert result.used_fallback
     assert result.llm_diagnostics[0].validation_diagnostics[0].error_code == 'PLANNER_UNASKED_DATASET'
@@ -134,7 +134,7 @@ def test_exhaustive_scope_validation_is_not_bypassed_by_a_template():
 def test_exhaustive_optional_only_model_plan_cannot_be_promoted_by_a_template():
     raw = {"goal":"列出方法", "requirements":[{
         "description":"识别核心方法", "required":False,
-        "evidence_targets":["method"], "projection_type":"enumeration"}]}
+        "evidence_targets":["method"]}]}
     result = ResearchPlanner(_QueuedClient((json.dumps(raw),)), max_attempts=1).plan(_context(exhaustive=True))
     assert result.used_fallback
     assert result.llm_diagnostics[0].validation_diagnostics[0].error_code == 'PLANNER_NO_REQUIRED_REQUIREMENT'
@@ -149,7 +149,7 @@ def test_planner_output_is_requirement_first_and_rejects_scope_expansion() -> No
                 {
                     "description": "识别论文提出或采用的风速预测方法",
                     "required": True,
-                    "evidence_targets": ["method"], "projection_type": "fact"}
+                    "evidence_targets": ["method"]}
             ],
         }
     )
@@ -164,7 +164,7 @@ def test_planner_output_is_requirement_first_and_rejects_scope_expansion() -> No
                 {
                     "description": "列出数据集和超参数",
                     "required": True,
-                    "evidence_targets": ["method"], "projection_type": "fact"}
+                    "evidence_targets": ["method"]}
             ],
         }
     )
@@ -179,7 +179,7 @@ def test_planner_output_is_requirement_first_and_rejects_scope_expansion() -> No
                 {
                     "description": "先搜索论文，再识别风速预测方法",
                     "required": True,
-                    "evidence_targets": ["method"], "projection_type": "fact"}
+                    "evidence_targets": ["method"]}
             ],
         }
     )
@@ -193,7 +193,7 @@ def test_planner_rejects_plan_without_required_answer_obligation() -> None:
         "requirements": [{
             "description": "识别风速预测方法",
             "required": False,
-            "evidence_targets": ["method"], "projection_type": "fact"}],
+            "evidence_targets": ["method"]}],
     })
     result = ResearchPlanner(_QueuedClient((optional_only,)), max_attempts=1).plan(_context())
     assert result.used_fallback
@@ -208,7 +208,7 @@ def test_planner_rejects_plan_without_required_answer_obligation() -> None:
         {"action": "search_references", "paper_id": "A", "query": "Find cited prior work on wind speed forecasting methods", "lexical_terms": ["prior work", "wind speed forecasting"], "requirement_ids": ["R3"]},
         {"action": "get_section_context", "paper_id": "A", "section_id": "methods", "requirement_ids": ["R1"]},
         {"action": "get_paper_overview", "paper_id": "A", "requirement_ids": ["R1"]},
-        {"action": "finish", "reason": "No further evidence is needed."},
+        {"action": "try_answer", "reason": "The raw Evidence Pool is ready."},
     ),
 )
 def test_agent_action_discriminated_union_accepts_each_tool_shape(

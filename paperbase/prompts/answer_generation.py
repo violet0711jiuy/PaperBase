@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Sequence
 
 if TYPE_CHECKING:
     from paperbase.generation.section_expander import EvidenceUnit
@@ -137,67 +137,11 @@ ANSWER_GENERATION_SYSTEM_PROMPT = (
 )
 
 
-ANSWER_SEMANTIC_PROMPT_VERSION = "answer-semantic-status-v4"
-
-AGENTIC_REQUIREMENT_COVERAGE_INSTRUCTION = """
-# Answer semantic author / Requirement completeness
-
-<requirements_with_verified_support> 提供 required Requirement 的已验证局部支持和允许引用范围，不保证能回答核心问题。
-只为这些固定 ID 输出 requirement_status object，值只能 complete、partial 或 unsupported。
-complete：全部实质回答义务都有选中 Evidence 支撑，且最终正文实际覆盖这些内容。
-partial：至少一个明确要求的核心事实或关系能回答，但重要部分仍缺少证据；只有相关背景或相邻指标不够。
-unsupported：虽然已有局部支持映射，但选中原文仍无法回答该 Requirement 的核心事实或关系。
-若全部 required Requirement 均无法回答核心内容，输出 unsupported，正文说明当前证据不足，不引用 Evidence 作答；程序生成拒答。
-当前片段未提供某信息，不能据此断言整篇论文没有报告该信息；负面结论也须原文直接支持。
-不要自行增加 Requirement 未要求的研究维度。
-
-<requirements_without_verified_support> 没有 selected verified support，程序将其设为 unsupported。
-知道这些缺口，回答有依据的部分并说明未覆盖内容；不得补写事实或输出这些 ID 的 status key。
-程序提供的 R→Evidence mapping 是允许引用范围，不得扩张、重绑定或猜测；你可以拒绝用它回答核心问题，但不修改上游局部支持。
-
-Projector support 是 Evidence-local 内容，不等于 Requirement 已完整回答。
-support_scope 描述局部支持；unresolved_aspects 是单条 Evidence 的缺口。
-其他 Evidence 可以补齐它，不得机械合并局部缺口，不得据其空/非空自动判 complete/partial。
-多个 Evidence 可以共同回答一个 Requirement；事实最终须由 source_text / 书目信息支持。
-
-每个判为 complete/partial 的 Requirement，正文必须实际引用至少一条其 allowed_supporting_evidence_ids。
-unsupported 项不填写引用、不补写其事实；同一 Evidence 仍可用于其他判为 complete/partial 的合法 Requirement。
-引用由正文 [E#]/[REF#] 产生；从 evidence_citation_bindings 复制合法标记。
-R# / REQ:R# 是 Requirement 标签，不能作 Evidence 引用。
-原文 [2]/[3] 是书目序号，不能换成 REF2/REF3。
-同一 Evidence 可以用于多个 Requirement，但须分别属于程序给出的支持映射。
-REF# 支持文献存在/书目信息，引用意图和关系需有 E# 正文支持。
-
-coverage_note 说明仍缺少的关键语义内容；完整回答可为 null。
-不要使用常识、Requirement 描述或局部缺口反向补事实。
-
-只输出 JSON：
-{
-  "direct_answer": "有依据的直接回答，带合法 inline citations",
-  "evidence_explanation": "原文中的机制、步骤、实验依据或比较关系，带引用",
-  "reading_interpretation": null,
-  "requirement_status": {"当前有支持映射的Required ID": "complete或partial或unsupported"},
-  "coverage_note": null
-}
-direct_answer 和 evidence_explanation 必须非空。
-reading_interpretation 不得引入新事实。
-不要输出 citations、requirement_coverage、evidence_ids、insufficient_evidence、partial_answer 或 overall_status；
-这些最终字段均由程序编译。
-""".strip()
-
-ANSWER_SEMANTIC_SYSTEM_PROMPT = (
-    ANSWER_EVIDENCE_RULES
-    + "\n\n" + AGENTIC_REQUIREMENT_COVERAGE_INSTRUCTION
-)
-
-
 def build_answer_generation_user_prompt(
     *,
     query: str,
     evidence: Sequence["EvidenceUnit"],
     conversation_context: Sequence[str] | None = None,
-    research_requirements: Sequence[tuple[str, str]] = (),
-    support_by_requirement: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
     """构造只包含用户问题、研究目标和已选证据的数据区。"""
 
@@ -211,33 +155,10 @@ def build_answer_generation_user_prompt(
         if item.strip()
     ) or "- (none)"
 
-    requirement_context = ""
     citation_context = (
         "<allowed_evidence_ids>\n" + json.dumps([item.evidence_id for item in evidence], ensure_ascii=False)
         + "\n</allowed_evidence_ids>\n"
     )
-
-    if research_requirements:
-        supported, unsupported = [], []
-        for rid, description in research_requirements:
-            ids = [item.evidence_id for item in evidence
-                   if item.evidence_id in (support_by_requirement or {}).get(rid, ())]
-            entry = {"requirement_id": rid, "requirement_label": f"REQ:{rid}", "description": description}
-            if ids:
-                entry["allowed_supporting_evidence_ids"] = ids
-                supported.append(entry)
-            else:
-                unsupported.append(entry)
-        requirement_context = (
-            "<requirements_with_verified_support>\n" + json.dumps(supported, ensure_ascii=False)
-            + "\n</requirements_with_verified_support>\n"
-            + "<requirements_without_verified_support>\n" + json.dumps(unsupported, ensure_ascii=False)
-            + "\n</requirements_without_verified_support>\n"
-            + "<evidence_citation_bindings>\n"
-            + json.dumps([{"evidence_id": item.evidence_id, "in_text_citation": f"[{item.evidence_id}]"}
-                          for item in evidence], ensure_ascii=False)
-            + "\n</evidence_citation_bindings>\n\n"
-        )
 
     return (
         "<user_query>\n"
@@ -246,7 +167,6 @@ def build_answer_generation_user_prompt(
         "<conversation_context>\n"
         f"{rendered_context}\n"
         "</conversation_context>\n\n"
-        f"{requirement_context}"
         f"{citation_context}"
         "<evidence_context>\n"
         f"{rendered_evidence}\n"
@@ -255,7 +175,7 @@ def build_answer_generation_user_prompt(
 
 
 def _render_evidence(item: "EvidenceUnit") -> str:
-    """渲染 Evidence；Agentic 模式优先展示原文，再展示结构化投影。"""
+    """渲染 Classic Evidence。"""
 
     page_text = _page_text(item.page_start, item.page_end)
 
@@ -268,44 +188,7 @@ def _render_evidence(item: "EvidenceUnit") -> str:
         f"chunks={','.join(item.chunk_ids)}\n"
     )
 
-    analysis = ""
-
-    if item.evidence_digest or item.claim_annotations:
-        claims = "\n".join(
-            "- "
-            f"statement={claim.statement}; "
-            f"relation={claim.relation}; "
-            f"ownership={claim.ownership}; "
-            f"source_excerpt={claim.source_excerpt}"
-            for claim in item.claim_annotations
-        ) or "- (none)"
-
-        analysis += (
-            "\n<evidence_analysis>\n"
-            f"digest={item.evidence_digest or '(none)'}\n"
-            f"claims:\n{claims}\n"
-            "</evidence_analysis>\n"
-        )
-
-    if item.projection_context is not None:
-        analysis += (
-            "\n<structured_projection>\n"
-            + json.dumps(
-                item.projection_context,
-                ensure_ascii=False,
-            )
-            + "\n</structured_projection>\n"
-        )
-
-        # Agentic:
-        # 原文先于 Projector 摘要，避免 Answer 先入为主地依赖 Projection。
-        return (
-            f"{header}"
-            f"<source_text>\n{item.text}\n</source_text>\n"
-            f"{analysis}"
-        )
-
-    return f"{header}{analysis}{item.text}"
+    return f"{header}{item.text}"
 
 
 def _page_text(

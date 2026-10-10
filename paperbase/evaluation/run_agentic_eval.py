@@ -61,6 +61,7 @@ def _result_payload(result: object) -> dict[str, Any]:
                             for item in result.answer.requirement_coverage
                         ]} if result.answer else {}),
             "selected_evidence_ids": [item.evidence_id for item in result.selected_evidence],
+            "answer_input_evidence_ids": list(result.answer_input_evidence_ids),
             "evidence_source_chunk_ids": {
                 item.evidence_id: list(item.evidence.source_chunk_ids)
                 for item in result.evidence
@@ -103,11 +104,11 @@ def _report(
         "This run measures only the Agentic service. Agent retrieval coverage uses all kept Evidence; "
         "final Evidence coverage uses the selected set. One-shot Retriever ranking metrics are N/A."
         if agentic_only else
-        "`retrieval_miss` points to the standalone Retriever ranking. A retrieval hit plus false no-support "
-        "points to Agent research, projection, completion, or selection."
+        "`retrieval_miss` points to the standalone Retriever ranking. A retrieval hit followed by an "
+        "uncited gold chunk points to Registry, Answer-input, grounding, or answer completeness."
     )
     recommendation = (
-        "Inspect low Agent retrieval coverage, then false no-support, selection, and answer failures."
+        "Inspect low Agent retrieval coverage, then answer-input, citation grounding, and open Requirement gaps."
         if agentic_only else
         "Prioritize only labels that recur in this run: retrieval misses first when Hit@5 is low; "
         "then false no-support/no-selected-evidence cases; then cost/stagnation labels."

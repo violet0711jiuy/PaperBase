@@ -39,7 +39,7 @@ def state():
 
 
 def wire(tool, paper="A", *, query="dynamic graph", lexical=("adaptive",), section="intro"):
-    if tool == "finish":
+    if tool in {"try_answer", "stop_research"}:
         return {"decision": {"action": tool, "reason": "No more useful research"}}
     body = {"action": tool, "requirement_ids": ["R1"]}
     if tool != "search_knowledge_base":
@@ -119,8 +119,8 @@ def assert_root_matches_domain(s):
     root = schema["properties"]["decision"]
     assert set(root["discriminator"]["mapping"]) == set(capabilities.available_tools)
     assert {v["$ref"] for v in root["oneOf"]} == set(root["discriminator"]["mapping"].values())
-    assert "finish" in capabilities.available_tools
-    assert schema_accepts(s, wire("finish"))
+    assert "stop_research" in capabilities.available_tools
+    assert schema_accepts(s, wire("stop_research"))
 
 
 def test_per_paper_budget_filters_search_only_and_guard_remains_defensive():
@@ -147,7 +147,7 @@ def test_per_paper_budget_filters_search_only_and_guard_remains_defensive():
 def test_empty_search_and_overview_domains_remove_only_their_root_branches():
     s = replace(state(), budget_usage=BudgetUsage(queries_per_paper=(("A", 2), ("B", 2))))
     assert set(_runtime_action_capabilities(s).available_tools) == {
-        "finish", "get_paper_overview", "get_section_context"}
+        "try_answer", "stop_research", "get_paper_overview", "get_section_context"}
     assert not schema_accepts(s, wire("search_papers", "arbitrary"))
     assert not schema_accepts(s, wire("search_references", "arbitrary"))
     assert_root_matches_domain(s)
@@ -212,7 +212,7 @@ def test_section_consumption_requires_completed_read(status, consumed):
 def test_kb_before_after_candidate_scope_and_empty_paper_domain():
     s = state()
     s = replace(s, context=replace(s.context, scope=QueryScope.KNOWLEDGE_BASE, target_paper_ids=()))
-    assert _runtime_action_capabilities(s).available_tools == ("finish", "search_knowledge_base")
+    assert _runtime_action_capabilities(s).available_tools == ("try_answer", "stop_research", "search_knowledge_base")
     assert schema_accepts(s, wire("search_knowledge_base"))
     for tool in ("search_papers", "search_references", "get_paper_overview", "get_section_context"):
         assert not schema_accepts(s, wire(tool))
@@ -233,14 +233,14 @@ def test_kb_before_after_candidate_scope_and_empty_paper_domain():
         candidate_selection=selection).code == "CandidateScopeLocked"
 
 
-def test_requirement_status_semantics_unchanged_and_empty_domain_finish_only():
+def test_requirement_status_semantics_unchanged_and_empty_domain_stop_only():
     s = replace(state(), requirement_states=(RequirementState("R1", RequirementStatus.SATISFIED),
                                              RequirementState("R2", RequirementStatus.UNCERTAIN)))
     assert _runtime_action_capabilities(s).valid_requirement_ids == ("R1",)
     assert schema_accepts(s, wire("search_papers"))
     s = replace(s, requirement_states=(RequirementState("R1", RequirementStatus.NO_SUPPORT_FOUND),
                                        RequirementState("R2", RequirementStatus.UNCERTAIN)))
-    assert _runtime_action_capabilities(s).available_tools == ("finish",)
+    assert _runtime_action_capabilities(s).available_tools == ("try_answer", "stop_research")
     assert_root_matches_domain(s)
     assert not schema_accepts(s, wire("search_papers"))
 

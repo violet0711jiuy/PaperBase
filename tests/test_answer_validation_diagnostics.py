@@ -87,8 +87,8 @@ def test_answer_schema_failure_is_distinct_and_visible_in_audit() -> None:
         answer=outcome, llm_diagnostics=outcome.llm_diagnostics,
         error_codes=(), clarification=None,
     ))
-    assert snapshot.validation_errors[0].code == "ANSWER_SCHEMA_REQUIRED_FIELD"
-    assert snapshot.validation_errors[0].stage == "schema_validation"
+    assert snapshot.validation_errors[0].error_code == "ANSWER_SCHEMA_REQUIRED_FIELD"
+    assert snapshot.validation_errors[0].error_stage == "schema_validation"
     assert snapshot.validation_errors[0].recovery_action == "fallback"
 
 
@@ -102,7 +102,7 @@ def test_answer_domain_rule_code_is_visible_in_audit() -> None:
         error_codes=(), clarification=None,
     ))
     item = snapshot.validation_errors[0]
-    assert item.code == item.rule_code == "ANSWER_UNKNOWN_CITATION"
+    assert item.error_code == "ANSWER_UNKNOWN_CITATION"
     assert item.field_path == "answer"
 
 

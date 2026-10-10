@@ -15,11 +15,11 @@ from typing import Any
 
 TAXONOMY = ("fact", "method", "experiment", "result", "synthesis", "bibliography", "unanswerable")
 FAILURE_STAGES = frozenset({
-    "retrieval", "projection", "integrity", "selection", "control",
+    "retrieval", "registry", "answer_input", "grounding", "control",
     "answer_generation", "answer_validation",
 })
 RESEARCH_FAILURE_STAGES = frozenset({
-    "retrieval", "projection", "integrity", "selection", "control",
+    "retrieval", "registry", "answer_input", "grounding", "control",
 })
 
 
@@ -50,8 +50,6 @@ def ranking_metrics(ranked_chunk_ids: Sequence[str], gold_ids: Sequence[str]) ->
 def _useful_action(step: Mapping[str, Any]) -> bool:
     return (
         int(step.get("added_count", 0) or 0) > 0
-        or int(step.get("new_supporting_evidence_count", 0) or 0) > 0
-        or bool(step.get("newly_supported_requirement_ids"))
         or bool(step.get("newly_exposed_section_ids"))
         or (str(step.get("action_name", "")).startswith(("get_section_context", "get_paper_overview")) and str(step.get("tool_status", "")) == "ok")
     )
@@ -195,78 +193,39 @@ def _failure_diagnostics(
         item for item in evidence
         if gold_set.intersection(evidence_source_chunk_ids.get(str(item.get("evidence_id")), ()))
     )
-    failed = tuple(item for item in gold_evidence if item.get("analysis_status") == "failed")
-    irrelevant = tuple(item for item in gold_evidence if item.get("analysis_status") == "irrelevant")
-    if failed:
-        add("projection", "PROJECTOR_FAILED",
-            evidence_ids=(str(item["evidence_id"]) for item in failed),
-            detail=f"gold_evidence_failed={len(failed)}")
-    if irrelevant:
-        add("projection", "PROJECTOR_NO_SUPPORT",
-            evidence_ids=(str(item["evidence_id"]) for item in irrelevant),
-            detail=f"gold_evidence_marked_irrelevant={len(irrelevant)}")
-    qualified_without_support = tuple(
-        item for item in gold_evidence
-        if item.get("analysis_status") == "qualified"
-        and not item.get("proposed_supports_requirement_ids")
+    answer_input_ids = set(str(value) for value in audit.get("answer_input_evidence_ids", ()))
+    missing_from_answer = tuple(
+        item for item in gold_evidence if str(item.get("evidence_id")) not in answer_input_ids
     )
-    if qualified_without_support:
-        add("projection", "PROJECTOR_NO_SUPPORT",
-            evidence_ids=(str(item["evidence_id"]) for item in qualified_without_support),
-            detail=f"gold_evidence_without_projector_support={len(qualified_without_support)}")
-    rejected = tuple(
+    if missing_from_answer:
+        add("answer_input", "GOLD_EVIDENCE_NOT_SHOWN_TO_ANSWERER",
+            evidence_ids=(str(item["evidence_id"]) for item in missing_from_answer),
+            detail=f"gold_evidence_missing_from_answer_input={len(missing_from_answer)}")
+    cited_ids = set(str(value) for value in audit.get("cited_evidence_ids", ()))
+    uncited = tuple(
         item for item in gold_evidence
-        if item.get("analysis_status") == "qualified"
-        and any(str(value).startswith("support_rejected:")
-                for value in item.get("projection_rejections", ()))
+        if str(item.get("evidence_id")) in answer_input_ids
+        and str(item.get("evidence_id")) not in cited_ids
     )
-    if rejected:
-        requirement_ids = {
-            str(value).split(":", 2)[1]
-            for item in rejected for value in item.get("projection_rejections", ())
-            if str(value).startswith("support_rejected:") and len(str(value).split(":", 2)) == 3
-        }
-        add("integrity", "INTEGRITY_INVALID",
-            requirement_ids=requirement_ids,
-            evidence_ids=(str(item["evidence_id"]) for item in rejected),
-            detail=f"gold_evidence_with_invalid_support_assertions={len(rejected)}")
+    if uncited:
+        add("grounding", "GOLD_ANSWER_INPUT_NOT_CITED",
+            evidence_ids=(str(item["evidence_id"]) for item in uncited),
+            detail=f"gold_answer_input_not_cited={len(uncited)}")
 
     required_ids = {
         str(item.get("requirement_id")) for item in audit.get("requirements", ())
         if isinstance(item, Mapping) and item.get("required") is True
     }
-    unsupported_ids = {
+    open_gap_ids = {
         str(item.get("requirement_id"))
         for item in audit.get("requirements", ())
         if isinstance(item, Mapping) and item.get("required") is True
-        and item.get("status") == "no_support_found"
+        and item.get("remaining_gap")
     }
-    if answerable and unsupported_ids:
-        add("projection", "PROJECTOR_NO_SUPPORT",
-            requirement_ids=unsupported_ids,
-            detail=f"required_obligations_without_projector_support={len(unsupported_ids)}")
-    verified_by_requirement = {
-        requirement_id: [
-            str(item.get("evidence_id")) for item in evidence
-            if requirement_id in item.get("verified_supports_requirement_ids", ())
-        ] for requirement_id in required_ids
-    }
-    selected_support = {
-        requirement_id for requirement_id in required_ids
-        if any(item.get("selected") is True
-               and requirement_id in item.get("verified_supports_requirement_ids", ())
-               for item in evidence)
-    }
-    unselected_ids = {
-        requirement_id for requirement_id, evidence_ids in verified_by_requirement.items()
-        if evidence_ids and requirement_id not in selected_support
-    }
-    if unselected_ids:
-        add("selection", "VERIFIED_SUPPORT_NOT_SELECTED",
-            requirement_ids=unselected_ids,
-            evidence_ids=(evidence_id for requirement_id in unselected_ids
-                          for evidence_id in verified_by_requirement[requirement_id]),
-            detail=f"required_obligations_without_selected_support={len(unselected_ids)}")
+    if answerable and open_gap_ids:
+        add("grounding", "REQUIRED_REQUIREMENT_GAP",
+            requirement_ids=open_gap_ids,
+            detail=f"required_obligations_with_open_gap={len(open_gap_ids)}")
 
     if stop_reason == "budget_exhausted":
         add("control", "BUDGET_EXHAUSTED", detail="global_agent_iteration_limit_reached")
@@ -287,10 +246,11 @@ def _failure_diagnostics(
         )
         if calls:
             rules = sorted({
-                str(item.get("code"))
+                str(item.get("error_code", item.get("code")))
                 for item in audit.get("validation_errors", ())
                 if isinstance(item, Mapping) and item.get("node") == "generate_answer"
-                and item.get("stage") == stage and item.get("code")
+                and item.get("error_stage", item.get("stage")) == stage
+                and item.get("error_code", item.get("code"))
             })
             if stage == "domain_validation" and any(
                 rule in {"ANSWER_UNKNOWN_CITATION", "ANSWER_CITATION_INVALID"}
@@ -310,13 +270,7 @@ def _required_support_selected(audit: Mapping[str, Any]) -> bool:
     )
     if not required or any(item.get("status") != "satisfied" for item in required):
         return False
-    selected_support = {
-        str(requirement_id)
-        for item in audit.get("evidence", ())
-        if isinstance(item, Mapping) and item.get("selected") is True
-        for requirement_id in item.get("verified_supports_requirement_ids", ())
-    }
-    return all(str(item.get("requirement_id")) in selected_support for item in required)
+    return all(item.get("answer") and item.get("citations") for item in required)
 
 
 def failure_labels(*, answerable: bool, retrieval: Mapping[str, Any], retrieval_observed: bool = True, run_status: str | None,

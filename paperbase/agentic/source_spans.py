@@ -1,4 +1,4 @@
-"""Deterministic, evidence-local source spans for Projector citations.
+"""Deterministic, evidence-local source spans for Grounded Answer citations.
 
 The provider selects opaque span IDs.  Only this module turns those IDs back
 into exact source text, so copied/paraphrased provider excerpts never become
@@ -96,7 +96,11 @@ def resolve_source_span_ids(content: str, span_ids: Iterable[str]) -> str:
     by_id = {span.span_id: (index, span) for index, span in enumerate(spans)}
     if any(span_id not in by_id for span_id in requested):
         raise SourceSpanResolutionError("source_span_not_found")
-    indices = sorted(by_id[span_id][0] for span_id in requested)
+    indices = [by_id[span_id][0] for span_id in requested]
+    if indices != sorted(indices):
+        raise SourceSpanResolutionError("source_spans_out_of_order")
+    if indices != list(range(indices[0], indices[-1] + 1)):
+        raise SourceSpanResolutionError("source_spans_non_contiguous")
     first = spans[indices[0]]
     last = spans[indices[-1]]
     if (

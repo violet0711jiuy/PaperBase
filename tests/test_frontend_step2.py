@@ -152,7 +152,7 @@ def test_agentic_stream_persists_answer_thread_and_evidence(tmp_path) -> None:
     audit = service.get_conversation_turn_audit(turn)
     assert audit is not None
     assert audit.thread_id == "research-test"
-    assert audit.schema_version == 1
+    assert audit.schema_version == "grounded-answer-v1"
     assert service.export_conversation_turn_audit(turn) == audit.to_json(indent=2)
     assert service.get_pending_agentic_task(conversation.conversation_id) is None
 

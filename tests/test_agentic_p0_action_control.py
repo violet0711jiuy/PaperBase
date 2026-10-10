@@ -194,7 +194,7 @@ class ActionControlPlaneTests(unittest.TestCase):
         )
         self.assertEqual(payload["iteration_budget"]["remaining"], 1)
 
-    def test_in_progress_requirement_exposes_verified_support_to_decision(self) -> None:
+    def test_in_progress_requirement_does_not_invent_answer_support(self) -> None:
         state = replace(
             _state(),
             requirement_states=(
@@ -205,13 +205,13 @@ class ActionControlPlaneTests(unittest.TestCase):
 
         payload = json.loads(_state_prompt(state, []))
 
-        # This fixture has no anchored Evidence; stored research-state IDs are
-        # not promoted into Integrity-valid local support or duplicated in the view.
-        self.assertEqual(payload["requirements"][0]["local_supports"], [])
+        # Retrieval state never becomes an accepted answer without Grounded Answer.
+        self.assertIsNone(payload["requirements"][0]["accepted_answer"])
+        self.assertNotIn("local_supports", payload["requirements"][0])
         self.assertNotIn("state_evidence_ids", payload["requirements"][0])
         self.assertNotIn("verified_support_evidence_ids", payload["requirements"][0])
-        self.assertEqual(payload["requirements"][0]["retrieval_state"], "not_searched")
-        self.assertIn("verified support", AGENT_DECISION_SYSTEM_PROMPT)
+        self.assertNotIn("retrieval_state", payload["requirements"][0])
+        self.assertIn("Grounded Answer", AGENT_DECISION_SYSTEM_PROMPT)
         self.assertIn("Requirement", AGENT_DECISION_SYSTEM_PROMPT)
 
     def test_overlong_lexical_terms_are_reselected_instead_of_truncated(self) -> None:
@@ -521,7 +521,7 @@ class ActionControlPlaneTests(unittest.TestCase):
         self.assertEqual(
             capabilities["available_section_ids_by_paper"], [["A", ["methods"]]]
         )
-        self.assertNotIn("available_tools", capabilities["tool_budget_state"])
+        self.assertNotIn("tool_budget_state", capabilities)
         self.assertNotIn("next_action", capabilities)
         self.assertNotIn("recent_unavailable_actions", capabilities)
         self.assertNotIn("unavailable_paper_queries", capabilities)
@@ -587,7 +587,7 @@ class ActionControlPlaneTests(unittest.TestCase):
 
         audit = build_agentic_audit_snapshot(result)
 
-        self.assertEqual(audit.validation_errors[0].stage, "schema_validation")
+        self.assertEqual(audit.validation_errors[0].error_stage, "schema_validation")
         self.assertEqual(audit.validation_errors[0].field_path, "searches[0].query")
         self.assertNotIn("hidden-reasoning", audit.to_json())
 

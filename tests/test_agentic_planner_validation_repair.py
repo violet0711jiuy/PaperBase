@@ -41,7 +41,7 @@ def payload(description: str) -> str:
         "goal": "解释所问机制",
         "requirements": [{
             "description": description, "required": True,
-            "evidence_targets": ["method"], "projection_type": "fact"}],
+            "evidence_targets": ["method"]}],
     }, ensure_ascii=False)
 
 
@@ -77,8 +77,8 @@ def test_unasked_code_implementation_is_rejected_with_auditable_diagnostic() -> 
     assert diagnostic.field_path == "requirements[0].description"
     assert diagnostic.requirement_id == "R1"
     snapshot = audit(result)
-    assert snapshot.validation_errors[0].stage == "domain_validation"
-    assert snapshot.validation_errors[0].rule_code == "PLANNER_UNASKED_IMPLEMENTATION"
+    assert snapshot.validation_errors[0].error_stage == "domain_validation"
+    assert snapshot.validation_errors[0].error_code == "PLANNER_UNASKED_IMPLEMENTATION"
     assert snapshot.validation_errors[0].field_path == "requirements[0].description"
     assert snapshot.validation_errors[0].requirement_id == "R1"
     assert snapshot.validation_errors[0].validator_name == "planner_requirement_scope"
@@ -147,7 +147,7 @@ def test_schema_failure_then_domain_failure_remain_distinct_in_audit() -> None:
     assert [call.error_stage for call in result.llm_diagnostics] == [
         "schema_validation", "domain_validation",
     ]
-    assert list(dict.fromkeys(item.stage for item in snapshot.validation_errors)) == [
+    assert list(dict.fromkeys(item.error_stage for item in snapshot.validation_errors)) == [
         "schema_validation", "domain_validation",
     ]
     assert snapshot.planning_mode == "literal_fallback"

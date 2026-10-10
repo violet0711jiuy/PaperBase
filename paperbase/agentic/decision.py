@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 from copy import deepcopy
 import json
-import re
 from typing import Callable, Protocol
 
 from pydantic import ValidationError
@@ -15,22 +14,18 @@ from paperbase.llm.client import (
     LLMCompletion,
     complete_json_with_diagnostics,
 )
-from paperbase.prompts.agentic_decision import (
-    AGENT_DECISION_SYSTEM_PROMPT,
-    LEGACY_AGENT_DECISION_SYSTEM_PROMPT,
-    build_agent_decision_user_prompt,
-)
+from paperbase.prompts.agentic_decision import AGENT_DECISION_SYSTEM_PROMPT
 from paperbase.retrieval.contracts import PaperSearchSpec, ToolStatus
-from paperbase.retrieval.evidence_scores import retrieval_rank_priority
 
 from .contracts import (
     AgentAction,
     BudgetUsage,
     CandidateSelection,
     CoverageState,
-    EvidenceQualification,
     EvidenceRecord,
-    FinishAction,
+    GroundedAnswerAttempt,
+    TryAnswerAction,
+    StopResearchAction,
     GetPaperOverviewAction,
     GetSectionContextAction,
     LLMCallRecord,
@@ -58,14 +53,13 @@ from .schemas import (
     SearchKnowledgeBaseDraft,
     SearchPapersDraft,
     SearchReferencesDraft,
+    TryAnswerDraft,
+    StopResearchDraft,
 )
-from .research_profile import build_research_profiles
 from .requirement_state import derive_requirement_states
-from .requirement_coverage import derive_requirement_coverage
 from .action_control import ActionCanonicalizer
 from .guards import GuardDecision
 from paperbase.retrieval.requests import CanonicalSearchRequest
-from .initial_search_hints import build_initial_search_hints
 from .decision_view import CompactDecisionLimits, build_compact_decision_view
 from .requirement_targets import targets_for_requirement_ids
 
@@ -118,6 +112,12 @@ class DecisionState:
     coverage: CoverageState | None = None
     candidate_selection: CandidateSelection | None = None
     requirement_states: tuple[RequirementState, ...] = ()
+    grounded_answer: GroundedAnswerAttempt | None = None
+    # Complete Registry snapshot used by the last Grounded Answer attempt.
+    # GroundedAnswerAttempt.evidence_ids names cited Evidence only, so it cannot
+    # determine whether fresh uncited Evidence exists.
+    answer_evidence_ids: tuple[str, ...] = ()
+    answer_attempt_count: int = 0
     # Ephemeral observability for tool choice; RequirementState remains the
     # only completion-state contract.
     overview_status_by_paper: tuple[tuple[str, str], ...] = ()
@@ -134,8 +134,6 @@ class DecisionState:
 class DecisionResult:
     action: AgentAction
     llm_calls: int
-    # ScriptedDecisionAgent 的测试兼容字段；生产 LLM Decision 不再生成。
-    qualifications: tuple[EvidenceQualification, ...] = ()
     llm_diagnostics: tuple[LLMCallRecord, ...] = ()
     action_canonicalization: ActionCanonicalization | None = None
     recovery_rejections: tuple[ActionRejectionContext, ...] = ()
@@ -151,10 +149,7 @@ class LLMDecisionAgent:
         temperature: float = 0,
         thinking_enabled: bool = False,
         view_limits: CompactDecisionLimits | None = None,
-        view_mode: str = "compact",
     ) -> None:
-        if view_mode not in {"compact", "shadow"}:
-            raise ValueError("view_mode must be compact or shadow.")
         # Reuse the provider's immutable views, omitting application output caps.
         # Other nodes continue to use their independently configured clients.
         for method, value in (("with_max_tokens", None), ("with_temperature", temperature),
@@ -170,7 +165,6 @@ class LLMDecisionAgent:
         self._max_attempts = max_attempts
         self._canonicalizer = ActionCanonicalizer()
         self._view_limits = view_limits or CompactDecisionLimits()
-        self._view_mode = view_mode
 
     def decide(self, state: DecisionState) -> DecisionResult:
         errors: list[ValidationDiagnostic] = []
@@ -196,11 +190,7 @@ class LLMDecisionAgent:
                 })
             view = build_compact_decision_view(current_state, errors, limits=limits)
             compact_prompt = view.to_json()
-            old_prompt = _legacy_state_prompt(current_state, errors, evidence_limit=evidence_limit)
             metrics = dict(view.metrics)
-            metrics.update(full_old_payload_chars=len(old_prompt),
-                           full_old_payload_bytes=len(old_prompt.encode("utf8")),
-                           compression_ratio=len(compact_prompt) / max(1, len(old_prompt)))
             try:
                 completion = complete_json_with_diagnostics(
                     _repair_client_if_needed(
@@ -210,9 +200,8 @@ class LLMDecisionAgent:
                             current_state.last_action_rejection is not None
                         ),
                     ),
-                    system_prompt=(AGENT_DECISION_SYSTEM_PROMPT if self._view_mode == "compact"
-                                   else LEGACY_AGENT_DECISION_SYSTEM_PROMPT),
-                    user_prompt=compact_prompt if self._view_mode == "compact" else old_prompt,
+                    system_prompt=AGENT_DECISION_SYSTEM_PROMPT,
+                    user_prompt=compact_prompt,
                     json_schema=_decision_json_schema(current_state),
                     schema_name="paperbase_agent_action",
                 )
@@ -326,7 +315,7 @@ class ScriptedDecisionAgent:
 
     def decide(self, state: DecisionState) -> DecisionResult:
         if not self._actions:
-            return DecisionResult(FinishAction("script exhausted"), 1)
+            return DecisionResult(StopResearchAction("script exhausted"), 1)
         return DecisionResult(self._actions.pop(0), 1)
 
 
@@ -359,7 +348,7 @@ def _decision_json_schema(state: DecisionState) -> dict[str, object]:
     }
     for name in ("SearchSpecDraft", "SearchKnowledgeBaseDraft", "SearchReferencesDraft",
                  "GetSectionContextDraft", "GetPaperOverviewDraft"):
-        # With no active binding only finish is reachable; no invalid empty enum.
+        # With no active binding only answer/stop actions are reachable.
         if capabilities.valid_requirement_ids:
             definitions[name]["properties"]["requirement_ids"]["items"]["enum"] = list(
                 capabilities.valid_requirement_ids)
@@ -441,7 +430,11 @@ def _to_action(draft: ActionDraft) -> AgentAction:
             paper_id=draft.paper_id,
             requirement_ids=tuple(draft.requirement_ids),
         )
-    return FinishAction(draft.reason)
+    if isinstance(draft, TryAnswerDraft):
+        return TryAnswerAction(draft.reason)
+    if isinstance(draft, StopResearchDraft):
+        return StopResearchAction(draft.reason)
+    raise TypeError(f"Unsupported Decision draft: {type(draft).__name__}")
 
 
 def _bind_plan_targets(action: AgentAction, plan: ResearchPlan) -> AgentAction:
@@ -469,239 +462,6 @@ def _state_prompt(
     return build_compact_decision_view(
         state, errors, limits=CompactDecisionLimits(support_entries_per_requirement=min(6, evidence_limit))
     ).to_json()
-
-
-def _legacy_state_prompt(
-    state: DecisionState,
-    errors: list[ValidationDiagnostic],
-    *,
-    evidence_limit: int = 12,
-) -> str:
-    # Shadow/debug input retains historical summaries; Registry owns source text.
-    from .requirement_targets import preferred_tools_for_targets
-    capabilities = _runtime_action_capabilities(state)
-    decision_rows = {
-        item["requirement_id"]: item
-        for item in build_compact_decision_view(
-            state,
-            limits=CompactDecisionLimits(
-                support_entries_per_requirement=min(6, evidence_limit)
-            ),
-        ).payload["requirements"]
-    }
-    visible_evidence = _visible_evidence(state, limit=evidence_limit)
-    profile_paper_ids = _profile_paper_ids(state)
-    research_profiles = build_research_profiles(
-        paper_ids=profile_paper_ids,
-        plan=state.plan,
-        evidence=state.evidence,
-        observations=state.observations,
-        default_targets=state.context.default_evidence_targets,
-    )
-    requirements_by_id = {
-        requirement.requirement_id: requirement
-        for requirement in state.plan.requirements
-    }
-    requirement_states = state.requirement_states or derive_requirement_states(
-        plan=state.plan,
-        evidence=state.evidence,
-        observations=state.observations,
-        context=state.context,
-        coverage=state.coverage,
-    )
-    summary = {
-        "question": state.context.resolved_query,
-        "initial_search_hints": build_initial_search_hints(state.context),
-        # Keep the immediate runtime rejection at the beginning of the payload.
-        # The full action history remains in RuntimeActionCapabilities below, but
-        # a retry must first satisfy this exact feasibility constraint.
-        "action_recovery": _action_recovery_constraint(state),
-        "scope": state.context.scope.value,
-        "trusted_paper_ids": state.context.target_paper_ids,
-        "requirements": [
-            {
-                "requirement_id": item.requirement_id,
-                "description": item.description,
-                "required": item.required,
-                "remaining_retrieval_targets": decision_rows[item.requirement_id][
-                    "available_retrieval_targets"
-                ],
-                "preferred_tools": preferred_tools_for_targets(item.evidence_targets, capabilities.available_tools),
-                "evidence_targets": sorted(
-                    target.value for target in item.evidence_targets
-                ),
-            }
-            for item in state.plan.requirements
-        ],
-        "unresolved_requirements": [
-            {
-                "requirement_id": item.requirement_id,
-                "description": requirements_by_id[item.requirement_id].description,
-                "required": requirements_by_id[item.requirement_id].required,
-                "status": (
-                    "support_found"
-                    if item.status is RequirementStatus.SATISFIED
-                    else item.status.value
-                ),
-                "verified_support_evidence_ids": item.evidence_ids,
-                "covered_critical_anchors": derive_requirement_coverage(
-                    requirements_by_id[item.requirement_id], state.evidence
-                ).covered_anchors,
-                "missing_critical_anchors": derive_requirement_coverage(
-                    requirements_by_id[item.requirement_id], state.evidence
-                ).missing_anchors,
-            }
-            for item in requirement_states
-            if requirements_by_id[item.requirement_id].required
-            and item.status not in {
-                RequirementStatus.NO_SUPPORT_FOUND,
-                RequirementStatus.UNCERTAIN,
-            }
-        ],
-        "evidence": [
-            {
-                "id": record.evidence_id,
-                "paper_id": record.evidence.paper_id,
-                "source_type": record.evidence.source_type.value,
-                "section_id": record.evidence.section_id,
-                "section": record.evidence.section,
-                "analysis_status": record.analysis_status.value,
-                "digest": record.digest,
-                "claims": [
-                    {
-                        "claim_id": claim.claim_id,
-                        "statement": claim.statement,
-                        "relation": claim.relation.value,
-                        "ownership": claim.ownership.value,
-                    }
-                    for claim in record.claims
-                ],
-                "supporting_queries": record.supporting_queries[-3:],
-                "covered_requirement_ids": record.covered_requirement_ids,
-                "projection": _projection_view(record),
-                "projections": _projections_view(record),
-                "method_entities": record.method_entities,
-                "method_families": record.method_families,
-                "baseline_entities": record.baseline_entities,
-            }
-            for record in visible_evidence
-        ],
-        "evidence_visibility": {
-            "shown": len(visible_evidence),
-            "total": len(state.evidence),
-        },
-        "available_context": {
-            "known_sections": [
-                {
-                    "paper_id": record.evidence.paper_id,
-                    "section_id": record.evidence.section_id,
-                    "section": record.evidence.section,
-                }
-                for record in visible_evidence
-                if record.evidence.section_id
-            ],
-            "formal_overview_status": [
-                {"paper_id": paper_id, "status": status}
-                for paper_id, status in state.overview_status_by_paper
-            ],
-        },
-        "research_profiles": [
-            {
-                "paper_id": profile.paper_id,
-                "queries_tried": profile.queries_tried,
-                "remaining_targets": sorted(
-                    target.value for target in profile.remaining_targets
-                ),
-                "supported_requirement_ids": profile.supported_requirement_ids,
-                "sections_seen": profile.sections_seen,
-                "qualified_digests": profile.qualified_digests,
-                "qualified_claims": profile.qualified_claims,
-                "empty_search_count": profile.empty_search_count,
-            }
-            for profile in research_profiles
-        ],
-        "recent_observations": [
-            {
-                "action": item.action_name,
-                "requirement_ids": _observation_requirement_ids(item),
-                "requirement_target_bindings": item.requirement_target_bindings,
-                "status": item.tool_status.value,
-                "added": item.added_evidence_ids,
-                "errors": item.error_codes,
-                "goal_progress": item.goal_progress,
-                "new_goal_items": item.new_goal_items,
-            }
-            for item in state.observations[-4:]
-        ],
-        "last_action_rejection": (
-            {
-                "action_name": state.last_action_rejection.action_name,
-                "action_arguments": state.last_action_rejection.action_arguments,
-                "requirement_ids": state.last_action_rejection.requirement_ids,
-                "rejection_code": state.last_action_rejection.rejection_code,
-                "rejection_reason": state.last_action_rejection.rejection_reason,
-                "guard_name": state.last_action_rejection.guard_name,
-                "rejection_stage": state.last_action_rejection.rejection_stage,
-                "blockers": state.last_action_rejection.blockers,
-                "validator_name": state.last_action_rejection.validator_name,
-            }
-            if state.last_action_rejection is not None
-            else None
-        ),
-        "runtime_action_capabilities": asdict(_runtime_action_capabilities(state)),
-        "suppressed_paper_ids": state.suppressed_paper_ids,
-        "budget_usage": state.budget_usage.__dict__,
-        "iteration_budget": {
-            "limit": state.max_agent_iterations,
-            "used": state.budget_usage.agent_iterations,
-            "remaining": (
-                max(0, state.max_agent_iterations - state.budget_usage.agent_iterations)
-                if state.max_agent_iterations is not None
-                else None
-            ),
-        },
-        "tool_budget_state": _tool_budget_state(state),
-        "last_search_outcome": _last_search_outcome(state),
-        "candidate_coverage": (
-            {
-                "strategy": state.coverage.strategy.value,
-                "screening_complete": state.coverage.coverage_complete,
-                "required_paper_ids": state.coverage.required_paper_ids,
-                "remaining_paper_ids": state.coverage.remaining_paper_ids,
-                "screened_paper_ids": state.coverage.screened_paper_ids,
-                "candidate_paper_ids": state.coverage.candidate_paper_ids,
-                "uncertain_paper_ids": state.coverage.uncertain_paper_ids,
-                "excluded_paper_ids": state.coverage.excluded_paper_ids,
-                "assessments": [
-                    {
-                        "paper_id": item.paper_id,
-                        "status": item.status.value,
-                        "queries_tried": item.queries_tried,
-                        "rationale": item.rationale,
-                    }
-                    for item in state.coverage.assessments
-                ],
-            }
-            if state.coverage is not None
-            else None
-        ),
-        "candidate_selection": (
-            [
-                {
-                    "paper_id": item.paper_id,
-                    "disposition": item.disposition.value,
-                    "reason": item.reason,
-                }
-                for item in state.candidate_selection.assessments
-            ]
-            if state.candidate_selection is not None
-            else None
-        ),
-        "previous_validation_errors": [
-            _repair_payload(item) for item in errors[-1:]
-        ],
-    }
-    return build_agent_decision_user_prompt(summary)
 
 
 def _action_recovery_constraint(
@@ -737,50 +497,6 @@ def _action_recovery_constraint(
     }
 
 
-def _projection_view(record: EvidenceRecord) -> dict[str, object] | None:
-    # Legacy single-object alias only; never discard heterogeneous siblings.
-    return _single_projection_view(record.projections[0]) if len(record.projections) == 1 else None
-
-
-def _projections_view(record: EvidenceRecord) -> list[dict[str, object]]:
-    return [_single_projection_view(projection) for projection in record.projections]
-
-
-def _single_projection_view(projection) -> dict[str, object]:
-    payload: dict[str, object] = {
-        "type": projection.projection_type.value,
-        "supported_requirement_ids": projection.supported_requirement_ids,
-        "support_anchors": [
-            {
-                "requirement_id": anchor.requirement_id,
-                "source_excerpt": anchor.source_excerpt,
-                "support_scope": anchor.support_scope,
-                "unresolved_aspects": list(anchor.unresolved_aspects),
-            }
-            for anchor in projection.support_anchors
-        ],
-    }
-    if hasattr(projection, "entities"):
-        payload["entities"] = [
-            {
-                "canonical_name": item.canonical_name,
-                "entity_type": item.entity_type,
-                "role": item.role.value,
-                "ownership": item.ownership.value,
-            }
-            for item in projection.entities
-        ]
-    if hasattr(projection, "facts"):
-        payload["facts"] = [
-            {"fact_type": fact.fact_type, "value": fact.value}
-            for fact in projection.facts
-        ]
-    for name in ("fact_type", "value", "mechanism", "steps", "inputs", "outputs", "comparison_dimensions"):
-        if hasattr(projection, name):
-            payload[name] = getattr(projection, name)
-    return payload
-
-
 def _observation_requirement_ids(observation: ResearchObservation) -> tuple[str, ...]:
     direct = observation.action_arguments.get("requirement_ids", ())
     values = list(direct) if isinstance(direct, (list, tuple)) else []
@@ -804,8 +520,6 @@ def _last_search_outcome(state: DecisionState) -> dict[str, object] | None:
             "requirement_ids": _observation_requirement_ids(observation),
             "added_evidence_ids": observation.added_evidence_ids,
             "reused_evidence_ids": observation.reused_evidence_ids,
-            "new_supporting_evidence_count": observation.new_supporting_evidence_count,
-            "newly_supported_requirement_ids": observation.newly_supported_requirement_ids,
             "newly_exposed_section_ids": observation.newly_exposed_section_ids,
         }
     return None
@@ -837,40 +551,18 @@ def _tool_budget_state(state: DecisionState) -> dict[str, object]:
     }
 
 
-def _profile_paper_ids(state: DecisionState) -> tuple[str, ...]:
-    if state.coverage is not None:
-        return state.coverage.required_paper_ids
-    if state.candidate_selection is not None:
-        return tuple(
-            dict.fromkeys(
-                (
-                    *state.candidate_selection.candidate_paper_ids,
-                    *state.candidate_selection.uncertain_paper_ids,
-                )
-            )
-        )
-    return tuple(
-        dict.fromkeys(
-            (
-                *state.context.target_paper_ids,
-                *(record.evidence.paper_id for record in state.evidence),
-            )
-        )
-    )
-
-
 def _validate_action_references(action: AgentAction, state: DecisionState) -> None:
     """拒绝无法从可信 DecisionState 中定位来源的模型引用。"""
     capabilities = _runtime_action_capabilities(state)
     known_requirement_ids = {item.requirement_id for item in state.plan.requirements}
     requirement_ids = _action_requirement_ids(action)
-    if known_requirement_ids and not isinstance(action, FinishAction):
+    if known_requirement_ids and not isinstance(action, (TryAnswerAction, StopResearchAction)):
         if not requirement_ids:
             raise ActionDomainValidationError(
                 code="InvalidRequirementBinding",
                 field_path="requirement_ids",
                 validator_name="requirement_binding_validator",
-                safe_reason="A non-finish Action must bind at least one Requirement.",
+                safe_reason="A retrieval Action must bind at least one Requirement.",
                 expected_constraint="at least one active requirement_id",
                 actual_summary="empty=true",
             )
@@ -912,7 +604,7 @@ def _validate_action_references(action: AgentAction, state: DecisionState) -> No
                 actual_summary=f"unknown_id={action.section_id}",
             )
 
-    if isinstance(action, FinishAction):
+    if isinstance(action, (TryAnswerAction, StopResearchAction)):
         return
     tool = action.action_name
     paper_domains = {
@@ -1040,7 +732,8 @@ def _field_path(location: tuple[object, ...]) -> str:
         "search_references",
         "get_section_context",
         "get_paper_overview",
-        "finish",
+        "try_answer",
+        "stop_research",
     }:
         values = values[1:]
     if not values:
@@ -1204,7 +897,22 @@ def _runtime_action_capabilities(state: DecisionState) -> RuntimeActionCapabilit
         if (available := tuple(section_id for section_id in dict.fromkeys(section_ids)
                                if (paper_id, section_id) not in executed_sections))
     )
-    available_tools = ["finish"]
+    current_evidence_ids = tuple(record.evidence_id for record in state.evidence)
+    answer_is_fresh = (
+        state.grounded_answer is not None
+        and state.answer_evidence_ids == current_evidence_ids
+    )
+    available_tools = ["stop_research"]
+    can_retry_same_evidence = (
+        answer_is_fresh
+        and state.grounded_answer is not None
+        and not state.grounded_answer.complete
+        and state.answer_attempt_count < 2
+    )
+    if not answer_is_fresh or can_retry_same_evidence:
+        available_tools.insert(0, "try_answer")
+    else:
+        reasons.append("try_answer:no_new_evidence_or_retry_budget")
     domains = {
         "search_papers": search_paper_ids,
         "search_references": search_paper_ids,
@@ -1316,115 +1024,3 @@ def _recent_unavailable_actions(
             seen.add(key)
             unique.append(item)
     return tuple(reversed(unique[:limit]))
-
-
-def _visible_evidence(
-    state: DecisionState, *, limit: int = 12
-) -> tuple[EvidenceRecord, ...]:
-    """按当前问题相关性排序，并先为每篇论文保留一个可见位置。"""
-    evidence = state.evidence
-    query_terms = _query_terms(state.context)
-    remaining_ids = set(state.coverage.remaining_paper_ids if state.coverage else ())
-
-    def rank(record: EvidenceRecord) -> tuple[float, ...]:
-        searchable = " ".join(
-            (
-                record.digest or "",
-                *(claim.statement for claim in record.claims),
-            )
-        ).casefold()
-        relevance = float(sum(term in searchable for term in query_terms))
-        return (
-            float(record.evidence.paper_id in remaining_ids),
-            relevance,
-            float(bool(record.claims)),
-            float(
-                any(
-                    claim.relation.value in {"supports", "contradicts"}
-                    for claim in record.claims
-                )
-            ),
-            retrieval_rank_priority(record.evidence),
-        )
-
-    ranked = sorted(
-        evidence,
-        key=rank,
-        reverse=True,
-    )
-    selected: list[EvidenceRecord] = []
-    counts: dict[str, int] = {}
-    seen_sections: dict[str, set[tuple[object, ...]]] = {}
-    # 第一轮每篇只取最高相关的一条，避免 limit 较小时被单篇高分 Evidence 吞没。
-    for record in ranked:
-        paper_id = record.evidence.paper_id
-        if paper_id in counts:
-            continue
-        selected.append(record)
-        counts[paper_id] = 1
-        seen_sections.setdefault(paper_id, set()).add(
-            _evidence_section_identity(record)
-        )
-        if len(selected) >= limit:
-            return tuple(selected)
-    # 第二轮优先展示不同章节，保证 Decision 看到的是互补证据而非相邻重复窗口。
-    for record in ranked:
-        paper_id = record.evidence.paper_id
-        if record in selected or counts.get(paper_id, 0) >= 3:
-            continue
-        section = _evidence_section_identity(record)
-        if section in seen_sections.get(paper_id, set()):
-            continue
-        selected.append(record)
-        counts[paper_id] = counts.get(paper_id, 0) + 1
-        seen_sections.setdefault(paper_id, set()).add(section)
-        if len(selected) >= limit:
-            return tuple(selected)
-    # 第三轮才按全局相关性用同章节证据补齐，同时保留单篇上限。
-    for record in ranked:
-        paper_id = record.evidence.paper_id
-        if record in selected:
-            continue
-        if counts.get(paper_id, 0) >= 3:
-            continue
-        selected.append(record)
-        counts[paper_id] = counts.get(paper_id, 0) + 1
-        if len(selected) >= limit:
-            break
-    return tuple(selected)
-
-
-def _evidence_section_identity(record: EvidenceRecord) -> tuple[object, ...]:
-    evidence = record.evidence
-    if evidence.section_id:
-        return (evidence.source_type.value, "section_id", evidence.section_id)
-    if evidence.section:
-        return (
-            evidence.source_type.value,
-            "section",
-            " ".join(evidence.section.casefold().split()),
-        )
-    return (
-        evidence.source_type.value,
-        "chunks",
-        tuple(sorted(evidence.source_chunk_ids)),
-    )
-
-
-def _query_terms(context: QueryContext) -> tuple[str, ...]:
-    """提取轻量、确定性的中英文相关性词项，不额外调用模型。"""
-    values = [
-        context.resolved_query,
-        context.semantic_query_en or "",
-        *context.lexical_keywords_en,
-    ]
-    terms: list[str] = []
-    for value in values:
-        folded = value.casefold()
-        terms.extend(re.findall(r"[a-z0-9][a-z0-9_-]{1,}", folded))
-        for sequence in re.findall(r"[\u3400-\u9fff]+", folded):
-            terms.extend(
-                sequence[index : index + 2]
-                for index in range(max(0, len(sequence) - 1))
-            )
-    return tuple(dict.fromkeys(term for term in terms if len(term) >= 2))

@@ -29,19 +29,18 @@ def aggregate_evaluations(records: list[AgenticCaseEvaluation]) -> dict:
         summary[group] = {f.name:_mean(getattr(getattr(r,group),f.name) for r in valid)
             for f in fields(dto) if f.name not in {'invalid_citation_ids','status'}} if dto else {}
     summary['research'] = {name:_mean(getattr(r.research,name) for r in valid) for name in
-        ('planned_requirement_count','required_requirement_count','verified_supported_requirement_count',
-         'unsupported_requirement_count','requirement_support_rate')}
+        ('planned_requirement_count','required_requirement_count','answered_requirement_count',
+         'open_gap_requirement_count','requirement_answer_rate')}
     funnel={}
-    for stage in ('retrieved','registered','projected','verified','selected','cited'):
+    for stage in ('retrieved','registered','answer_input','cited'):
         applicable=[r for r in valid if r.answerable and r.evidence_funnel.gold_chunk_ids
             and getattr(r.evidence_funnel,f'gold_{stage}_chunk_ids') is not None]
         denominator=sum(len(r.evidence_funnel.gold_chunk_ids) for r in applicable)
         numerator=sum(len(getattr(r.evidence_funnel,f'gold_{stage}_chunk_ids')) for r in applicable)
         funnel[f'gold_{stage}_rate']=dict(value=numerator/denominator if denominator else None,
             gold_chunks_observed=denominator,gold_chunks_at_stage=numerator,observed_cases=len(applicable))
-    for before,after in [('retrieved','registered'),('registered','verified'),('verified','selected'),('selected','cited')]:
-        after_field = ('gold_verified_selected_chunk_ids' if before=='verified' and after=='selected'
-            else f'gold_{after}_chunk_ids')
+    for before,after in [('retrieved','registered'),('registered','answer_input'),('answer_input','cited')]:
+        after_field = f'gold_{after}_chunk_ids'
         applicable=[r for r in valid if r.answerable and r.evidence_funnel.gold_chunk_ids
             and getattr(r.evidence_funnel,f'gold_{before}_chunk_ids') is not None
             and getattr(r.evidence_funnel,after_field) is not None]
@@ -83,7 +82,7 @@ def render_report(summary, by_type, records, manifest):
         return 'null' if v is None else f'{v:.3f}' if isinstance(v,(float,int)) else str(v)
     sections=[f'# E1 Diagnostic Evaluation — {manifest.run_id}',
         f'模式：{manifest.mode}；schema：{manifest.evaluation_schema_version}；case 数：{summary["case_count"]}。',
-        '这是确定性诊断，不报告开放式语义正确率。生产 Requirement support ≠ gold semantic completeness。',
+        '这是确定性诊断，不报告开放式语义正确率。Requirement answer 与 source-span citation 是同一语义边界。',
         '## Retrieval', '| Metric | Value | Known cases |','|---|---:|---:|']
     sections.extend(f'| {name} | {display(row["value"])} | {row["observed_cases"]} |' for name,row in summary['retrieval'].items())
     sections+=['## Evidence funnel','| Stage / conversion | Value | Known cases |','|---|---:|---:|']
@@ -94,7 +93,7 @@ def render_report(summary, by_type, records, manifest):
         '## Metrics by primary_type','| Type | Cases | Primary stages | Gap cases |','|---|---:|---|---:|']
     sections.extend(f'| {kind} | {m["case_count"]} | {m["primary_failure_counts"]} | {m["observability_gap_cases"]} |' for kind,m in by_type.items())
     sections+=['## Representative failures']
-    sections.extend(f'- {r.case_id}: primary={r.primary_failure_stage}; labels={list(r.failure_labels)}; stop={r.stop_reason}; gold retrieved/registered/verified/selected/cited={r.evidence_funnel.gold_retrieved_chunk_ids}/{r.evidence_funnel.gold_registered_chunk_ids}/{r.evidence_funnel.gold_verified_chunk_ids}/{r.evidence_funnel.gold_selected_chunk_ids}/{r.evidence_funnel.gold_cited_chunk_ids}'
+    sections.extend(f'- {r.case_id}: primary={r.primary_failure_stage}; labels={list(r.failure_labels)}; stop={r.stop_reason}; gold retrieved/registered/answer-input/cited={r.evidence_funnel.gold_retrieved_chunk_ids}/{r.evidence_funnel.gold_registered_chunk_ids}/{r.evidence_funnel.gold_answer_input_chunk_ids}/{r.evidence_funnel.gold_cited_chunk_ids}'
         for r in [r for r in records if r.failure_labels][:8])
     sections+=['## Observability gaps','```json',json.dumps(summary['observability_gaps'],ensure_ascii=False,indent=2),'```',
         '未知不是零；null 指标不进入均值，Funnel 使用已观测 gold chunk 加权分母。',

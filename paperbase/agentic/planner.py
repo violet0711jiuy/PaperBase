@@ -25,8 +25,6 @@ from .contracts import (
     LLMCallRecord,
     PlanningMode,
     QueryContext,
-    EvidenceProjectionType,
-    ResearchGoal,
     ResearchPlan,
     ResearchRequirement,
 )
@@ -35,7 +33,6 @@ from paperbase.llm.diagnostics import (
     safe_validation_summary, success_record,
 )
 from .schemas import ResearchPlanDraft
-from .projection_shapes import _legacy_projection_type
 
 
 @dataclass(frozen=True)
@@ -132,13 +129,10 @@ def _validate_and_build(draft: ResearchPlanDraft, context: QueryContext) -> Rese
             description=item.description,
             required=item.required,
             evidence_targets=frozenset(item.evidence_targets),
-            projection_type=item.projection_type,
         )
         for index, item in enumerate(draft.requirements, start=1)
     )
     _validate_requirement_scope(requirements, context)
-    if any(item.projection_type is None for item in requirements):
-        raise ValueError("New Planner Requirements must declare projection_type.")
     if not any(item.required for item in requirements):
         raise PlannerDomainValidationError(
             code="PLANNER_NO_REQUIRED_REQUIREMENT",
@@ -163,12 +157,6 @@ def _literal_fallback_plan(context: QueryContext) -> ResearchPlan:
         requirements=(ResearchRequirement(
             "R1", context.resolved_query, required=True,
             evidence_targets=context.default_evidence_targets,
-            # Literal fallback has no reliable entity-domain judgment. Fact can
-            # preserve any requested collection without inventing entity types;
-            # model-authored method/model enumeration remains unchanged.
-            projection_type=(EvidenceProjectionType.FACT
-                if context.retrieval_goal is ResearchGoal.EXHAUSTIVE_ENUMERATION
-                else _legacy_projection_type(context)),
         ),),
         planning_mode=PlanningMode.LITERAL_FALLBACK,
     )

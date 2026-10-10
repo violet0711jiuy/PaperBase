@@ -14,7 +14,8 @@ from .contracts import (
     CandidateSelection,
     BudgetUsage,
     CorpusScopeSnapshot,
-    FinishAction,
+    TryAnswerAction,
+    StopResearchAction,
     GuardState,
     GetPaperOverviewAction,
     GetSectionContextAction,
@@ -101,7 +102,7 @@ class BudgetAndGuardTracker:
         known_section_pairs: frozenset[tuple[str, str]] = frozenset(),
         canonical_requests=None,
     ) -> GuardDecision:
-        if isinstance(action, FinishAction):
+        if isinstance(action, (TryAnswerAction, StopResearchAction)):
             return GuardDecision(True, "OK", "")
         requests = (compile_action_requests(action, context=context, snapshot=snapshot,
                     top_k=self.settings.top_k_per_paper) if canonical_requests is None else canonical_requests)
@@ -361,8 +362,10 @@ def action_fingerprint(action: AgentAction) -> str:
         value = [action.action_name, action.paper_id, action.section_id]
     elif isinstance(action, GetPaperOverviewAction):
         value = [action.action_name, action.paper_id]
-    else:
+    elif isinstance(action, (TryAnswerAction, StopResearchAction)):
         value = [action.action_name, action.reason.casefold()]
+    else:
+        value = [action.action_name]
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 

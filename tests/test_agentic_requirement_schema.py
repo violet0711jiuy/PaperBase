@@ -59,7 +59,7 @@ def test_requirement_state_round_trips_through_checkpoint_dto() -> None:
     assert load_contract(dto, tuple[RequirementState, ...]) == states
 
 
-def test_legacy_requirement_priority_payload_defaults_required_and_old_plan_loads() -> None:
+def test_removed_requirement_fields_do_not_change_current_plan_semantics() -> None:
     legacy_plan = {
         "goal": "legacy goal",
         "subtasks": [],
@@ -75,7 +75,9 @@ def test_legacy_requirement_priority_payload_defaults_required_and_old_plan_load
 
     restored = load_contract(legacy_plan, ResearchPlan)
 
-    assert restored.requirements[0].required is False
+    # Current checkpoints do not migrate removed priority/subtask semantics.
+    # Missing `required` uses the current contract default instead.
+    assert restored.requirements[0].required is True
     assert not hasattr(restored.requirements[0], "priority")
     # Old checkpoint data did not contain requirement_states; absence is valid.
     assert not hasattr(restored, "subtasks")

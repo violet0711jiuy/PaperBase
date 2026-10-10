@@ -2,7 +2,6 @@
 
 from .answer_generator import AnswerGenerationResult, GroundedAnswerGenerator
 from .section_expander import (
-    EvidenceClaimContext,
     EvidenceUnit,
     ExpansionResult,
     SectionAwareNeighborExpander,
@@ -14,7 +13,6 @@ __all__ = [
     "AnswerService",
     "AnswerServiceResult",
     "EvidenceUnit",
-    "EvidenceClaimContext",
     "ExpansionResult",
     "GroundedAnswerGenerator",
     "SectionAwareNeighborExpander",

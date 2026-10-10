@@ -11,8 +11,6 @@ from paperbase.retrieval.contracts import (
 
 from .contracts import (
     AgentAction,
-    EvidenceAnalysis,
-    EvidenceAnalysisStatus,
     EvidenceRecord,
     RegistryDelta,
     RegistryState,
@@ -21,8 +19,6 @@ from .contracts import (
 )
 
 from .requirement_targets import targets_for_requirement_ids, requirement_target_bindings
-from .evidence_analysis import requires_analysis, projection_requirement_scope
-from .grounding import verified_support_ids
 
 
 class EvidenceRegistry:
@@ -110,13 +106,7 @@ class EvidenceRegistry:
                 requested_requirement_ids=tuple(requirement_ids),
             )
             added.append(evidence_id)
-        return RegistryDelta(
-            tuple(dict.fromkeys(added)), tuple(dict.fromkeys(reused)),
-            tuple(dict.fromkeys((*added, *(
-                eid for eid in reused if plan is not None
-                and requires_analysis(self.get(eid), plan)
-            )))),
-        )
+        return RegistryDelta(tuple(dict.fromkeys(added)), tuple(dict.fromkeys(reused)))
 
     def _find_overlapping_record(
         self, evidence: object
@@ -135,47 +125,6 @@ class EvidenceRegistry:
             (record for record in self._records_by_key.values() if record.evidence_id == evidence_id),
             None,
         )
-
-    def apply_analyses(
-        self, analyses: tuple[EvidenceAnalysis, ...], *, plan: ResearchPlan | None = None
-    ) -> tuple[str, ...]:
-        """把独立 Evidence Analysis 原子写回 Registry。"""
-        evidence_ids = [item.evidence_id for item in analyses]
-        if len(evidence_ids) != len(set(evidence_ids)):
-            raise ValueError("同一轮 Evidence Analysis 不能重复处理同一 Evidence。")
-        records_by_id = {
-            record.evidence_id: record for record in self._records_by_key.values()
-        }
-        unknown_ids = tuple(
-            evidence_id
-            for evidence_id in evidence_ids
-            if evidence_id not in records_by_id
-        )
-        if unknown_ids:
-            raise ValueError(
-                "Evidence Analysis 引用了未知 Evidence：" + ", ".join(unknown_ids)
-            )
-        replacements = []
-        for analysis in analyses:
-            current = records_by_id[analysis.evidence_id]
-            # A failed reanalysis must leave the last successful assessment intact.
-            if (analysis.status in {EvidenceAnalysisStatus.FAILED, EvidenceAnalysisStatus.PENDING}
-                    and current.analysis_status in {EvidenceAnalysisStatus.QUALIFIED, EvidenceAnalysisStatus.IRRELEVANT}):
-                continue
-            candidate = replace(current, assessment=analysis)
-            requirements = plan.requirements if plan is not None else ()
-            if not set(verified_support_ids(current, requirements)).issubset(
-                    verified_support_ids(candidate, requirements)):
-                continue
-            if plan is not None:
-                if analysis.evaluated_requirement_ids and not set(analysis.evaluated_requirement_ids).issubset(
-                        projection_requirement_scope(current, plan)):
-                    raise ValueError("Successful analysis evaluated scope must belong to Evidence-local scope.")
-            replacements.append((current, analysis))
-        for current, analysis in replacements:
-            key = _evidence_key(current.evidence)
-            self._records_by_key[key] = replace(current, assessment=analysis)
-        return tuple(analysis.evidence_id for _, analysis in replacements)
 
     def snapshot(self) -> RegistryState:
         return RegistryState(

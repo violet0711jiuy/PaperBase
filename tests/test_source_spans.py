@@ -24,11 +24,18 @@ def test_contiguous_span_ids_restore_one_exact_source_slice() -> None:
     assert resolve_source_span_ids(content, ("S1", "S2")) == "First fact. Second fact."
 
 
-def test_sparse_or_out_of_order_span_ids_restore_a_bounded_canonical_envelope() -> None:
+@pytest.mark.parametrize(
+    ("span_ids", "code"),
+    (
+        (("S3", "S1"), "source_spans_out_of_order"),
+        (("S1", "S3"), "source_spans_non_contiguous"),
+    ),
+)
+def test_sparse_or_out_of_order_span_ids_are_rejected(span_ids, code) -> None:
     content = "First fact. Second fact. Third fact. Fourth fact."
-    assert resolve_source_span_ids(content, ("S3", "S1")) == (
-        "First fact. Second fact. Third fact."
-    )
+    with pytest.raises(SourceSpanResolutionError) as caught:
+        resolve_source_span_ids(content, span_ids)
+    assert caught.value.code == code
 
 
 @pytest.mark.parametrize(
@@ -48,4 +55,4 @@ def test_sparse_span_envelope_is_rejected_when_it_is_too_broad() -> None:
     content = " ".join(f"Sentence {index} has enough filler text to be distinct." for index in range(30))
     with pytest.raises(SourceSpanResolutionError) as caught:
         resolve_source_span_ids(content, ("S1", "S30"))
-    assert caught.value.code == "source_spans_too_broad"
+    assert caught.value.code in {"source_spans_non_contiguous", "source_spans_too_broad"}

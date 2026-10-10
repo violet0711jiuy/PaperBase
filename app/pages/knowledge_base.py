@@ -256,6 +256,10 @@ def _render_requirement_audit(audit: AgenticAuditSnapshot) -> None:
             f"**{item.requirement_id}**：{item.description}  "
             f"  \n必需：{required} · 状态：{item.status} · 支持证据：{evidence}"
         )
+        if item.answer:
+            st.markdown(item.answer)
+        if item.remaining_gap:
+            st.caption(f"仍缺：{item.remaining_gap}")
 
 
 def _render_paper_research_audit(audit: AgenticAuditSnapshot) -> None:
@@ -314,12 +318,6 @@ def _render_research_timeline(audit: AgenticAuditSnapshot) -> None:
                         for item in step.filter_reasons
                     )
                 )
-        if step.cache_hits or step.cache_misses or step.cache_writes or step.cache_errors:
-            st.caption(
-                "分析缓存："
-                f"命中 {step.cache_hits}，未命中 {step.cache_misses}，"
-                f"写入 {step.cache_writes}，错误 {step.cache_errors}"
-            )
 
 
 def _render_rejected_actions(audit: AgenticAuditSnapshot) -> None:
@@ -337,29 +335,19 @@ def _render_rejected_actions(audit: AgenticAuditSnapshot) -> None:
 
 
 def _render_claim_audit(audit: AgenticAuditSnapshot) -> None:
-    """展示 Evidence Digest 与 Claim 级归属，防止跨论文错误归因。"""
+    """展示最终回答实际引用的原始 Evidence 与 source span。"""
     qualified = tuple(item for item in audit.evidence if item.selected or item.cited)
     if not qualified:
         return
-    st.markdown("#### 结论与证据归因")
+    st.markdown("#### 回答引用与原始证据")
     for item in qualified:
         cited = " · 回答已引用" if item.cited else ""
         with st.container(border=True):
             st.markdown(f"**{item.evidence_id} · {item.paper_title}{cited}**")
-            if item.digest:
-                st.markdown(item.digest)
-            _render_tag_line("覆盖目标", item.covered_targets)
-            for claim in item.claims:
-                relation = _RELATION_LABELS.get(claim.relation, claim.relation)
-                ownership = _OWNERSHIP_LABELS.get(claim.ownership, claim.ownership)
-                st.markdown(
-                    f"- **{claim.claim_id}**：{claim.statement}  "
-                    f"  \n  关系：{relation} · 归属：{ownership}"
-                )
-                if claim.rationale:
-                    st.caption(f"判定理由：{claim.rationale}")
-                if claim.source_excerpt:
-                    st.caption(f"原文锚点：{claim.source_excerpt}")
+            if item.source_preview:
+                st.markdown(item.source_preview)
+            _render_tag_line("来源 chunks", item.source_chunk_ids)
+            _render_tag_line("引用 spans", item.citation_span_ids)
 
 
 def _render_advanced_diagnostics(audit: AgenticAuditSnapshot) -> None:

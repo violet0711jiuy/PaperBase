@@ -109,18 +109,10 @@ class LLMCallRecord:
     recovery_action: str | None = None
     validation_summary: str | None = None
     validation_diagnostics: tuple[ValidationDiagnostic, ...] = ()
-    # Projector execution metadata; additive defaults preserve old checkpoints.
-    projector_input_size: int | None = None
     requested_output_tokens: int | None = None
-    projector_call_mode: str | None = None
-    projector_repair: bool = False
-    projector_fallback_reason: str | None = None
     # Counts/sizes only, never the derived view or a second business-state copy.
     decision_iteration: int | None = None
     decision_view_metrics: dict[str, int | float] | None = None
-    # Projector-only structural forensics; no response/source/prompt text.
-    projector_pre_parse_summary: dict[str, object] | None = None
-    projector_post_conversion_summary: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.node, str) or not self.node.strip():

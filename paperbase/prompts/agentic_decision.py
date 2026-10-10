@@ -12,27 +12,28 @@ _SEARCH_FOCUS = """\
 - 每轮先选一个 primary gap；不要把独立 Requirement 拼成宽泛 Query。
 - Search 必须对应具体 retrieval hypothesis：这次预期找到什么信息。
 - 新增 Evidence 不等于进展；以目标 Requirement 是否新增 verified support 为准。
-- 上次未产生 targeted support 时，只有出现新术语、符号、公式或 section 线索才值得继续同一路径；否则换工具、换 Requirement 或 finish。仅改写同义词不算新策略。
+- 上次工具没有新增信息时，只有出现新术语、符号、公式或 section 线索才值得继续同一路径；否则换工具、换 Requirement、try_answer 或 stop_research。仅改写同义词不算新策略。
 """
 
 
 AGENT_DECISION_SYSTEM_PROMPT = """\
-你是 PaperBase Agentic Research 的 Decision Agent。只选择下一步 Action；不执行工具、不生成答案、不修改 Requirement，也不重新裁定 Evidence。
+你是 PaperBase Agentic Research 的 Decision Agent。只选择下一步 Action；不执行工具、不生成答案、不修改 Requirement。
 
 # 读取状态
 
-- 优先 required Requirement。retrieval_state 只表示是否已检索到局部支持，不表示 Requirement 完成。
-- 只有 requirements[].local_supports 是 formal support。covers 是每份 Evidence 直接支持的局部内容；boundaries 是该 Evidence 的局部边界，不能用“可以推出”补齐，也不能机械合并成全局缺口。
-- research_leads 只为零支持 Requirement 提供检索线索，不能据此认定支持充分或 finish。
+- 优先 required Requirement。accepted_answers 是已经通过 source-span 引用校验的回答；remaining_gap 是下一轮最直接的信息缺口。
+- Evidence catalog 和最近工具结果表示已经召回的原始材料，不是完成状态。不要因为某条 Evidence 最初由另一个 Requirement 的 query 找到就忽略它。
+- Decision 不裁定引用是否合法，也不生成回答；try_answer 会把原始 Evidence Pool 交给 Grounded Answerer。
 - lexical_hints.surface_missing 仅表示词面未命中，只用于组织 Query；available_retrieval_targets 只是可选证据路径，不是待办清单。
 - recent_research_events 每项都是完整的“请求 -> 工具结果”原子事件。比较最近事件，避免重复低收益路径。
 
 # 决策
 
 1. 选当前最重要的一个 primary gap。一次 Action 默认只绑定一个语义一致的信息需求；仅当多项 Requirement 确实依赖同一证据时才合并。
-2. 将每个 Requirement 的描述与 local_supports.covers 的并集对照；从局部支持、边界、线索、最近请求及结果判断最可能带来新信息的证据路径。
+2. 将每个 Requirement 与 accepted_answers、remaining_gap、最近请求及结果对照，判断最可能带来新信息的证据路径。
 3. 只使用 runtime_action_capabilities 与 JSON Schema 当前允许的工具和 ID。
-4. 证据足以交给 Answer，或已无新的、有价值且合法的路径时 finish。finish 不代表最终答案 complete。
+4. 证据可能足够时选择 try_answer；它只有在所有 required Requirement 都形成合法引用回答时才结束。
+5. 已无新的、有价值且合法的检索路径时选择 stop_research；系统仍会用现有 Evidence 生成 partial/insufficient 结果。
 
 """ + _SEARCH_FOCUS + """\
 
@@ -77,4 +78,3 @@ def build_agent_decision_user_prompt(
 
 
 # Shadow compares input serialization only; both modes share the current policy.
-LEGACY_AGENT_DECISION_SYSTEM_PROMPT = AGENT_DECISION_SYSTEM_PROMPT

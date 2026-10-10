@@ -26,20 +26,6 @@ class EvidenceUnit:
     text: str
     token_count: int
     section_id: str | None = None
-    evidence_digest: str | None = None
-    claim_annotations: tuple["EvidenceClaimContext", ...] = ()
-    supported_requirement_ids: tuple[str, ...] = ()
-    projection_context: dict[str, object] | None = None
-
-
-@dataclass(frozen=True)
-class EvidenceClaimContext:
-    """最终回答可消费的 Claim 归属信息，不依赖 Agentic 内部 DTO。"""
-
-    statement: str
-    relation: str
-    ownership: str
-    source_excerpt: str
 
 
 @dataclass(frozen=True)

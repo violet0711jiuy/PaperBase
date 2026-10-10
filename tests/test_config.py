@@ -46,21 +46,20 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.retrieval.bm25_keywords_top_k, 20)
         self.assertTrue(settings.retrieval.query_rewrite.enabled)
         self.assertEqual(settings.answer_generation.max_output_tokens, 4000)
-        self.assertEqual(settings.agentic_research.max_output_tokens, 8000)
+        self.assertFalse(hasattr(settings.agentic_research, "max_output_tokens"))
         self.assertFalse(hasattr(settings.agentic_research, "max_evidence_per_analysis"))
         self.assertFalse(hasattr(settings.agentic_research, "final_evidence_max_per_paper"))
         self.assertFalse(hasattr(settings.agentic_research, "max_no_new_evidence_rounds"))
-        self.assertEqual(
-            settings.agentic_research.evidence_analysis_max_output_tokens, 1400
-        )
-        self.assertEqual(
-            settings.agentic_research.evidence_analysis_timeout_seconds, 60.0
-        )
+        self.assertFalse(hasattr(
+            settings.agentic_research, "evidence_analysis_max_output_tokens"
+        ))
+        self.assertFalse(hasattr(
+            settings.agentic_research, "evidence_analysis_timeout_seconds"
+        ))
         self.assertEqual(settings.agentic_research.node_max_attempts, 2)
-        self.assertEqual(
-            settings.agentic_research.evidence_analysis_cache_path,
-            project_root / "storage" / "evidence_analysis_cache.sqlite3",
-        )
+        self.assertFalse(hasattr(
+            settings.agentic_research, "evidence_analysis_cache_path"
+        ))
         self.assertEqual(
             settings.database.path,
             project_root / "storage" / "paperbase.sqlite3",

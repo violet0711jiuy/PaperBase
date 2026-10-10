@@ -97,7 +97,7 @@ def test_wire_schema_rejects_multi_requirement_action_binding():
     assert list(validator.iter_errors(_paper_decision(["R1", "R2"])))
 
 
-def test_empty_runtime_requirement_domain_exposes_finish_only():
+def test_empty_runtime_requirement_domain_exposes_stop_only():
     state = replace(
         _state(),
         requirement_states=(
@@ -109,14 +109,18 @@ def test_empty_runtime_requirement_domain_exposes_finish_only():
     decision = schema["properties"]["decision"]
 
     assert _runtime_action_capabilities(state).valid_requirement_ids == ()
-    assert decision["oneOf"] == [{"$ref": "#/$defs/FinishDraft"}]
+    assert decision["oneOf"] == [
+        {"$ref": "#/$defs/TryAnswerDraft"},
+        {"$ref": "#/$defs/StopResearchDraft"},
+    ]
     assert decision["discriminator"]["mapping"] == {
-        "finish": "#/$defs/FinishDraft"
+        "try_answer": "#/$defs/TryAnswerDraft",
+        "stop_research": "#/$defs/StopResearchDraft",
     }
     validator = Draft202012Validator(schema)
     assert not list(
         validator.iter_errors(
-            {"decision": {"action": "finish", "reason": "No active requirements."}}
+            {"decision": {"action": "stop_research", "reason": "No active requirements."}}
         )
     )
     assert list(validator.iter_errors(_reference_decision(["R1"])))

@@ -331,9 +331,6 @@ class AgenticResearchSettings(BaseModel):
 
     enabled: bool = True
     checkpoint_path: Path = Path("storage/agentic_checkpoints.sqlite3")
-    evidence_analysis_cache_path: Path = Path(
-        "storage/evidence_analysis_cache.sqlite3"
-    )
     checkpoint_retention_days: int = Field(default=30, ge=1, le=3650)
     max_concurrent_runs: int = Field(default=1, ge=1, le=32)
     max_agent_iterations: int = Field(default=8, ge=1, le=50)
@@ -346,9 +343,7 @@ class AgenticResearchSettings(BaseModel):
     decision_transport_max_retries: int = Field(default=0, ge=0, le=2)
     llm_sampling_profile: Literal["configured", "qwen38_recommended"] = "configured"
     planner_temperature: float = Field(default=0, ge=0, le=2)
-    projector_temperature: float = Field(default=0, ge=0, le=2)
     answer_temperature: float = Field(default=0, ge=0, le=2)
-    decision_view_mode: Literal["compact", "shadow"] = "compact"
     decision_view_support_limit: int = Field(default=6, ge=1, le=50)
     decision_view_recent_observations: int = Field(default=2, ge=1, le=20)
     decision_view_recent_queries: int = Field(default=3, ge=1, le=20)
@@ -360,26 +355,13 @@ class AgenticResearchSettings(BaseModel):
     decision_view_entity_limit: int = Field(default=12, ge=1, le=100)
     # Opt into strict mode only after verifying the configured endpoint/model.
     schema_critical_output_mode: Literal["json_object", "json_schema"] = "json_object"
-    # Legacy keys accepted for config compatibility; structured nodes omit caps.
-    evidence_analysis_max_output_tokens: int = Field(default=1_400, ge=400, le=8_000)
-    evidence_projector_batch_size: int = Field(default=4, ge=1, le=32)
-    evidence_projector_batch_base_tokens: int = Field(default=200, ge=0, le=8_000)
-    evidence_projector_batch_per_evidence_tokens: int = Field(default=1_400, ge=400, le=8_000)
-    evidence_projector_batch_max_output_tokens: int = Field(default=8_000, ge=400, le=8_000)
-    evidence_analysis_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
-    # Legacy compatibility only; Agentic clients no longer send output caps.
-    max_output_tokens: int = Field(default=8_000, ge=1_000, le=32_000)
     top_k_per_paper: int = Field(default=5, ge=1, le=30)
     evidence_admission_enabled: bool = True
     evidence_min_rerank_score: float = Field(default=0.05, ge=0.0, le=1.0)
     evidence_source_overlap_threshold: float = Field(
         default=0.8, ge=0.5, le=1.0
     )
-    final_evidence_max_units: int = Field(default=8, ge=1, le=50)
-
-    @field_validator(
-        "checkpoint_path", "evidence_analysis_cache_path", mode="after"
-    )
+    @field_validator("checkpoint_path", mode="after")
     @classmethod
     def resolve_checkpoint_path(cls, value: Path, info: ValidationInfo) -> Path:
         """将 Agent checkpoint 与分析缓存固定到配置目录下的绝对路径。"""
@@ -459,14 +441,20 @@ def load_settings(config_path: Path | str | None = None) -> AppSettings:
     agentic_config = raw_config.setdefault("agentic_research", {})
     if not isinstance(agentic_config, dict):
         raise ConfigurationError("agentic_research must be a YAML mapping.")
-    # 旧配置中的三个参数从未按配置值生效；读取时丢弃，避免升级后拒绝旧 YAML。
-    agentic_config.pop("max_evidence_per_analysis", None)
-    agentic_config.pop("final_evidence_max_per_paper", None)
-    agentic_config.pop("max_no_new_evidence_rounds", None)
-    agentic_config.setdefault(
-        "evidence_analysis_cache_path",
-        "storage/evidence_analysis_cache.sqlite3",
-    )
+    # Removed Projector-era keys are ignored only at the file boundary. They
+    # are not part of the runtime Settings contract or written by examples.
+    for obsolete_key in (
+        "max_evidence_per_analysis", "final_evidence_max_per_paper",
+        "max_no_new_evidence_rounds", "evidence_analysis_cache_path",
+        "projector_temperature", "decision_view_mode",
+        "evidence_analysis_max_output_tokens", "evidence_projector_batch_size",
+        "evidence_projector_batch_base_tokens",
+        "evidence_projector_batch_per_evidence_tokens",
+        "evidence_projector_batch_max_output_tokens",
+        "evidence_analysis_timeout_seconds", "max_output_tokens",
+        "final_evidence_max_units",
+    ):
+        agentic_config.pop(obsolete_key, None)
 
     try:
         settings = AppSettings.model_validate(
