@@ -1,6 +1,6 @@
 # 当前验证基线
 
-核对日期：2026-10-10。
+核对日期：2026-10-11。
 
 ## 当前代码基线
 
@@ -16,11 +16,11 @@
 
 ## Live 验证状态
 
-新 Grounded Answer 架构已于 2026-10-10 单独重跑 `method_002`，结果 **FAIL**：gold recall 100%，Decision thinking=false、timeout=0，但两次 Grounded Answer 都把同一 Evidence 中多个分离区间放入一条 citation，触发旧连续性规则，最终 `fatal_error/fallback`。实际 Answer 文本已覆盖 MPIWcapt 与 C_i，因此该失败定位为 citation representation/validation failure，而不是 retrieval miss 或 answer semantic omission。
+新 Grounded Answer 架构已于 2026-10-10 再次单独重跑 `method_002`。核心正确性门禁已通过：R1/R2 均 complete，span anchors 3/3，Answer 正式 audit 2/2，Decision view 与离线重建逐字一致，且 C_i 只检索一次。Gold recall 100%，Decision thinking=false、timeout=0，耗时 72.6 秒，已知用量 14,220 tokens。
 
-该 run 耗时 75.9 秒、39,212 tokens，Decision view chars 为 `2102 → 8047 → 11464 → 13900`，另有一次重复 C_i 搜索被 Guard 拦截。报告保存在本地 `output/decision_atomic_method002_rerun1_live_20261010/`，不随仓库发布。
+该 run 唯一未通过的是旧“不相邻翻倍”门禁：Decision view 为 `2115 → 4512 → 4512`，首次召回四条 Evidence 后增长 2.13 倍，随后不再增长。定位表明增长中包含 Evidence 正文预览；这与“Decision 只决定动作、Grounded Answerer 才读正文”的边界不符，因此 Decision Evidence catalog 已进一步改为纯元数据，移除 `source_preview` 及其配置。用本轮保存状态离线重建为 `2115 → 3785 → 3785`，最大相邻倍率约 1.79；这是离线 replay，改动仍需下一次 live run 验证。
 
-随后代码已修复但**尚未再次 live 验证**：有序稀疏 spans 现在拆成多个精确连续 anchors；乱序/未知/重复仍拒绝。用该 run 的真实 E1 与 span IDs 离线重放已全部通过。Decision view 去除重复 Evidence、答案正文和重复 rejection 信息，同一保存状态重建后的前三轮为 `2106 → 4188 → 5792`。这些是离线 replay，不得写成新的 live 通过结果。
+本轮另有 5 次无 usage 的连接错误（4 次 Decision、1 次 Answer），均为 `APIConnectionError → ConnectError → ConnectionResetError`；Answer 重试后成功。它们属于传输稳定性问题，不应记作 Decision timeout、模型输出错误或架构正确性失败，但会造成 wall time 与总 token 不完整。
 
 此前关闭 Decision thinking 的两例实验中，timeout 从 6 次降为 0、总耗时从 9 分 14 秒降至 2 分 18 秒，但同时采样 profile 有变化，故它只支持“thinking 路径是主要嫌疑”，不构成严格因果隔离。新架构保持 thinking=false，并将在新 live gate 中继续记录。
 
@@ -28,7 +28,7 @@
 
 按以下顺序执行，失败即停：
 
-1. 再次运行 `method_002`，验证 span 拆分、答案完成状态、审计中的 Answer 调用和实际 Decision view
+1. 再次运行 `method_002`，验证 metadata-only Decision view 的相邻增长门禁，并继续记录连接错误
 2. `synthesis_001`
 3. `unanswerable_001`
 4. `method_001`、`fact_001`

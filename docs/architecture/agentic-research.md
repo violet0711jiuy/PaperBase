@@ -28,7 +28,7 @@ flowchart TD
 |---|---|---|
 | Query Understanding | 原问题、会话上下文 | `QueryContext` 与冷启动 hints；不直接执行检索 |
 | Planner | 问题与范围 | 宽粒度 `ResearchRequirement`：ID、description、required、evidence_targets |
-| Decision | 当前 Requirement、缺口、Evidence 摘要、最近工具结果、预算 | 一个合法 Action 及其参数；不声明 support/satisfied |
+| Decision | 当前 Requirement、缺口、Evidence 元数据目录、最近工具结果、预算 | 一个合法 Action 及其参数；不声明 support/satisfied |
 | Canonical compiler + Guard | Action | 唯一 effective request/identity，检查范围、重复与预算 |
 | Tools | canonical request | 原始 `RetrievedEvidence` 与真实执行回执 |
 | Evidence Registry | Tool Evidence | 稳定 E#/REF#、provenance、检索来源和 Requirement 请求绑定；不判断语义支持 |
@@ -59,7 +59,7 @@ flowchart TD
 
 ## Decision 输入
 
-Decision 输入是确定性压缩视图，不重复传整份 Evidence 正文。它包含 Requirement 状态与 gap、Evidence 的短目录、最近查询/工具结果、合法能力和预算。进入答案阶段时 Grounded Answerer 才读取完整 Evidence。超时重试使用真正更小的 compact view，不原样重发。
+Decision 输入是确定性压缩视图，不传 Evidence 正文或预览。它包含 Requirement 状态与 gap、Evidence 的 ID/论文/章节/chunk 元数据目录、最近查询/工具结果、合法能力和预算。Decision 据此判断下一步动作，但不负责判断正文是否足以支持 claim；进入答案阶段时 Grounded Answerer 才读取完整 Evidence。超时重试使用真正更小的 compact view，不原样重发。
 
 `lexical_terms` 仍由 Decision LLM 生成，每次 1–5 个非空词，并绑定一个 primary Requirement。Canonical compiler 决定实际检索请求与 duplicate identity。
 

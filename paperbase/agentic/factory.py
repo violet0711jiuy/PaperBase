@@ -168,7 +168,6 @@ def create_agentic_research_service(
                 recent_queries=settings.agentic_research.decision_view_recent_queries,
                 recent_actions=settings.agentic_research.decision_view_recent_actions,
                 sections=settings.agentic_research.decision_view_sections,
-                support_scope_chars=settings.agentic_research.decision_view_scope_chars,
                 unresolved_aspects=settings.agentic_research.decision_view_unresolved_limit,
                 unresolved_aspect_chars=settings.agentic_research.decision_view_unresolved_chars,
                 entity_hints=settings.agentic_research.decision_view_entity_limit,

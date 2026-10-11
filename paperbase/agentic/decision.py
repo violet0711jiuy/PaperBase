@@ -185,7 +185,7 @@ class LLMDecisionAgent:
                     name: max(1, getattr(limits, name) // 2)
                     for name in ("support_entries_per_requirement", "recent_observations",
                                  "recent_queries", "recent_actions", "sections", "entity_hints",
-                                 "research_leads", "support_scope_chars",
+                                 "research_leads",
                                  "unresolved_aspect_chars")
                 })
             view = build_compact_decision_view(current_state, errors, limits=limits)

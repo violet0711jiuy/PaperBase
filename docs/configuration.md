@@ -40,14 +40,14 @@ Decision 关闭 thinking 是当前正式默认值。此前两例实测中它消�
 | `decision_timeout_seconds` | 单次 Decision 请求 timeout，不是 case 总时限 |
 | `decision_transport_max_retries` | SDK transport retry；当前 0，避免与 node retry 相乘 |
 | `planner_temperature` / `answer_temperature` | configured profile 下对应节点温度 |
-| `decision_view_*` | Decision 原子视图的条数和字符预算 |
+| `decision_view_*` | Decision 原子视图的目录/历史条数及 gap 字符预算；不含 Evidence 正文预览 |
 | `schema_critical_output_mode` | strict schema 节点的 provider 输出模式 |
 | `top_k_per_paper` | 工具内部单篇检索返回量 |
 | `evidence_admission_enabled` | Registry 前的确定性 Evidence 准入 |
 | `evidence_min_rerank_score` | 只用于 normalized higher-is-better reranker score |
 | `evidence_source_overlap_threshold` | source chunk 重叠去重阈值 |
 
-Agentic Grounded Answerer始终读取 Registry 中全部去重 Evidence，因此没有 `final_evidence_max_units` 或同类答案截断配置。Decision 使用短目录控制上下文增长，Answerer 保留完整语义输入。
+Agentic Grounded Answerer始终读取 Registry 中全部去重 Evidence，因此没有 `final_evidence_max_units` 或同类答案截断配置。Decision 只读取 Evidence 元数据目录，Answerer 保留完整语义输入。
 
 ## 已废弃配置
 

@@ -349,7 +349,6 @@ class AgenticResearchSettings(BaseModel):
     decision_view_recent_queries: int = Field(default=3, ge=1, le=20)
     decision_view_recent_actions: int = Field(default=3, ge=1, le=20)
     decision_view_sections: int = Field(default=10, ge=1, le=100)
-    decision_view_scope_chars: int = Field(default=160, ge=80, le=1000)
     decision_view_unresolved_limit: int = Field(default=6, ge=1, le=50)
     decision_view_unresolved_chars: int = Field(default=240, ge=40, le=2000)
     decision_view_entity_limit: int = Field(default=12, ge=1, le=100)

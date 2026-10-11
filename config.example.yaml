@@ -221,7 +221,6 @@ agentic_research:
   decision_view_recent_queries: 3
   decision_view_recent_actions: 3
   decision_view_sections: 10
-  decision_view_scope_chars: 160
   decision_view_unresolved_limit: 6
   decision_view_unresolved_chars: 240
   decision_view_entity_limit: 12

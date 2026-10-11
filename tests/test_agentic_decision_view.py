@@ -53,14 +53,14 @@ def _state(*, evidence=(), grounded_answer=None, observations=()) -> DecisionSta
     )
 
 
-def test_decision_view_is_atomic_and_does_not_repeat_full_evidence_bodies() -> None:
+def test_decision_view_is_atomic_and_does_not_include_evidence_bodies() -> None:
     view = build_compact_decision_view(_state(evidence=(record(),))).to_dict()
     serialized = str(view)
-    assert serialized.count("FULL RAW BODY") == 1
+    assert "FULL RAW BODY" not in serialized
     assert "x" * 1200 not in serialized
     assert view["latest_tool_evidence_ids"] == ["E1"]
     assert view["evidence_catalog"][0]["evidence_id"] == "E1"
-    assert len(view["evidence_catalog"][0]["source_preview"]) <= 161
+    assert "source_preview" not in view["evidence_catalog"][0]
     assert "retrieved_by_queries" not in view["evidence_catalog"][0]
     assert "supports" not in serialized and "support_found" not in serialized
 
@@ -95,8 +95,8 @@ def test_compact_retry_limits_reduce_catalog_and_recent_history() -> None:
         state, limits=CompactDecisionLimits(
             support_entries_per_requirement=1, recent_observations=1,
             recent_queries=1, recent_actions=1, sections=1,
-            support_scope_chars=80, unresolved_aspects=1,
-            unresolved_aspect_chars=40, entity_hints=1, research_leads=1,
+            unresolved_aspects=1, unresolved_aspect_chars=40,
+            entity_hints=1, research_leads=1,
         )
     )
     assert compact.metrics["decision_view_chars"] < normal.metrics["decision_view_chars"]

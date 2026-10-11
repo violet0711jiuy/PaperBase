@@ -1,8 +1,8 @@
 """Small, deterministic Decision input derived from Graph state.
 
-Decision receives plans, answer gaps, a raw Evidence catalog and the latest
-tool delta. It never receives semantic projections or duplicated full Evidence
-bodies. Full raw text is reserved for the Grounded Answerer.
+Decision receives plans, answer gaps, an Evidence metadata catalog and the
+latest tool delta. It never receives semantic projections or Evidence bodies.
+Full raw text is reserved for the Grounded Answerer.
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ class CompactDecisionLimits:
     recent_queries: int = 3
     recent_actions: int = 3
     sections: int = 10
-    support_scope_chars: int = 160
     unresolved_aspects: int = 6
     unresolved_aspect_chars: int = 240
     entity_hints: int = 12
@@ -220,7 +219,6 @@ def build_compact_decision_view(
             "section": _clip(source.section or "", 240),
             "source_chunk_ids": source.source_chunk_ids,
             "last_seen_iteration": record.last_seen_iteration,
-            "source_preview": _clip(source.content, limits.support_scope_chars),
         }
         catalog.append(row)
         if record.last_seen_iteration == newest_iteration:
