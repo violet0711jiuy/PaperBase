@@ -11,7 +11,8 @@ from pydantic import TypeAdapter
 from paperbase.agentic.checkpoint_serde import dump_contract, load_contract
 from paperbase.agentic.contracts import (
     ActionRejectionContext, BudgetUsage, CandidateAssessment, CandidateDisposition,
-    CandidateSelection, CorpusScopeSnapshot, RegistryState, ResearchObservation,
+    CandidateSelection, CorpusScopeSnapshot, GroundedAnswerAttempt, RegistryState,
+    RequirementAnswer, ResearchObservation,
     RequirementState, RequirementStatus, RuntimeActionCapabilities,
     RuntimeUnavailablePaperQuery, QueryScope,
 )
@@ -147,7 +148,7 @@ def test_per_paper_budget_filters_search_only_and_guard_remains_defensive():
 def test_empty_search_and_overview_domains_remove_only_their_root_branches():
     s = replace(state(), budget_usage=BudgetUsage(queries_per_paper=(("A", 2), ("B", 2))))
     assert set(_runtime_action_capabilities(s).available_tools) == {
-        "try_answer", "stop_research", "get_paper_overview", "get_section_context"}
+        "stop_research", "get_paper_overview", "get_section_context"}
     assert not schema_accepts(s, wire("search_papers", "arbitrary"))
     assert not schema_accepts(s, wire("search_references", "arbitrary"))
     assert_root_matches_domain(s)
@@ -212,7 +213,7 @@ def test_section_consumption_requires_completed_read(status, consumed):
 def test_kb_before_after_candidate_scope_and_empty_paper_domain():
     s = state()
     s = replace(s, context=replace(s.context, scope=QueryScope.KNOWLEDGE_BASE, target_paper_ids=()))
-    assert _runtime_action_capabilities(s).available_tools == ("try_answer", "stop_research", "search_knowledge_base")
+    assert _runtime_action_capabilities(s).available_tools == ("stop_research", "search_knowledge_base")
     assert schema_accepts(s, wire("search_knowledge_base"))
     for tool in ("search_papers", "search_references", "get_paper_overview", "get_section_context"):
         assert not schema_accepts(s, wire(tool))
@@ -240,9 +241,25 @@ def test_requirement_status_semantics_unchanged_and_empty_domain_stop_only():
     assert schema_accepts(s, wire("search_papers"))
     s = replace(s, requirement_states=(RequirementState("R1", RequirementStatus.NO_SUPPORT_FOUND),
                                        RequirementState("R2", RequirementStatus.UNCERTAIN)))
-    assert _runtime_action_capabilities(s).available_tools == ("try_answer", "stop_research")
+    assert _runtime_action_capabilities(s).available_tools == ("stop_research",)
     assert_root_matches_domain(s)
     assert not schema_accepts(s, wire("search_papers"))
+
+
+def test_try_answer_is_only_available_for_bounded_same_snapshot_reread():
+    s = state()
+    evidence_ids = tuple(record.evidence_id for record in s.evidence)
+    partial = GroundedAnswerAttempt((
+        RequirementAnswer("R1", None, remaining_gap="Need a focused reread."),
+        RequirementAnswer("R2", None, remaining_gap="Need a focused reread."),
+    ), ())
+    fresh = replace(
+        s, grounded_answer=partial, answer_evidence_ids=evidence_ids,
+        answer_attempt_count=1,
+    )
+    assert _runtime_action_capabilities(fresh).available_tools[0] == "try_answer"
+    exhausted = replace(fresh, answer_attempt_count=2)
+    assert "try_answer" not in _runtime_action_capabilities(exhausted).available_tools
 
 
 ROOT = Path(__file__).resolve().parents[1]

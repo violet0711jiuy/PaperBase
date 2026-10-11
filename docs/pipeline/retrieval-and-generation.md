@@ -1,6 +1,6 @@
 # 检索与生成：Classic 与 Agentic
 
-核对日期：2026-10-10。两条路径共享正式知识库、Retriever、原文 provenance 和 LLM client，但编排与答案契约不同。
+核对日期：2026-10-11。两条路径共享正式知识库、Retriever、原文 provenance 和 LLM client，但编排与答案契约不同。
 
 ## Classic RAG
 
@@ -21,7 +21,7 @@ Classic Answer 使用 `answer_generation.max_evidence_units` 与 `max_output_tok
 Question → Requirements → Decision
 → canonical search / context tools
 → Raw Evidence Registry
-→ Grounded Answerer reads the complete Registry
+→ new Evidence automatically enters Grounded Answerer
 → deterministic source-span validation
 → complete answer, or actual gaps back to Decision
 ```
@@ -36,7 +36,7 @@ Question → Requirements → Decision
 
 Decision 的原始 JSON 不可直接执行。Canonical compiler 生成唯一 effective request 和 identity，Guard 与 executor 共用它来校验范围、预算与重复请求。Requirement binding 表示检索目的，不限制 Evidence 最终可以回答哪些义务。
 
-Agentic 不再对 Registry 进行语义投影或最终截断。所有去重后的 Evidence 都进入 Grounded Answerer；只有实际引用的 Evidence 成为 `selected_evidence`。完整输入快照由 `answer_input_evidence_ids` 单独记录，以便评测区分“已召回但未给 Answerer”和“给了但未引用”。
+Agentic 不再对 Registry 进行语义投影或最终截断。Registry 快照新增 Evidence 时由 Graph 自动进入 Grounded Answerer；只有没有新增 Evidence，或 Answerer 返回实际 gap 后，控制权才回到 Decision。所有去重后的 Evidence 都进入 Grounded Answerer；只有实际引用的 Evidence 成为 `selected_evidence`。完整输入快照由 `answer_input_evidence_ids` 单独记录，以便评测区分“已召回但未给 Answerer”和“给了但未引用”。
 
 ## Score 语义
 

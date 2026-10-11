@@ -1,6 +1,6 @@
 # Agentic Research 当前架构
 
-核对日期：2026-10-10。生产入口是 [factory.py](../../paperbase/agentic/factory.py)、[graph.py](../../paperbase/agentic/graph.py) 与 [contracts.py](../../paperbase/agentic/contracts.py)。
+核对日期：2026-10-11。生产入口是 [factory.py](../../paperbase/agentic/factory.py)、[graph.py](../../paperbase/agentic/graph.py) 与 [contracts.py](../../paperbase/agentic/contracts.py)。
 
 ## 设计目标
 
@@ -14,8 +14,9 @@ flowchart TD
     D -->|search / expand| G[Guard + canonical request]
     G --> T[Retrieval Tool]
     T --> R[Raw Evidence Registry]
-    R --> D
-    D -->|try_answer| A[Grounded Answerer]
+    R -->|new Evidence| A[Grounded Answerer]
+    R -->|no new Evidence| D
+    D -->|bounded focused reread| A
     A --> V[确定性 span / citation 校验]
     V -->|required gaps| D
     V -->|all required answered| F[ResearchAnswer]
@@ -40,9 +41,9 @@ flowchart TD
 ## Agent loop
 
 1. Planner 只拆宽粒度回答义务，不预先编排固定 workflow。
-2. Decision 每轮只看完成下一步所需的原子视图，选择搜索、章节扩展、overview、`try_answer` 或 `stop_research`。
-3. 工具结果经 Evidence Admission 和去重后进入 Registry；原始正文一直保留。
-4. `try_answer` 将当前 Registry 的全部 Evidence 交给 Grounded Answerer。不存在旧的最终 Evidence 数量上限。
+2. Decision 每轮只看完成下一步所需的原子视图，选择搜索、章节扩展、overview、受限聚焦重读或 `stop_research`。
+3. 工具结果经 Evidence Admission 和去重后进入 Registry；原始正文一直保留。Registry 快照只要出现尚未评估的新 Evidence，Graph 就直接进入 Grounded Answer，不让 metadata-only Decision 猜测证据是否充分。
+4. Grounded Answerer读取当前 Registry 的全部 Evidence。不存在旧的最终 Evidence 数量上限；`try_answer` 只保留为相同 Evidence 快照的一次受限聚焦重读。
 5. Answerer 必须按 Plan 顺序覆盖每个 required Requirement：能回答则引用 source spans；不能回答则输出具体 gap。
 6. 引用通过本地确定性校验后，完整项进入 accepted answers。后续重试不得改写已接受项。
 7. 若仍有 gap，Decision 只围绕实际 gap 决定是否继续检索。相同 Evidence Pool 允许一次聚焦重读，防止模型偶发漏读；再无进展则必须检索或停止。

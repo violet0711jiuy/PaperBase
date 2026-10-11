@@ -909,10 +909,13 @@ def _runtime_action_capabilities(state: DecisionState) -> RuntimeActionCapabilit
         and not state.grounded_answer.complete
         and state.answer_attempt_count < 2
     )
-    if not answer_is_fresh or can_retry_same_evidence:
+    # Fresh Registry snapshots route directly to Grounded Answer in the Graph.
+    # Decision may request try_answer only for the one bounded reread of an
+    # already assessed snapshot.
+    if can_retry_same_evidence:
         available_tools.insert(0, "try_answer")
     else:
-        reasons.append("try_answer:no_new_evidence_or_retry_budget")
+        reasons.append("try_answer:no_focused_reread_available")
     domains = {
         "search_papers": search_paper_ids,
         "search_references": search_paper_ids,

@@ -109,12 +109,8 @@ def test_empty_runtime_requirement_domain_exposes_stop_only():
     decision = schema["properties"]["decision"]
 
     assert _runtime_action_capabilities(state).valid_requirement_ids == ()
-    assert decision["oneOf"] == [
-        {"$ref": "#/$defs/TryAnswerDraft"},
-        {"$ref": "#/$defs/StopResearchDraft"},
-    ]
+    assert decision["oneOf"] == [{"$ref": "#/$defs/StopResearchDraft"}]
     assert decision["discriminator"]["mapping"] == {
-        "try_answer": "#/$defs/TryAnswerDraft",
         "stop_research": "#/$defs/StopResearchDraft",
     }
     validator = Draft202012Validator(schema)

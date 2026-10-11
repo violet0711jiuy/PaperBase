@@ -499,7 +499,11 @@ def build_agentic_research_graph() -> StateGraph:
             "generate_answer": "generate_answer",
         },
     )
-    graph.add_edge("register_and_observe", "decide_action")
+    graph.add_conditional_edges(
+        "register_and_observe",
+        _route,
+        {"decide_action": "decide_action", "generate_answer": "generate_answer"},
+    )
     graph.add_conditional_edges(
         "validate_action",
         _route,
@@ -647,8 +651,14 @@ def _build_plan(
 def _decide_action(
     state: AgentGraphState, runtime: Runtime[AgentGraphContext]
 ) -> AgentGraphState:
-    tracker = _tracker(state, runtime.context.settings)
     registry = _registry(state)
+    # Decision receives Evidence metadata, not Evidence bodies.  Route every
+    # unseen Registry snapshot through the semantic authority before asking
+    # Decision to choose another retrieval action.  This also protects a
+    # checkpoint resumed directly at decide_action.
+    if _has_unassessed_evidence(state, registry):
+        return {"answer_mode": "", "next_node": "generate_answer"}
+    tracker = _tracker(state, runtime.context.settings)
     capacity = tracker.can_decide()
     if not capacity.accepted:
         return _terminal_update(
@@ -1163,7 +1173,11 @@ def _register_and_observe(
             ),
             tuple[RequirementState, ...],
         ),
-        "next_node": "decide_action",
+        "next_node": (
+            "generate_answer"
+            if _has_unassessed_evidence(state, registry)
+            else "decide_action"
+        ),
     }
 
 
@@ -1521,6 +1535,17 @@ def _registry_snapshot(state: AgentGraphState) -> RegistryState:
 
 def _registry(state: AgentGraphState) -> EvidenceRegistry:
     return EvidenceRegistry(_registry_snapshot(state))
+
+
+def _has_unassessed_evidence(
+    state: AgentGraphState, registry: EvidenceRegistry | None = None,
+) -> bool:
+    """Whether the Registry snapshot has not yet reached Grounded Answer."""
+    active = registry or _registry(state)
+    current_ids = tuple(record.evidence_id for record in active.records)
+    return bool(current_ids) and current_ids != tuple(
+        state.get("answer_evidence_ids", ())
+    )
 
 
 def _guard_snapshot(state: AgentGraphState) -> GuardState:
