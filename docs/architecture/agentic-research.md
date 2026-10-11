@@ -66,7 +66,7 @@ Decision 输入是确定性压缩视图，不传 Evidence 正文或预览。它�
 
 ## Checkpoint 与版本
 
-当前 checkpoint semantic authority 是 `paperbase-agentic-grounded-answer-v1`。旧 Projector checkpoint 不迁移、不恢复执行；应新建研究线程。公开审计版本是 `grounded-answer-v1`，评测版本是 `agentic-grounded-answer-eval-v3`。
+当前 checkpoint semantic authority 是 `paperbase-agentic-grounded-answer-v1`。旧 Projector checkpoint 不迁移、不恢复执行；应新建研究线程。公开审计版本是 `grounded-answer-v1`，评测版本是 `agentic-grounded-answer-eval-v4`。
 
 ## 安全边界
 

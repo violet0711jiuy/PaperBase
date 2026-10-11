@@ -32,6 +32,53 @@ def gold_chunk_ids(golden: Mapping[str, Any]) -> tuple[str, ...]:
     ))
 
 
+def gold_evidence_alternatives(
+    golden: Mapping[str, Any],
+) -> dict[str, tuple[tuple[str, ...], ...]]:
+    """Return manually audited substitute paths for canonical Golden chunks.
+
+    A path is an all-of set of chunks; multiple paths for one canonical chunk
+    are alternatives.  Exact chunk recall remains unchanged and continues to
+    use :func:`gold_chunk_ids`.
+    """
+    raw = golden.get("evidence_alternatives", {})
+    if not isinstance(raw, Mapping):
+        return {}
+    return {
+        str(canonical): tuple(
+            tuple(str(chunk_id) for chunk_id in path)
+            for path in paths
+            if isinstance(path, Sequence) and not isinstance(path, (str, bytes))
+        )
+        for canonical, paths in raw.items()
+        if isinstance(paths, Sequence) and not isinstance(paths, (str, bytes))
+    }
+
+
+def covered_gold_evidence_ids(
+    golden: Mapping[str, Any], observed_chunk_ids: Iterable[str],
+) -> tuple[str, ...]:
+    """Canonical Gold IDs covered exactly or by one audited substitute path."""
+    observed = set(observed_chunk_ids)
+    alternatives = gold_evidence_alternatives(golden)
+    return tuple(
+        chunk_id
+        for chunk_id in gold_chunk_ids(golden)
+        if chunk_id in observed
+        or any(path and set(path) <= observed for path in alternatives.get(chunk_id, ()))
+    )
+
+
+def evidence_path_coverage(
+    golden: Mapping[str, Any], observed_chunk_ids: Iterable[str],
+) -> float | None:
+    """Alternative-aware evidence coverage without redefining exact recall."""
+    gold = gold_chunk_ids(golden)
+    if not gold:
+        return None
+    return len(covered_gold_evidence_ids(golden, observed_chunk_ids)) / len(gold)
+
+
 def ranking_metrics(ranked_chunk_ids: Sequence[str], gold_ids: Sequence[str]) -> dict[str, float | None]:
     """Canonical chunk-ID-only Top-5 metrics; empty Gold is not applicable."""
     gold = set(gold_ids)
@@ -136,6 +183,10 @@ def evaluate_case_metrics(
         "gold_chunk_ids": list(gold), "retrieved_chunk_ids": list(ranked_chunk_ids[:5]) if ranked_chunk_ids is not None else None,
         "run_status": run_status, "stop_reason": stop_reason,
         **retrieval,
+        "evidence_path_coverage_at_5": (
+            evidence_path_coverage(golden, ranked_chunk_ids[:5])
+            if answerable and ranked_chunk_ids is not None else None
+        ),
         "tool_calls": budget.get("tool_calls"),
         "retrieval_queries": budget.get("retrieval_queries"),
         "llm_calls": budget.get("llm_calls"),
@@ -149,6 +200,12 @@ def evaluate_case_metrics(
         "abstention_correct": abstention_correct,
         "gold_evidence_coverage": selected_gold_coverage(selected, gold) if answerable else None,
         "agent_retrieved_gold_coverage": selected_gold_coverage(agent_retrieved, gold) if answerable else None,
+        "selected_evidence_path_coverage": (
+            evidence_path_coverage(golden, selected) if answerable else None
+        ),
+        "agent_retrieved_evidence_path_coverage": (
+            evidence_path_coverage(golden, agent_retrieved) if answerable else None
+        ),
         "agent_retrieved_source_chunk_ids": list(agent_retrieved),
         "selected_source_chunk_ids": list(selected), "partial_answer": partial,
         "overall_answer_status": overall_status,
@@ -314,15 +371,27 @@ def aggregate_case_metrics(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "evaluation_outcomes": dict(sorted(Counter(
             str(row.get("evaluation_outcome", "failure")) for row in rows
         ).items())),
-        "retrieval": {key: _mean(answerable, key) for key in ("hit_at_5", "recall_at_5", "reciprocal_rank")},
+        "retrieval": {key: _mean(answerable, key) for key in (
+            "hit_at_5", "recall_at_5", "reciprocal_rank", "evidence_path_coverage_at_5",
+        )},
         "agent_efficiency": {key: _mean(rows, key) for key in ("useful_action_rate", "tool_calls", "retrieval_queries", "llm_calls")},
         "research_completion": {
             "answerable_completion_rate": _mean(answerable, "completed_answerable"),
             "false_no_support_rate": _mean(answerable, "false_no_support"),
             "legacy_false_no_support_rate": _mean(answerable, "legacy_false_no_support"),
         },
-        "agent_retrieval": {"gold_evidence_coverage": _mean(answerable, "agent_retrieved_gold_coverage")},
-        "final_evidence": {"gold_evidence_coverage": _mean(answerable, "gold_evidence_coverage")},
+        "agent_retrieval": {
+            "gold_evidence_coverage": _mean(answerable, "agent_retrieved_gold_coverage"),
+            "evidence_path_coverage": _mean(
+                answerable, "agent_retrieved_evidence_path_coverage"
+            ),
+        },
+        "final_evidence": {
+            "gold_evidence_coverage": _mean(answerable, "gold_evidence_coverage"),
+            "evidence_path_coverage": _mean(
+                answerable, "selected_evidence_path_coverage"
+            ),
+        },
         "grounding_safety": {"abstention_accuracy": _mean(unanswerable, "abstention_correct")},
     }
 

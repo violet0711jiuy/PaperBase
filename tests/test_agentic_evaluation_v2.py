@@ -48,6 +48,35 @@ def test_grounded_funnel_is_retrieved_registered_answer_input_cited() -> None:
     assert row.primary_failure_stage is None
 
 
+def test_audited_alternative_path_counts_without_changing_exact_funnel() -> None:
+    golden = {
+        "id": "synthesis_001",
+        "primary_type": "synthesis",
+        "answerable": True,
+        "relevant_evidence": [{"chunk_ids": ["canonical"]}],
+        "evidence_alternatives": {"canonical": [["alternative_a", "alternative_b"]]},
+    }
+    evidence = EvidenceTrace(
+        "E1", "P1", ("alternative_a", "alternative_b"),
+        presented_to_answerer=True, cited_requirement_ids=("R1",),
+        selected=True, cited=True,
+    )
+    trace = replace(
+        _trace(), evidence=(evidence,),
+        selected_source_chunk_ids=("alternative_a", "alternative_b"),
+    )
+
+    row = evaluate_agentic_case(golden, trace)
+
+    assert row.retrieval.cumulative_gold_retrieval_recall == 0.0
+    assert row.retrieval.cumulative_evidence_path_coverage == 1.0
+    assert row.evidence_funnel.gold_cited_chunk_ids == ()
+    assert row.evidence_funnel.path_covered_gold_cited_chunk_ids == ("canonical",)
+    assert row.answer.gold_citation_coverage == 0.0
+    assert row.answer.gold_citation_path_coverage == 1.0
+    assert "retrieval_miss" not in row.failure_labels
+
+
 def test_gold_in_answer_input_but_not_cited_is_grounding_failure() -> None:
     row = evaluate_agentic_case(_gold(), _trace(cited=False))
     assert row.primary_failure_stage == "grounding"

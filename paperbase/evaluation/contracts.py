@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Protocol
 
-EVALUATION_SCHEMA_VERSION = "agentic-grounded-answer-eval-v3"
+EVALUATION_SCHEMA_VERSION = "agentic-grounded-answer-eval-v4"
 
 
 def json_safe(value):
@@ -121,6 +121,8 @@ class RetrievalEvaluation:
     cumulative_gold_retrieval_recall: float | None
     queries_until_first_gold: int | None
     retrieval_queries: int | None
+    initial_search_evidence_path_coverage: float | None
+    cumulative_evidence_path_coverage: float | None
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,10 @@ class EvidenceFunnelEvaluation:
     gold_answer_input_chunk_ids: tuple[str, ...] | None
     gold_cited_chunk_ids: tuple[str, ...] | None
     observed_gold_retrieved_chunk_ids: tuple[str, ...]
+    path_covered_gold_retrieved_chunk_ids: tuple[str, ...] | None
+    path_covered_gold_registered_chunk_ids: tuple[str, ...] | None
+    path_covered_gold_answer_input_chunk_ids: tuple[str, ...] | None
+    path_covered_gold_cited_chunk_ids: tuple[str, ...] | None
 
 
 @dataclass(frozen=True)
@@ -164,6 +170,7 @@ class AnswerEvaluation:
     invalid_citation_ids: tuple[str, ...] | None
     answer_input_citation_coverage: float | None
     gold_citation_coverage: float | None
+    gold_citation_path_coverage: float | None
     correct_abstention: bool | None
     unsafe_non_abstention: bool | None
     false_abstention: bool | None

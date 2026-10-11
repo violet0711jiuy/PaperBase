@@ -1,10 +1,35 @@
-from paperbase.evaluation.agentic import aggregate_action_control_metrics, aggregate_case_metrics, evaluate_case_metrics, metrics_by_type, ranking_metrics
+from paperbase.evaluation.agentic import (
+    aggregate_action_control_metrics,
+    aggregate_case_metrics,
+    covered_gold_evidence_ids,
+    evaluate_case_metrics,
+    evidence_path_coverage,
+    metrics_by_type,
+    ranking_metrics,
+)
 from paperbase.evaluation.run_agentic_eval import _load_completed
 import json
 
 def test_ranking_metrics_use_exact_canonical_ids_only():
     assert ranking_metrics(["x", "g2", "g1"], ["g1", "g2"]) == {"hit_at_5": 1.0, "recall_at_5": 1.0, "reciprocal_rank": 0.5}
     assert ranking_metrics(["x"], ["g1"])["reciprocal_rank"] == 0.0
+
+
+def test_evidence_path_coverage_keeps_exact_recall_separate() -> None:
+    golden = {
+        "relevant_evidence": [{"chunk_ids": ["g1", "g2"]}],
+        "evidence_alternatives": {"g2": [["a", "b"], ["c"]]},
+    }
+
+    assert ranking_metrics(["g1", "a", "b"], ["g1", "g2"])["recall_at_5"] == 0.5
+    assert covered_gold_evidence_ids(golden, ["g1", "a", "b"]) == ("g1", "g2")
+    assert evidence_path_coverage(golden, ["g1", "a", "b"]) == 1.0
+    assert evidence_path_coverage(golden, ["g1", "a"]) == 0.5
+    assert evidence_path_coverage(golden, ["g1", "c"]) == 1.0
+
+
+def test_evidence_path_coverage_is_na_without_canonical_gold() -> None:
+    assert evidence_path_coverage({"relevant_evidence": []}, ["a"]) is None
 
 def test_case_metrics_exclude_rejected_actions_and_classify_states():
     golden = {"id":"a", "question":"q", "primary_type":"fact", "answerable":True, "relevant_evidence":[{"chunk_ids":["g"]}]}
@@ -32,8 +57,10 @@ def test_agentic_only_metrics_skip_standalone_retriever() -> None:
     assert row["hit_at_5"] is None
     assert row["retrieved_chunk_ids"] is None
     assert row["agent_retrieved_gold_coverage"] == 1.0
+    assert row["agent_retrieved_evidence_path_coverage"] == 1.0
     assert "retrieval_miss" not in row["failure_labels"]
     assert aggregate_case_metrics([row])["agent_retrieval"]["gold_evidence_coverage"] == 1.0
+    assert aggregate_case_metrics([row])["agent_retrieval"]["evidence_path_coverage"] == 1.0
 
 
 def test_answer_coverage_partial_is_not_counted_as_complete_success() -> None:

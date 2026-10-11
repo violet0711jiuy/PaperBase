@@ -141,6 +141,64 @@ def test_single_hop_with_multiple_chunks_is_only_a_review_checklist(tmp_path: Pa
     assert report["single_hop_multi_chunk_cases"][0]["chunk_ids"] == ["chunk_1", "chunk_2"]
 
 
+def test_audited_evidence_alternative_path_is_validated(tmp_path: Path) -> None:
+    database = tmp_path / "paperbase.sqlite3"
+    _write_database(
+        database,
+        [
+            ("canonical", "paper_1", "Method", "content", 3, 3),
+            ("alternative_a", "paper_1", "Method", "content", 4, 4),
+            ("alternative_b", "paper_1", "Method", "content", 4, 5),
+        ],
+    )
+    record = _record(
+        evidence={
+            "paper_id": "paper_1",
+            "section": "Stale method location",
+            "page_start": 2,
+            "page_end": 2,
+            "chunk_ids": ["canonical"],
+        }
+    )
+    record["evidence_alternatives"] = {
+        "canonical": [["alternative_a", "alternative_b"]]
+    }
+
+    _, validated, report = _write_inputs_and_run(tmp_path, database, [record])
+
+    assert report["status"] == "PASS"
+    assert json.loads(validated.read_text(encoding="utf-8"))["evidence_alternatives"] == {
+        "canonical": [["alternative_a", "alternative_b"]]
+    }
+
+
+def test_evidence_alternative_key_must_be_canonical(tmp_path: Path) -> None:
+    database = tmp_path / "paperbase.sqlite3"
+    _write_database(
+        database,
+        [("canonical", "paper_1", "Method", "content", 3, 3)],
+    )
+    record = _record(
+        evidence={
+            "paper_id": "paper_1",
+            "section": "Method",
+            "page_start": 3,
+            "page_end": 3,
+            "chunk_ids": ["canonical"],
+        }
+    )
+    record["evidence_alternatives"] = {"not_canonical": [["canonical"]]}
+
+    _, validated, report = _write_inputs_and_run(tmp_path, database, [record])
+
+    assert report["status"] == "NEEDS_MANUAL_REVIEW"
+    assert any(
+        "keys must be canonical" in item["message"]
+        for item in report["dataset_validation"]["schema_errors"]
+    )
+    assert not validated.exists()
+
+
 def _record(
     *,
     primary_type: str = "fact",

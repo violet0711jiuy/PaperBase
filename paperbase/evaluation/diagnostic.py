@@ -1,7 +1,13 @@
 """Deterministic E1 metrics for retrieval, raw Registry and grounded citations."""
 from __future__ import annotations
 
-from .agentic import gold_chunk_ids, ranking_metrics
+from .agentic import (
+    covered_gold_evidence_ids,
+    evidence_path_coverage,
+    gold_chunk_ids,
+    gold_evidence_alternatives,
+    ranking_metrics,
+)
 from .contracts import (
     AgenticCaseEvaluation, AnswerEvaluation, CaseTrace, DatasetIssue,
     EfficiencyEvaluation, EvidenceFunnelEvaluation, RequirementEvaluation,
@@ -19,6 +25,13 @@ def evaluate_agentic_case(
 ) -> AgenticCaseEvaluation:
     gold = gold_chunk_ids(golden)
     gold_set = set(gold)
+    alternative_chunk_ids = {
+        chunk_id
+        for paths in gold_evidence_alternatives(golden).values()
+        for path in paths
+        for chunk_id in path
+    }
+    audited_chunk_ids = gold_set | alternative_chunk_ids
     gaps = list(trace.observability_gaps)
     records = trace.evidence
 
@@ -26,19 +39,35 @@ def evaluate_agentic_case(
         overlap = gold_set.intersection(known)
         return tuple(chunk for chunk in gold if chunk in overlap) if complete or overlap == gold_set else None
 
+    def path_covered_ids(known, complete):
+        covered = covered_gold_evidence_ids(golden, known)
+        return covered if complete or len(covered) == len(gold) else None
+
     def stage_ids(flag):
-        known, complete = set(), records is not None
+        known = set()
+        exact_complete = path_complete = records is not None
         for record in records or ():
             value = flag(record)
-            if value is None and gold_set.intersection(_chunks(record)): complete = False
+            chunks = _chunks(record)
+            if value is None:
+                if gold_set.intersection(chunks):
+                    exact_complete = False
+                if audited_chunk_ids.intersection(chunks):
+                    path_complete = False
             if value is True:
-                if record.source_chunk_ids is None: complete = False
-                known.update(_chunks(record))
-        return gold_ids(known, complete)
+                if record.source_chunk_ids is None:
+                    exact_complete = path_complete = False
+                known.update(chunks)
+        return (
+            gold_ids(known, exact_complete),
+            path_covered_ids(known, path_complete),
+        )
 
-    registered = stage_ids(lambda _: True)
-    answer_input = stage_ids(lambda record: record.presented_to_answerer)
-    cited = stage_ids(lambda record: record.cited)
+    registered, registered_path = stage_ids(lambda _: True)
+    answer_input, answer_input_path = stage_ids(
+        lambda record: record.presented_to_answerer
+    )
+    cited, cited_path = stage_ids(lambda record: record.cited)
     for name, value in (("registered", registered), ("answer_input", answer_input), ("cited", cited)):
         if value is None: gaps.append(f"gold_{name}_provenance_or_authority")
 
@@ -71,6 +100,7 @@ def evaluate_agentic_case(
             else: gaps.append("queries_until_first_gold_attribution")
             until_possible = False
     retrieved = gold_ids(retrieved_known, retrieval_complete)
+    retrieved_path = path_covered_ids(retrieved_known, retrieval_complete)
     if retrieved is None: gaps.append("cumulative_retrieval_provenance")
     initial_chunks = None
     if first is not None and first.candidates is not None:
@@ -87,10 +117,13 @@ def evaluate_agentic_case(
         bool(gold_set.intersection(initial_chunks)) if initial_chunks is not None and gold else None,
         len(gold_set.intersection(initial_chunks)) / len(gold) if initial_chunks is not None and gold else None,
         recall(retrieved), until_gold, retrieval_queries,
+        evidence_path_coverage(golden, initial_chunks) if initial_chunks is not None else None,
+        recall(retrieved_path),
     )
     funnel = EvidenceFunnelEvaluation(
         gold, retrieved, registered, answer_input, cited,
         tuple(chunk for chunk in gold if chunk in retrieved_known),
+        retrieved_path, registered_path, answer_input_path, cited_path,
     )
 
     requirement_rows = tuple(RequirementEvaluation(
@@ -134,7 +167,8 @@ def evaluate_agentic_case(
     answer_metrics = AnswerEvaluation(
         has_answer, insufficient, answer.partial_answer if answer else None,
         len(citations) if citations is not None else None, validity, invalid,
-        input_coverage, recall(cited), correct_abstention, unsafe, false_abstention,
+        input_coverage, recall(cited), recall(cited_path), correct_abstention,
+        unsafe, false_abstention,
     )
     if answer is None or has_answer is None: gaps.append("answer_presence")
     if invalid is None: gaps.append("citation_validity")
@@ -176,11 +210,15 @@ def evaluate_agentic_case(
         if trace.setup_failure_stage: failure(trace.setup_failure_stage, f"{trace.setup_failure_stage}_setup_failure")
         if trace.requirements == (): failure("planning", "no_usable_plan")
         if answerable and gold:
-            if retrieved == (): failure("retrieval", "retrieval_miss")
-            elif retrieved is not None and len(retrieved) < len(gold): failure("retrieval", "retrieval_partial")
-            if retrieved and registered == (): failure("registry", "gold_retrieved_not_registered")
-            if registered and answer_input == (): failure("answer_input", "gold_registered_not_shown_to_answerer")
-            if answer_input and cited == (): failure("grounding", "gold_answer_input_not_cited")
+            if retrieved_path == (): failure("retrieval", "retrieval_miss")
+            elif retrieved_path is not None and len(retrieved_path) < len(gold):
+                failure("retrieval", "retrieval_partial")
+            if retrieved_path and registered_path == ():
+                failure("registry", "gold_retrieved_not_registered")
+            if registered_path and answer_input_path == ():
+                failure("answer_input", "gold_registered_not_shown_to_answerer")
+            if answer_input_path and cited_path == ():
+                failure("grounding", "gold_answer_input_not_cited")
         if answerable and insufficient is True: failure("answer", "false_abstention")
         if unsafe is True: failure("answer", "unsafe_non_abstention")
         if answer_metrics.partial_answer is True: failure("answer", "partial_answer")

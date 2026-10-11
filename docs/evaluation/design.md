@@ -1,6 +1,6 @@
 # 评测设计与边界
 
-核对日期：2026-10-10。当前 Agentic 确定性评测契约是 `agentic-grounded-answer-eval-v3`。
+核对日期：2026-10-11。当前 Agentic 确定性评测契约是 `agentic-grounded-answer-eval-v4`。
 
 ## 三层评测
 
@@ -15,6 +15,12 @@
 ## Golden
 
 正式数据为 [golden_dataset_v1_2.jsonl](../../eval/datasets/golden_dataset_v1_2.jsonl)，40 cases；SHA256 `05eb18b529073ac71930ef42cee8a7527fcba57c82f48b80e070bc04602a092b`。`reference_answer` 和 `required_facts` 只用于评测，不能注入 Agent。
+
+候选 [golden_dataset_v1_3.jsonl](../../eval/datasets/golden_dataset_v1_3.jsonl)
+只为 `synthesis_001` 增加人工审核的 `evidence_alternatives`。字段的 key 是
+canonical Gold chunk；每个内层列表是一条必须全部出现的 all-of 路径，多条路径之间为 OR。
+严格 chunk recall 仍只按 `relevant_evidence` 计算；`evidence_path_coverage` 单独报告
+canonical 或任一替代路径的覆盖率，不能把两者混成一个指标，也不能由运行结果自动反推替代路径。
 
 固定 smoke：`fact_001`、`method_001`、`method_002`、`experiment_001`、`result_001`、`synthesis_001`、`bibliography_001`、`unanswerable_001`。
 

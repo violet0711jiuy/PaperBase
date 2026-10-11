@@ -1,6 +1,6 @@
 # Agentic Grounded Answer 确定性诊断
 
-版本：`agentic-grounded-answer-eval-v3`。该 evaluator 不调用语义 Judge、不修改生产 Agent 或 Golden。
+版本：`agentic-grounded-answer-eval-v4`。该 evaluator 不调用语义 Judge、不修改生产 Agent 或 Golden。
 
 ## Evidence funnel
 
@@ -23,6 +23,13 @@ gold chunks
 
 `selected_evidence_ids` 在当前架构中是实际引用 Evidence 的兼容投影，不是一个独立选择阶段。完整输入必须看 `answer_input_evidence_ids`。
 
+每个 funnel 阶段同时保留两套不可混报的量：
+
+- `gold_*_chunk_ids` / strict recall：只认 `relevant_evidence` 中的 canonical chunk ID；
+- `path_covered_gold_*_chunk_ids` / evidence path coverage：canonical chunk 本身命中，或人工审核的某条 all-of `evidence_alternatives` 路径全部命中，才算覆盖该 canonical 单元。
+
+替代路径只来自冻结 Golden，不由单次运行结果或模型自动生成。它用于避免把已获得等价证据误判为检索/grounding 失败，不会重写或抹去严格 recall。
+
 ## Requirement 记录
 
 每个 Requirement 审计包含：
@@ -40,7 +47,7 @@ Answerer 只能引用为每条 Evidence 预切分的 span ID。本地校验要�
 
 ## 解释边界
 
-- Gold recall 100% 只证明 Retriever 找到了标注 chunk。
+- strict Gold recall 100% 只证明 Retriever 找到了 canonical 标注 chunk；path coverage 100% 表示 canonical 或人工审核的等价证据路径已完整覆盖。
 - Evidence 进入 Registry 不证明 Answerer 看到了它；由 answer input 阶段确认。
 - Answerer 看到 Evidence 但未引用，是 grounding/semantic read 问题，不应归因于 Retriever。
 - span 100% 合法只证明可追溯，不证明 entailment。

@@ -75,6 +75,7 @@ SEMANTIC_FIELDS = (
     "answerable",
     "reference_answer",
     "required_facts",
+    "evidence_alternatives",
     "expected_bibliography_intent",
 )
 
@@ -222,10 +223,53 @@ def validate_dataset(
         if "relevant_evidence" in record and not isinstance(record.get("relevant_evidence"), list):
             schema_errors.append({"case_id": case_id, "message": "relevant_evidence must be a list"})
 
+        alternatives = record.get("evidence_alternatives")
+        if alternatives is not None:
+            canonical_ids = {
+                str(chunk_id)
+                for evidence in record.get("relevant_evidence", [])
+                if isinstance(evidence, dict)
+                for chunk_id in evidence.get("chunk_ids", [])
+                if _is_nonempty_string(chunk_id)
+            }
+            if not isinstance(alternatives, dict):
+                schema_errors.append({
+                    "case_id": case_id,
+                    "message": "evidence_alternatives must be an object",
+                })
+            else:
+                for canonical_id, paths in alternatives.items():
+                    if not _is_nonempty_string(canonical_id) or canonical_id not in canonical_ids:
+                        schema_errors.append({
+                            "case_id": case_id,
+                            "message": "evidence_alternatives keys must be canonical relevant_evidence chunk IDs",
+                        })
+                    if not isinstance(paths, list) or not paths:
+                        schema_errors.append({
+                            "case_id": case_id,
+                            "message": f"evidence_alternatives[{canonical_id!r}] must contain paths",
+                        })
+                        continue
+                    for path_index, path in enumerate(paths):
+                        if (
+                            not isinstance(path, list)
+                            or not path
+                            or any(not _is_nonempty_string(chunk_id) for chunk_id in path)
+                            or len(path) != len(set(path))
+                        ):
+                            schema_errors.append({
+                                "case_id": case_id,
+                                "message": (
+                                    f"evidence_alternatives[{canonical_id!r}] path {path_index} "
+                                    "must be a non-empty unique list of chunk IDs"
+                                ),
+                            })
+
         if answerable is False and (
             record.get("reference_answer") is not None
             or record.get("required_facts") != []
             or record.get("relevant_evidence") != []
+            or bool(record.get("evidence_alternatives"))
         ):
             logic_errors.append(
                 {
@@ -382,6 +426,17 @@ def _all_evidence_chunk_ids(records: Sequence[Mapping[str, Any]]) -> list[str]:
             result.extend(
                 str(chunk_id)
                 for chunk_id in evidence["chunk_ids"]
+                if _is_nonempty_string(chunk_id)
+            )
+        alternatives = record.get("evidence_alternatives", {})
+        if isinstance(alternatives, dict):
+            result.extend(
+                str(chunk_id)
+                for paths in alternatives.values()
+                if isinstance(paths, list)
+                for path in paths
+                if isinstance(path, list)
+                for chunk_id in path
                 if _is_nonempty_string(chunk_id)
             )
     return result
@@ -608,6 +663,36 @@ def validate_evidence(
                     section_type_mismatches.append(mismatch)
                     if record.get("primary_type") == "bibliography":
                         bibliography_errors.append(mismatch)
+
+        alternatives = record.get("evidence_alternatives", {})
+        if isinstance(alternatives, dict):
+            expected_paper_id = record.get("paper_id")
+            for canonical_id, paths in alternatives.items():
+                if not isinstance(paths, list):
+                    continue
+                for path_index, path in enumerate(paths):
+                    if not isinstance(path, list):
+                        continue
+                    for chunk_id in path:
+                        if not _is_nonempty_string(chunk_id):
+                            continue
+                        row = chunks.get(str(chunk_id))
+                        if row is None:
+                            missing_chunks.append({
+                                "case_id": case_id,
+                                "evidence_alternative_for": canonical_id,
+                                "path_index": path_index,
+                                "chunk_id": str(chunk_id),
+                            })
+                        elif row["paper_id"] != expected_paper_id:
+                            paper_mismatches.append({
+                                "case_id": case_id,
+                                "evidence_alternative_for": canonical_id,
+                                "path_index": path_index,
+                                "chunk_id": str(chunk_id),
+                                "case_paper_id": expected_paper_id,
+                                "sqlite_paper_id": row["paper_id"],
+                            })
 
     # 防御性断言：validated 副本绝不能改变任何 Case 语义字段或 chunk_id 集合。
     for original, validated in zip(records, validated_records):

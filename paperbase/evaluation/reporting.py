@@ -39,6 +39,23 @@ def aggregate_evaluations(records: list[AgenticCaseEvaluation]) -> dict:
         numerator=sum(len(getattr(r.evidence_funnel,f'gold_{stage}_chunk_ids')) for r in applicable)
         funnel[f'gold_{stage}_rate']=dict(value=numerator/denominator if denominator else None,
             gold_chunks_observed=denominator,gold_chunks_at_stage=numerator,observed_cases=len(applicable))
+        path_field = f'path_covered_gold_{stage}_chunk_ids'
+        path_applicable = [
+            r for r in valid if r.answerable and r.evidence_funnel.gold_chunk_ids
+            and getattr(r.evidence_funnel, path_field) is not None
+        ]
+        path_denominator = sum(
+            len(r.evidence_funnel.gold_chunk_ids) for r in path_applicable
+        )
+        path_numerator = sum(
+            len(getattr(r.evidence_funnel, path_field)) for r in path_applicable
+        )
+        funnel[f'evidence_path_{stage}_rate'] = dict(
+            value=path_numerator/path_denominator if path_denominator else None,
+            gold_chunks_observed=path_denominator,
+            gold_chunks_at_stage=path_numerator,
+            observed_cases=len(path_applicable),
+        )
     for before,after in [('retrieved','registered'),('registered','answer_input'),('answer_input','cited')]:
         after_field = f'gold_{after}_chunk_ids'
         applicable=[r for r in valid if r.answerable and r.evidence_funnel.gold_chunk_ids

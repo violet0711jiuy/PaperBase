@@ -11,7 +11,7 @@ Agentic live case 的 Answer 原始最终输出自动保存到 `cases/<case_id>.
 ```text
 eval/
 ├── candidates/          # Candidate Goldens 与人工审核表
-├── datasets/            # Golden v1、v1.1 与当前冻结的 v1.2
+├── datasets/            # Golden v1、v1.1、v1.2 与候选 v1.3
 ├── scripts/             # 生成、冻结、校验、评测与诊断脚本
 └── results/             # 每次运行重新生成，已由 Git 忽略
 ```
@@ -79,6 +79,7 @@ Audit 只读取已经保存的 trace，不会再次调用模型。
 | `golden_dataset_v1.jsonl` | 人工审核后首次冻结版本。 |
 | `golden_dataset_v1_1.jsonl` | 将 context-free Query 改写为尽可能 self-contained。 |
 | `golden_dataset_v1_2.jsonl` | 修正过严或过宽 Evidence 后的当前 Retrieval Benchmark。 |
+| `golden_dataset_v1_3.jsonl` | 候选版本；仅为 `synthesis_001` 增加人工审核的 all-of Evidence 替代路径，不改变 canonical chunk 集合或严格 recall。 |
 
 历史 Retrieval 数值及当前 Agentic smoke 状态见 [`docs/evaluation/current-baseline.md`](../docs/evaluation/current-baseline.md)，
 Schema、类型、Tags 和指标定义见
