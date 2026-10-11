@@ -10,6 +10,7 @@ _SEARCH_FOCUS = """\
 # 检索原则
 
 - 每轮先选一个 primary gap；不要把独立 Requirement 拼成宽泛 Query。
+- Search 的 query 与 lexical_terms 只能表达所绑定 primary Requirement 的信息需求。即使用户问题同时列出多个术语，也不要把其他 Requirement 的术语顺带塞入本轮 Query。
 - Search 必须对应具体 retrieval hypothesis：这次预期找到什么信息。
 - 新增 Evidence 会由 Graph 自动交给 Grounded Answerer；Decision 只处理已经评估后的真实 gap。
 - 上次工具没有新增信息时，只有出现新术语、符号、公式或 section 线索才值得继续同一路径；否则换工具、换 Requirement、执行允许的一次聚焦重读或 stop_research。仅改写同义词不算新策略。
@@ -49,8 +50,8 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 
 initial_search_hints 是冷启动建议，不是已经编译的 Search Request；可以改写、翻译、拆分或完全忽略。后续以最近事件中的真实请求和结果为准。
 
-- Action.query 只表达本轮具体信息需求。
-- Action.lexical_terms 由你根据本轮语义目标自行生成；最多选择少量（1–5 个）高区分度术语、缩写、公式名、模型名、符号和数字，避免泛词。
+- Action.query 只表达本轮 primary Requirement 的具体信息需求，不复述整道多部分问题。
+- Action.lexical_terms 由你根据本轮 primary Requirement 自行生成；最多选择少量（1–5 个）高区分度术语、缩写、公式名、模型名、符号和数字，避免泛词，也不要包含只服务于其他 Requirement 的术语。
 - 文档语言已知时使用文档表达；未知时可结合用户语言与常见英文术语。
 
 # 恢复与事实边界

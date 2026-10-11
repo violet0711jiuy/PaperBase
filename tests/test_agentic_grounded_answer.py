@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from paperbase.agentic.contracts import (
     EvidenceRecord,
     EvidenceTarget,
@@ -90,15 +88,89 @@ def test_missing_requirement_is_repaired_against_the_same_raw_evidence():
     assert repair_payload["evidence"][0]["evidence_id"] == "E1"
 
 
-def test_answer_text_without_source_spans_never_becomes_grounded():
+def test_invalid_requirement_is_repaired_without_regenerating_valid_sibling():
     invalid = complete_payload()
     invalid["answers"][0]["citations"] = []
-    client = QueueClient(invalid, invalid)
-    with pytest.raises(Exception):
-        LLMGroundedAnswerer(client).answer(
-            question="How does the method work?", plan=plan(), evidence=(evidence(),)
-        )
+    repaired_r1 = {"answers": [complete_payload()["answers"][0]]}
+    client = QueueClient(invalid, repaired_r1)
+    result = LLMGroundedAnswerer(client).answer(
+        question="How does the method work?", plan=plan(), evidence=(evidence(),)
+    )
+
+    assert result.complete
     assert len(client.calls) == 2
+    repair_payload = json.loads(client.calls[1]["user_prompt"])
+    assert [item["requirement_id"] for item in repair_payload["requirements"]] == ["R1"]
+    assert "accepted_answers" not in repair_payload
+
+
+def test_uncited_missing_evidence_prose_is_normalized_to_unanswered_gap():
+    partial = complete_payload()
+    partial["answers"][0] = {
+        "requirement_id": "R1",
+        "answer": "The current evidence does not explain MPIWcapt.",
+        "citations": [],
+        "remaining_gap": "Need the definition and role of MPIWcapt.",
+    }
+    client = QueueClient(partial)
+
+    result = LLMGroundedAnswerer(client).answer(
+        question="How does the method work?", plan=plan(), evidence=(evidence(),)
+    )
+
+    assert result.requirements[0].answer is None
+    assert result.requirements[0].citations == ()
+    assert result.requirements[0].remaining_gap == "Need the definition and role of MPIWcapt."
+    assert result.requirements[1].complete
+    assert len(client.calls) == 1
+
+
+def test_previously_accepted_requirement_is_preserved_without_model_repetition():
+    accepted_payload = {"answers": [complete_payload()["answers"][0]]}
+    accepted = LLMGroundedAnswerer(QueueClient(accepted_payload)).answer(
+        question="How does the method work?",
+        plan=ResearchPlan("Explain MPIWcapt", (plan().requirements[0],)),
+        evidence=(evidence(),),
+    ).requirements[0]
+    client = QueueClient({"answers": [complete_payload()["answers"][1]]})
+
+    result = LLMGroundedAnswerer(client).answer(
+        question="How does the method work?", plan=plan(), evidence=(evidence(),),
+        accepted_answers=(accepted,),
+    )
+
+    prompt = json.loads(client.calls[0]["user_prompt"])
+    assert [item["requirement_id"] for item in prompt["requirements"]] == ["R2"]
+    assert "accepted_answers" not in prompt
+    assert result.requirements == (accepted, result.requirements[1])
+    assert result.complete
+
+
+def test_named_requirement_term_must_appear_in_cited_source_spans():
+    invalid = complete_payload()
+    invalid["answers"][1] = {
+        "requirement_id": "R2",
+        "answer": "C_i is inferred from the interval-width behavior.",
+        "citations": [{"evidence_id": "E1", "source_span_ids": ["S1"]}],
+        "remaining_gap": "The cited span does not explicitly define C_i.",
+    }
+    repaired = {"answers": [{
+        "requirement_id": "R2",
+        "answer": None,
+        "citations": [],
+        "remaining_gap": "Need an explicit definition of C_i.",
+    }]}
+    client = QueueClient(invalid, repaired)
+
+    result = LLMGroundedAnswerer(client).answer(
+        question="How does the method work?", plan=plan(), evidence=(evidence(),)
+    )
+
+    assert result.requirements[0].complete
+    assert result.requirements[1].answer is None
+    repair_payload = json.loads(client.calls[1]["user_prompt"])
+    assert [item["requirement_id"] for item in repair_payload["requirements"]] == ["R2"]
+    assert repair_payload["validation_errors"][0]["code"] == "ANSWER_REQUIREMENT_TERM_UNANCHORED"
 
 
 def test_ordered_non_contiguous_spans_become_separate_exact_citations():

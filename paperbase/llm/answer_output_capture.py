@@ -11,7 +11,8 @@ from threading import Lock
 
 _active_capture: ContextVar[object | None] = ContextVar("answer_output_capture", default=None)
 _ANSWER_SCHEMAS = {"paperbase_grounded_answer", "paperbase_grounded_answer_semantic_v2",
-                   "paperbase_grounded_answer_semantic_v3"}
+                   "paperbase_grounded_answer_semantic_v3",
+                   "paperbase_grounded_requirement_answer_v1"}
 
 
 class _Capture:

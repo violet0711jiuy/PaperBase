@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
+import re
 from typing import Protocol, Sequence
 
 from pydantic import ValidationError
@@ -31,7 +32,7 @@ from .contracts import (
     ResearchAnswer,
     ResearchPlan,
 )
-from .schemas import GroundedAnswerDraft
+from .schemas import GroundedAnswerDraft, GroundedRequirementAnswerDraft
 from .source_spans import (
     SourceSpanResolutionError,
     partition_source_span_ids,
@@ -142,16 +143,38 @@ class LLMGroundedAnswerer:
                 evidence_ids=(),
             )
 
+        required_by_id = dict(requirements)
+        accepted_by_id: dict[str, RequirementAnswer] = {}
+        for item in accepted_answers:
+            if item.requirement_id not in required_by_id or not item.complete:
+                raise GroundedAnswerValidationError(
+                    "ANSWER_ACCEPTED_RESULT_INVALID",
+                    "accepted_answers",
+                    "Only complete answers for current required Requirements may be preserved.",
+                )
+            if item.requirement_id in accepted_by_id:
+                raise GroundedAnswerValidationError(
+                    "ANSWER_ACCEPTED_RESULT_DUPLICATE",
+                    "accepted_answers",
+                    "Accepted Requirement answers must be unique.",
+                )
+            accepted_by_id[item.requirement_id] = item
+
+        pending = tuple(
+            item for item in requirements if item[0] not in accepted_by_id
+        )
+        if not pending:
+            return _attempt_from_answers(requirements, accepted_by_id)
+
         errors: list[dict[str, object]] = []
         diagnostics: list[LLMCallRecord] = []
-        schema = _response_schema(requirements, pack)
         for attempt in range(1, self._max_attempts + 1):
             completion: LLMCompletion | None = None
+            schema = _response_schema(pending, pack)
             prompt = build_grounded_answer_prompt(
                 question=question,
-                requirements=requirements,
+                requirements=pending,
                 evidence=pack.prompt_payload(),
-                accepted_answers=tuple(_accepted_payload(item) for item in accepted_answers),
                 validation_errors=errors,
             )
             try:
@@ -163,17 +186,6 @@ class LLMGroundedAnswerer:
                     schema_name="paperbase_grounded_requirement_answer_v1",
                 )
                 draft = GroundedAnswerDraft.model_validate_json(completion.content)
-                result = _convert_grounded_answer(
-                    draft,
-                    requirements=requirements,
-                    pack=pack,
-                    accepted_answers=tuple(accepted_answers),
-                    diagnostics=tuple(diagnostics),
-                )
-                diagnostics.append(success_record(
-                    node="grounded_answer", attempt=attempt, completion=completion
-                ))
-                return replace(result, llm_diagnostics=tuple(diagnostics))
             except Exception as error:
                 can_retry = attempt < self._max_attempts
                 diagnostics.append(failure_record(
@@ -185,7 +197,74 @@ class LLMGroundedAnswerer:
                 ))
                 errors = [_safe_error(error)]
                 if not can_retry:
+                    if accepted_by_id:
+                        _fill_unresolved_answers(accepted_by_id, pending)
+                        return _attempt_from_answers(
+                            requirements, accepted_by_id, tuple(diagnostics)
+                        )
                     raise GroundedAnswerAttemptsExhausted(error, diagnostics) from error
+                continue
+
+            expected = tuple(rid for rid, _ in pending)
+            actual = tuple(item.requirement_id for item in draft.answers)
+            if actual != expected:
+                error = GroundedAnswerValidationError(
+                    "ANSWER_REQUIREMENT_PARTITION_INVALID",
+                    "answers.requirement_id",
+                    "answers must contain every requested Requirement exactly once and in order.",
+                )
+                can_retry = attempt < self._max_attempts
+                diagnostics.append(failure_record(
+                    node="grounded_answer", attempt=attempt, error=error,
+                    completion=completion, can_retry=can_retry,
+                ))
+                errors = [_safe_error(error)]
+                if not can_retry:
+                    if accepted_by_id:
+                        _fill_unresolved_answers(accepted_by_id, pending)
+                        return _attempt_from_answers(
+                            requirements, accepted_by_id, tuple(diagnostics)
+                        )
+                    raise GroundedAnswerAttemptsExhausted(error, diagnostics) from error
+                continue
+
+            item_errors: list[tuple[str, GroundedAnswerValidationError]] = []
+            for index, item in enumerate(draft.answers):
+                try:
+                    accepted_by_id[item.requirement_id] = _convert_requirement_answer(
+                        item,
+                        index=index,
+                        requirement_description=required_by_id[item.requirement_id],
+                        pack=pack,
+                    )
+                except GroundedAnswerValidationError as error:
+                    item_errors.append((item.requirement_id, error))
+
+            if not item_errors:
+                diagnostics.append(success_record(
+                    node="grounded_answer", attempt=attempt, completion=completion
+                ))
+                return _attempt_from_answers(
+                    requirements, accepted_by_id, tuple(diagnostics)
+                )
+
+            failed_ids = {rid for rid, _ in item_errors}
+            pending = tuple(item for item in pending if item[0] in failed_ids)
+            can_retry = attempt < self._max_attempts
+            diagnostics.append(failure_record(
+                node="grounded_answer", attempt=attempt,
+                error=item_errors[0][1], completion=completion,
+                can_retry=can_retry,
+            ))
+            errors = [
+                {"requirement_id": rid, **_safe_error(error)}
+                for rid, error in item_errors
+            ]
+            if not can_retry:
+                _fill_unresolved_answers(accepted_by_id, pending)
+                return _attempt_from_answers(
+                    requirements, accepted_by_id, tuple(diagnostics)
+                )
         raise RuntimeError("Grounded Answer attempts exhausted.")
 
 
@@ -251,21 +330,6 @@ def _evidence_payload(record: EvidenceRecord) -> dict[str, object]:
     }
 
 
-def _accepted_payload(answer: RequirementAnswer) -> dict[str, object]:
-    return {
-        "requirement_id": answer.requirement_id,
-        "answer": answer.answer,
-        "citations": [
-            {
-                "evidence_id": citation.evidence_id,
-                "source_span_ids": list(citation.source_span_ids),
-            }
-            for citation in answer.citations
-        ],
-        "remaining_gap": answer.remaining_gap,
-    }
-
-
 def _response_schema(requirements, pack: EvidencePack) -> dict[str, object]:
     schema = GroundedAnswerDraft.model_json_schema()
     ids = [rid for rid, _ in requirements]
@@ -282,90 +346,149 @@ def _response_schema(requirements, pack: EvidencePack) -> dict[str, object]:
     return schema
 
 
-def _convert_grounded_answer(
-    draft: GroundedAnswerDraft,
+def _convert_requirement_answer(
+    item: GroundedRequirementAnswerDraft,
     *,
-    requirements: tuple[tuple[str, str], ...],
+    index: int,
+    requirement_description: str,
     pack: EvidencePack,
-    accepted_answers: tuple[RequirementAnswer, ...],
-    diagnostics: tuple[LLMCallRecord, ...],
-) -> GroundedAnswerAttempt:
-    expected = tuple(rid for rid, _ in requirements)
-    actual = tuple(item.requirement_id for item in draft.answers)
-    if actual != expected:
+) -> RequirementAnswer:
+    """Validate one Requirement without discarding valid siblings.
+
+    A model sometimes writes an explanation of missing evidence in ``answer``
+    while also returning an explicit gap.  With no citations that prose cannot
+    become a published claim, so it is deterministically reduced to the gap.
+    """
+    answer = item.answer.strip() if item.answer is not None else None
+    gap = item.remaining_gap.strip() if item.remaining_gap is not None else None
+    if answer and not item.citations:
+        if gap:
+            return RequirementAnswer(item.requirement_id, None, remaining_gap=gap)
         raise GroundedAnswerValidationError(
-            "ANSWER_REQUIREMENT_PARTITION_INVALID",
-            "answers.requirement_id",
-            "answers must contain every required Requirement exactly once and in Plan order.",
+            "ANSWER_CITATION_REQUIRED", f"answers[{index}].citations",
+            "Every answer must cite at least one raw Evidence span.",
         )
+    if not answer and (item.citations or not gap):
+        raise GroundedAnswerValidationError(
+            "ANSWER_GAP_REQUIRED", f"answers[{index}]",
+            "An unanswered Requirement must provide remaining_gap and no citations.",
+        )
+
     by_id = {record.evidence_id: record for record in pack.records}
-    converted: list[RequirementAnswer] = []
-    for index, item in enumerate(draft.answers):
-        answer = item.answer.strip() if item.answer is not None else None
-        gap = item.remaining_gap.strip() if item.remaining_gap is not None else None
-        if answer and not item.citations:
+    citations: list[GroundedCitation] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for citation_index, citation in enumerate(item.citations):
+        record = by_id.get(citation.evidence_id)
+        if record is None:
             raise GroundedAnswerValidationError(
-                "ANSWER_CITATION_REQUIRED", f"answers[{index}].citations",
-                "Every answer must cite at least one raw Evidence span.",
+                "ANSWER_UNKNOWN_EVIDENCE",
+                f"answers[{index}].citations[{citation_index}].evidence_id",
+                "Citation Evidence must belong to the supplied Evidence Pack.",
             )
-        if not answer and (item.citations or not gap):
+        try:
+            runs = partition_source_span_ids(
+                record.evidence.content, citation.source_span_ids
+            )
+        except SourceSpanResolutionError as error:
             raise GroundedAnswerValidationError(
-                "ANSWER_GAP_REQUIRED", f"answers[{index}]",
-                "An unanswered Requirement must provide remaining_gap and no citations.",
-            )
-        citations: list[GroundedCitation] = []
-        seen: set[tuple[str, tuple[str, ...]]] = set()
-        for citation_index, citation in enumerate(item.citations):
-            record = by_id.get(citation.evidence_id)
-            if record is None:
+                f"ANSWER_{error.code.upper()}",
+                f"answers[{index}].citations[{citation_index}].source_span_ids",
+                "Citation span IDs must be known, ordered and locally bounded.",
+            ) from error
+        for span_ids in runs:
+            identity = (citation.evidence_id, span_ids)
+            if identity in seen:
                 raise GroundedAnswerValidationError(
-                    "ANSWER_UNKNOWN_EVIDENCE",
-                    f"answers[{index}].citations[{citation_index}].evidence_id",
-                    "Citation Evidence must belong to the supplied Evidence Pack.",
+                    "ANSWER_DUPLICATE_CITATION",
+                    f"answers[{index}].citations[{citation_index}]",
+                    "Duplicate citations are not allowed.",
                 )
-            try:
-                runs = partition_source_span_ids(
-                    record.evidence.content, citation.source_span_ids
-                )
-            except SourceSpanResolutionError as error:
-                raise GroundedAnswerValidationError(
-                    f"ANSWER_{error.code.upper()}",
-                    f"answers[{index}].citations[{citation_index}].source_span_ids",
-                    "Citation span IDs must be known, ordered and locally bounded.",
-                ) from error
-            for span_ids in runs:
-                identity = (citation.evidence_id, span_ids)
-                if identity in seen:
-                    raise GroundedAnswerValidationError(
-                        "ANSWER_DUPLICATE_CITATION",
-                        f"answers[{index}].citations[{citation_index}]",
-                        "Duplicate citations are not allowed.",
-                    )
-                seen.add(identity)
-                excerpt = resolve_source_span_ids(record.evidence.content, span_ids)
-                citations.append(GroundedCitation(citation.evidence_id, span_ids, excerpt))
-        if len(citations) > 8:
-            raise GroundedAnswerValidationError(
-                "ANSWER_CITATIONS_TOO_FRAGMENTED",
-                f"answers[{index}].citations",
-                "A Requirement answer may use at most eight contiguous citation anchors.",
-            )
-        converted.append(RequirementAnswer(item.requirement_id, answer, tuple(citations), gap))
-    accepted_by_id = {item.requirement_id: item for item in accepted_answers}
-    for index, item in enumerate(converted):
-        accepted = accepted_by_id.get(item.requirement_id)
-        if accepted is not None and item != accepted:
-            raise GroundedAnswerValidationError(
-                "ANSWER_ACCEPTED_RESULT_CHANGED",
-                f"answers[{index}]",
-                "Previously accepted Requirement answers and citations must be returned unchanged.",
-            )
+            seen.add(identity)
+            excerpt = resolve_source_span_ids(record.evidence.content, span_ids)
+            citations.append(GroundedCitation(citation.evidence_id, span_ids, excerpt))
+    if len(citations) > 8:
+        raise GroundedAnswerValidationError(
+            "ANSWER_CITATIONS_TOO_FRAGMENTED",
+            f"answers[{index}].citations",
+            "A Requirement answer may use at most eight contiguous citation anchors.",
+        )
+    protected_terms = _protected_requirement_terms(requirement_description)
+    cited_text = "\n".join(citation.source_excerpt for citation in citations)
+    if answer and protected_terms and not any(
+        _term_is_anchored(term, cited_text) for term in protected_terms
+    ):
+        raise GroundedAnswerValidationError(
+            "ANSWER_REQUIREMENT_TERM_UNANCHORED",
+            f"answers[{index}].citations",
+            "A named symbol or method in the Requirement must occur in the cited source spans.",
+        )
+    return RequirementAnswer(item.requirement_id, answer, tuple(citations), gap)
+
+
+def _protected_requirement_terms(description: str) -> tuple[str, ...]:
+    """Return explicit identifiers that should be visible in direct support.
+
+    Ordinary prose is deliberately excluded.  The rule only covers tokens with
+    separators (``C_i``, ``MLE-QV``) or distinctive mixed-case abbreviations
+    (``MPIWcapt``), where accepting unrelated nearby prose is especially risky.
+    """
+    candidates = re.findall(
+        r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)*(?![A-Za-z0-9])",
+        description,
+    )
+    return tuple(dict.fromkeys(
+        token for token in candidates
+        if "_" in token
+        or (sum(char.isupper() for char in token) >= 2
+            and ("-" in token or any(char.islower() for char in token)))
+    ))
+
+
+def _term_is_anchored(term: str, text: str) -> bool:
+    parts = tuple(part for part in re.split(r"[_-]+", term) if part)
+    if not parts:
+        return False
+    separator = r"(?:[\W_])*"
+    if "-" in term and all(part.isupper() for part in parts):
+        atoms = tuple(char for part in parts for char in part)
+    else:
+        atoms = parts
+    pattern = r"(?<![A-Za-z0-9])" + separator.join(
+        re.escape(atom) for atom in atoms
+    ) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def _fill_unresolved_answers(
+    answers: dict[str, RequirementAnswer],
+    pending: Sequence[tuple[str, str]],
+) -> None:
+    for requirement_id, _ in pending:
+        answers.setdefault(
+            requirement_id,
+            RequirementAnswer(
+                requirement_id,
+                None,
+                remaining_gap=(
+                    "当前 Requirement 的模型输出未通过 source-span 引用校验；"
+                    "需要基于现有 Evidence 聚焦重试。"
+                ),
+            ),
+        )
+
+
+def _attempt_from_answers(
+    requirements: Sequence[tuple[str, str]],
+    answers: dict[str, RequirementAnswer],
+    diagnostics: tuple[LLMCallRecord, ...] = (),
+) -> GroundedAnswerAttempt:
+    ordered = tuple(answers[rid] for rid, _ in requirements)
     cited_evidence_ids = tuple(dict.fromkeys(
         citation.evidence_id
-        for answer in converted
+        for answer in ordered
         for citation in answer.citations
     ))
-    return GroundedAnswerAttempt(tuple(converted), cited_evidence_ids, diagnostics)
+    return GroundedAnswerAttempt(ordered, cited_evidence_ids, diagnostics)
 
 
 def _safe_error(error: Exception) -> dict[str, object]:

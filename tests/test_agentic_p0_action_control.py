@@ -213,6 +213,10 @@ class ActionControlPlaneTests(unittest.TestCase):
         self.assertNotIn("retrieval_state", payload["requirements"][0])
         self.assertIn("Grounded Answer", AGENT_DECISION_SYSTEM_PROMPT)
         self.assertIn("Requirement", AGENT_DECISION_SYSTEM_PROMPT)
+        self.assertIn(
+            "\u4e0d\u590d\u8ff0\u6574\u9053\u591a\u90e8\u5206\u95ee\u9898",
+            AGENT_DECISION_SYSTEM_PROMPT,
+        )
 
     def test_overlong_lexical_terms_are_reselected_instead_of_truncated(self) -> None:
         too_many = ["2019", "成都", "重庆", "冬季", "大气消光", "2001-2016"]
