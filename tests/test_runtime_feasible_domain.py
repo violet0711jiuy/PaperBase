@@ -42,13 +42,18 @@ def state():
 def wire(tool, paper="A", *, query="dynamic graph", lexical=("adaptive",), section="intro"):
     if tool in {"try_answer", "stop_research"}:
         return {"decision": {"action": tool, "reason": "No more useful research"}}
-    body = {"action": tool, "requirement_ids": ["R1"]}
+    body = {"action": tool, "requirement_id": "R1"}
     if tool != "search_knowledge_base":
         body["paper_id"] = paper
     if tool.startswith("search"):
-        body.update(query=query, lexical_terms=list(lexical))
+        body.update(semantic_query=query, lexical_terms=list(lexical))
     if tool == "search_papers":
-        body = {"action": tool, "searches": [{k: v for k, v in body.items() if k != "action"}]}
+        body = {
+            "action": tool,
+            "requirement_id": body["requirement_id"],
+            "searches": [{k: v for k, v in body.items()
+                          if k not in {"action", "requirement_id"}}],
+        }
     if tool == "get_section_context":
         body["section_id"] = section
     return {"decision": body}

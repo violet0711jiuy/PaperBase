@@ -10,7 +10,7 @@ _SEARCH_FOCUS = """\
 # 检索原则
 
 - 每轮先选一个 primary gap；不要把独立 Requirement 拼成宽泛 Query。
-- Search 的 query 与 lexical_terms 只能表达所绑定 primary Requirement 的信息需求。即使用户问题同时列出多个术语，也不要把其他 Requirement 的术语顺带塞入本轮 Query。
+- Search 的 semantic_query 与 lexical_terms 只能表达所绑定 primary Requirement 的信息需求。即使原问题包含多个术语，也不要把其他 Requirement 的术语顺带塞入本轮检索。
 - Search 必须对应具体 retrieval hypothesis：这次预期找到什么信息。
 - 新增 Evidence 会由 Graph 自动交给 Grounded Answerer；Decision 只处理已经评估后的真实 gap。
 - 上次工具没有新增信息时，只有出现新术语、符号、公式或 section 线索才值得继续同一路径；否则换工具、换 Requirement、执行允许的一次聚焦重读或 stop_research。仅改写同义词不算新策略。
@@ -25,12 +25,11 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 - 优先 required Requirement。accepted_answer 只给出已校验状态、引用 Evidence IDs 和 remaining_gap，不重复答案正文；remaining_gap 是下一轮最直接的信息缺口。
 - Evidence catalog 和最近工具结果表示已经召回的原始材料，不是完成状态。不要因为某条 Evidence 最初由另一个 Requirement 的 query 找到就忽略它。
 - Decision 不裁定引用是否合法，也不生成回答；try_answer 仅表示对已经评估过的同一 Evidence Pool 执行一次受限聚焦重读。
-- lexical_hints.surface_missing 仅表示词面未命中，只用于组织 Query；available_retrieval_targets 只是可选证据路径，不是待办清单。
 - recent_research_events 每项都是完整的“请求 -> 工具结果”原子事件。比较最近事件，避免重复低收益路径。
 
 # 决策
 
-1. 选当前最重要的一个 primary gap。一次 Action 默认只绑定一个语义一致的信息需求；仅当多项 Requirement 确实依赖同一证据时才合并。
+1. 选当前最重要的一个 primary gap。每次 Action 必须且只能绑定一个 Requirement；不要合并多个 Requirement。召回 Evidence 可以由 Grounded Answerer 跨 Requirement 使用，不需要扩大检索范围。
 2. 将每个 Requirement 与 accepted_answer、remaining_gap、最近请求及结果对照，判断最可能带来新信息的证据路径。
 3. 只使用 runtime_action_capabilities 与 JSON Schema 当前允许的工具和 ID。
 4. 若 runtime 仍允许 try_answer，它只用于相同 Evidence 快照的一次聚焦重读；新 Evidence 的首次回答不由 Decision 触发。
@@ -48,10 +47,9 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 
 # Query
 
-initial_search_hints 是冷启动建议，不是已经编译的 Search Request；可以改写、翻译、拆分或完全忽略。后续以最近事件中的真实请求和结果为准。
-
-- Action.query 只表达本轮 primary Requirement 的具体信息需求，不复述整道多部分问题。
+- Action.semantic_query 只表达本轮 requirement_id 对应的具体信息需求，不复述整道多部分问题。
 - Action.lexical_terms 由你根据本轮 primary Requirement 自行生成；最多选择少量（1–5 个）高区分度术语、缩写、公式名、模型名、符号和数字，避免泛词，也不要包含只服务于其他 Requirement 的术语。
+- search_papers 可以为同一 Requirement 查询多篇论文；一个 Action 内的所有 searches 共享顶层 requirement_id。
 - 文档语言已知时使用文档表达；未知时可结合用户语言与常见英文术语。
 
 # 恢复与事实边界

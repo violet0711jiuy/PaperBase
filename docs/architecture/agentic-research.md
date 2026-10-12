@@ -1,6 +1,6 @@
 # Agentic Research 当前架构
 
-核对日期：2026-10-11。生产入口是 [factory.py](../../paperbase/agentic/factory.py)、[graph.py](../../paperbase/agentic/graph.py) 与 [contracts.py](../../paperbase/agentic/contracts.py)。
+核对日期：2026-10-12。生产入口是 [factory.py](../../paperbase/agentic/factory.py)、[graph.py](../../paperbase/agentic/graph.py) 与 [contracts.py](../../paperbase/agentic/contracts.py)。
 
 ## 设计目标
 
@@ -27,7 +27,7 @@ flowchart TD
 
 | 模块 | 输入 | 输出 / 权威边界 |
 |---|---|---|
-| Query Understanding | 原问题、会话上下文 | `QueryContext` 与冷启动 hints；不直接执行检索 |
+| Query Understanding | 原问题、会话上下文 | `QueryContext`：规范化问题、意图、范围与证据类型；不生成检索 query/关键词，不直接执行检索 |
 | Planner | 问题与范围 | 宽粒度 `ResearchRequirement`：ID、description、required、evidence_targets |
 | Decision | 当前 Requirement、缺口、Evidence 元数据目录、最近工具结果、预算 | 一个合法 Action 及其参数；不声明 support/satisfied |
 | Canonical compiler + Guard | Action | 唯一 effective request/identity，检查范围、重复与预算 |
@@ -64,11 +64,13 @@ flowchart TD
 
 Decision 输入是确定性压缩视图，不传 Evidence 正文或预览。它包含 Requirement 状态与 gap、Evidence 的 ID/论文/章节/chunk 元数据目录、最近查询/工具结果、合法能力和预算。Decision 据此判断下一步动作，但不负责判断正文是否足以支持 claim；进入答案阶段时 Grounded Answerer 才读取完整 Evidence。超时重试使用真正更小的 compact view，不原样重发。
 
-`lexical_terms` 仍由 Decision LLM 生成，每次 1–5 个非空词，并绑定一个 primary Requirement。query 与关键词只表达该 Requirement 的信息需求，不复述整道多部分问题。Canonical compiler 决定实际检索请求与 duplicate identity。
+LLM-facing Action 使用单数 `requirement_id`，每次严格绑定一个 active Requirement；`search_papers` 可以在同一 Action 内查询多篇论文，但所有 search 都共享这个绑定。`semantic_query` 与 `lexical_terms` 由 Decision LLM 针对该 Requirement 生成，关键词为 1–5 个非空项。它们不能带入只属于其他 Requirement 的明确符号或方法标识符。程序对这种跨 Requirement 标识符做窄范围、确定性的校验，失败时只允许一次有诊断信息的 Decision 修复；它不做语义完成度判断。
+
+通过 Schema 后，wire 字段会编译到内部 `AgentAction`。内部执行、Registry provenance 与 audit 仍保留 `query`/`requirement_ids`，因为它们描述已执行请求和历史关联，而不是继续暴露给 Decision LLM 的生成接口。Canonical compiler 决定实际检索请求与 duplicate identity。
 
 ## Checkpoint 与版本
 
-当前 checkpoint semantic authority 是 `paperbase-agentic-grounded-answer-v1`。旧 Projector checkpoint 不迁移、不恢复执行；应新建研究线程。公开审计版本是 `grounded-answer-v1`，评测版本是 `agentic-grounded-answer-eval-v4`。
+当前 checkpoint semantic authority 是 `paperbase-agentic-grounded-answer-v1`。旧 Projector checkpoint 不迁移、不恢复执行；应新建研究线程。公开审计版本是 `grounded-answer-v1`。Decision wire contract 的评测由独立 v1.5 observer 读取，不回写历史 v1.4 产物。
 
 ## 安全边界
 

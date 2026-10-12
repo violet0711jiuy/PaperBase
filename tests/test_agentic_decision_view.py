@@ -58,7 +58,9 @@ def test_decision_view_is_atomic_and_does_not_include_evidence_bodies() -> None:
     serialized = str(view)
     assert "FULL RAW BODY" not in serialized
     assert "x" * 1200 not in serialized
-    assert view["latest_tool_evidence_ids"] == ["E1"]
+    assert "latest_tool_evidence_ids" not in view
+    assert "question" not in view and "research_goal" not in view
+    assert "initial_search_hints" not in view
     assert view["evidence_catalog"][0]["evidence_id"] == "E1"
     assert "source_preview" not in view["evidence_catalog"][0]
     assert "retrieved_by_queries" not in view["evidence_catalog"][0]

@@ -42,6 +42,9 @@ class ActionCanonicalizer:
         self._remove_deprecated_fields(decision, "decision", operations)
         action_name = decision.get("action")
         if action_name == "search_papers":
+            self._strip_identifier(
+                decision, "requirement_id", "requirement_id", operations
+            )
             searches = decision.get("searches")
             if isinstance(searches, list):
                 for index, search in enumerate(searches):
@@ -53,14 +56,17 @@ class ActionCanonicalizer:
             "search_knowledge_base",
             "search_references",
         }:
+            self._strip_identifier(
+                decision, "requirement_id", "requirement_id", operations
+            )
             self._normalize_search(decision, "decision", operations)
         elif action_name == "get_section_context":
             self._strip_identifier(decision, "paper_id", "paper_id", operations)
             self._strip_identifier(decision, "section_id", "section_id", operations)
-            self._normalize_identifier_list(decision, "requirement_ids", "requirement_ids", operations)
+            self._strip_identifier(decision, "requirement_id", "requirement_id", operations)
         elif action_name == "get_paper_overview":
             self._strip_identifier(decision, "paper_id", "paper_id", operations)
-            self._normalize_identifier_list(decision, "requirement_ids", "requirement_ids", operations)
+            self._strip_identifier(decision, "requirement_id", "requirement_id", operations)
 
         return result, ActionCanonicalization(
             changed=bool(operations),
@@ -99,9 +105,8 @@ class ActionCanonicalizer:
     ) -> None:
         self._remove_deprecated_fields(value, prefix, operations)
         self._strip_identifier(value, "paper_id", f"{prefix}.paper_id", operations)
-        self._normalize_query(value, f"{prefix}.query", operations)
+        self._normalize_semantic_query(value, f"{prefix}.semantic_query", operations)
         self._normalize_lexical_terms(value, f"{prefix}.lexical_terms", operations)
-        self._normalize_identifier_list(value, "requirement_ids", f"{prefix}.requirement_ids", operations)
 
     def _strip_identifier(
         self,
@@ -117,17 +122,17 @@ class ActionCanonicalizer:
                 value[name] = normalized
                 self._record(operations, field_path, "trimmed", 1)
 
-    def _normalize_query(
+    def _normalize_semantic_query(
         self,
         value: dict[str, Any],
         field_path: str,
         operations: list[CanonicalizationOperation],
     ) -> None:
-        original = value.get("query")
+        original = value.get("semantic_query")
         if isinstance(original, str):
             normalized = " ".join(original.split())
             if normalized != original:
-                value["query"] = normalized
+                value["semantic_query"] = normalized
                 self._record(operations, field_path, "normalized_whitespace", 1)
 
     def _normalize_lexical_terms(
@@ -162,37 +167,3 @@ class ActionCanonicalizer:
         # Schema validates the five-term limit.  Silently keeping the first
         # five would discard later, more discriminative terms before repair.
         value["lexical_terms"] = deduplicated
-
-    def _normalize_identifier_list(
-        self,
-        value: dict[str, Any],
-        name: str,
-        field_path: str,
-        operations: list[CanonicalizationOperation],
-    ) -> None:
-        original = value.get(name)
-        if not isinstance(original, list):
-            return
-        trimmed = [item.strip() if isinstance(item, str) else item for item in original]
-        trim_count = sum(
-            isinstance(before, str) and before != after
-            for before, after in zip(original, trimmed)
-        )
-        non_empty = [item for item in trimmed if not (isinstance(item, str) and not item)]
-        self._record(operations, field_path, "trimmed", trim_count)
-        self._record(operations, field_path, "removed_empty", len(trimmed) - len(non_empty))
-        deduplicated: list[Any] = []
-        seen: set[tuple[str, str] | tuple[str, int]] = set()
-        for item in non_empty:
-            key: tuple[str, str] | tuple[str, int]
-            if isinstance(item, str):
-                key = ("text", item)
-            else:
-                key = ("identity", id(item))
-            if key not in seen:
-                seen.add(key)
-                deduplicated.append(item)
-        self._record(operations, field_path, "deduplicated", len(non_empty) - len(deduplicated))
-        # Unknown IDs deliberately survive this canonicalization and must fail
-        # deterministic domain validation.
-        value[name] = deduplicated

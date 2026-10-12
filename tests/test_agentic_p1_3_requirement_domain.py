@@ -22,7 +22,7 @@ from test_agentic_p0_action_control import _state
 
 
 BRANCHES = (
-    "SearchSpecDraft",
+    "SearchPapersDraft",
     "SearchKnowledgeBaseDraft",
     "SearchReferencesDraft",
     "GetSectionContextDraft",
@@ -30,28 +30,28 @@ BRANCHES = (
 )
 
 
-def _reference_decision(requirement_ids: list[str]) -> dict[str, object]:
+def _reference_decision(requirement_id: object) -> dict[str, object]:
     return {
         "decision": {
             "action": "search_references",
             "paper_id": "A",
-            "query": "2009 wind forecasting review",
+            "semantic_query": "2009 wind forecasting review",
             "lexical_terms": ["2009", "wind forecasting"],
-            "requirement_ids": requirement_ids,
+            "requirement_id": requirement_id,
         }
     }
 
 
-def _paper_decision(requirement_ids: list[str]) -> dict[str, object]:
+def _paper_decision(requirement_id: object) -> dict[str, object]:
     return {
         "decision": {
             "action": "search_papers",
+            "requirement_id": requirement_id,
             "searches": [
                 {
                     "paper_id": "A",
-                    "query": "method",
+                    "semantic_query": "method",
                     "lexical_terms": ["method"],
-                    "requirement_ids": requirement_ids,
                 }
             ],
         }
@@ -64,11 +64,9 @@ def test_all_requirement_bound_branches_use_runtime_requirement_enum():
 
     assert _runtime_action_capabilities(state).valid_requirement_ids == ("R1", "R2")
     for branch_name in BRANCHES:
-        requirement_ids = schema["$defs"][branch_name]["properties"]["requirement_ids"]
-        assert requirement_ids["type"] == "array"
-        assert requirement_ids["minItems"] == 1
-        assert requirement_ids["maxItems"] == 1
-        assert requirement_ids["items"]["enum"] == ["R1", "R2"]
+        requirement_id = schema["$defs"][branch_name]["properties"]["requirement_id"]
+        assert requirement_id["type"] == "string"
+        assert requirement_id["enum"] == ["R1", "R2"]
 
 
 @pytest.mark.parametrize("invalid_id", ["]R1", "]", "R3"])
@@ -76,17 +74,17 @@ def test_wire_schema_rejects_ids_outside_runtime_domain(invalid_id):
     schema = _decision_json_schema(_state())
     validator = Draft202012Validator(schema)
 
-    assert list(validator.iter_errors(_reference_decision([invalid_id])))
-    assert list(validator.iter_errors(_paper_decision([invalid_id])))
+    assert list(validator.iter_errors(_reference_decision(invalid_id)))
+    assert list(validator.iter_errors(_paper_decision(invalid_id)))
 
 
-@pytest.mark.parametrize("requirement_ids", [["R1"], ["R2"]])
-def test_wire_schema_accepts_each_legal_requirement_binding(requirement_ids):
+@pytest.mark.parametrize("requirement_id", ["R1", "R2"])
+def test_wire_schema_accepts_each_legal_requirement_binding(requirement_id):
     schema = _decision_json_schema(_state())
     validator = Draft202012Validator(schema)
 
-    assert not list(validator.iter_errors(_reference_decision(requirement_ids)))
-    assert not list(validator.iter_errors(_paper_decision(requirement_ids)))
+    assert not list(validator.iter_errors(_reference_decision(requirement_id)))
+    assert not list(validator.iter_errors(_paper_decision(requirement_id)))
 
 
 def test_wire_schema_rejects_multi_requirement_action_binding():
@@ -119,15 +117,19 @@ def test_empty_runtime_requirement_domain_exposes_stop_only():
             {"decision": {"action": "stop_research", "reason": "No active requirements."}}
         )
     )
-    assert list(validator.iter_errors(_reference_decision(["R1"])))
+    assert list(validator.iter_errors(_reference_decision("R1")))
 
 
 def test_local_requirement_validator_remains_defense_in_depth():
     state = _state()
-    valid = SearchReferencesAction("A", "review", requirement_ids=("R1", "R2"))
+    valid = SearchReferencesAction("A", "review", requirement_ids=("R1",))
+    multiple = SearchReferencesAction("A", "review", requirement_ids=("R1", "R2"))
     invalid = SearchReferencesAction("A", "review", requirement_ids=("]R1",))
 
     _validate_action_references(valid, state)
+    with pytest.raises(ActionDomainValidationError) as multiple_error:
+        _validate_action_references(multiple, state)
+    assert multiple_error.value.code == "InvalidRequirementBinding"
     with pytest.raises(ActionDomainValidationError) as raised:
         _validate_action_references(invalid, state)
     assert raised.value.code == "InvalidRequirementId"

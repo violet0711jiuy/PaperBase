@@ -172,16 +172,15 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
         def search(query: str) -> dict[str, object]:
             return {
                 "paper_id": "A",
-                "query": query,
+                "semantic_query": query,
                 "lexical_terms": ["method"],
-                "evidence_targets": ["method"],
-                "requirement_ids": ["R1"],
             }
 
         invalid = json.dumps(
             {
                 "decision": {
                     "action": "search_papers",
+                    "requirement_id": "R1",
                     "searches": [search("method"), search("method details")],
                 },
             }
@@ -190,6 +189,7 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
             {
                 "decision": {
                     "action": "search_papers",
+                    "requirement_id": "R1",
                     "searches": [search("method")],
                 },
             }
@@ -208,13 +208,12 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
             {
                 "decision": {
                     "action": "search_papers",
+                    "requirement_id": "R1",
                     "searches": [
                         {
                             "paper_id": "A",
-                            "query": "method",
+                            "semantic_query": "method",
                             "lexical_terms": ["method"],
-                            "evidence_targets": ["method"],
-                            "requirement_ids": ["R1"],
                         }
                     ],
                     "top_k": 100,
@@ -225,13 +224,12 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
             {
                 "decision": {
                     "action": "search_papers",
+                    "requirement_id": "R1",
                     "searches": [
                         {
                             "paper_id": "A",
-                            "query": "method",
+                            "semantic_query": "method",
                             "lexical_terms": ["method"],
-                            "evidence_targets": ["method"],
-                            "requirement_ids": ["R1"],
                         }
                     ],
                 }
@@ -250,9 +248,9 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
             {
                 "decision": {
                     "action": "get_section_context",
+                    "requirement_id": "R1",
                     "paper_id": "A",
                     "section_id": "invented",
-                    "requirement_ids": ["R1"],
                 }
             }
         )
@@ -260,13 +258,12 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
             {
                 "decision": {
                     "action": "search_papers",
+                    "requirement_id": "R1",
                     "searches": [
                         {
                             "paper_id": "A",
-                            "query": "method",
+                            "semantic_query": "method",
                             "lexical_terms": ["method"],
-                            "evidence_targets": ["method"],
-                            "requirement_ids": ["R1"],
                         }
                     ],
                 }
@@ -284,9 +281,9 @@ class AgenticDecisionAndToolTests(unittest.TestCase):
             {
                 "decision": {
                     "action": "get_section_context",
+                    "requirement_id": "R1",
                     "paper_id": "A",
                     "section_id": "method",
-                    "requirement_ids": ["R1"],
                 }
             }
         )

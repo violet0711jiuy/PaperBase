@@ -87,15 +87,10 @@ class QueryUnderstandingService:
                 )
                 draft = fallback
                 used_fallback = True
-        # The validated draft owns the advisory hints. Do not apply the Search
-        # compiler's independent quota or inject original-language query terms.
-        lexical = tuple(dict.fromkeys(term.strip() for term in draft.lexical_keywords_en if term.strip()))
         targets = frozenset(draft.evidence_targets)
         context = QueryContext(
             original_query=query,
             resolved_query=draft.resolved_query,
-            semantic_query_en=(draft.semantic_query_en or None),
-            lexical_keywords_en=lexical,
             intent=draft.intent,
             scope=resolution.scope,
             target_paper_ids=resolution.target_paper_ids,
@@ -143,8 +138,6 @@ def _deterministic_draft(
         targets = [EvidenceTarget.GENERAL]
     return QueryUnderstandingDraft(
         resolved_query=query,
-        semantic_query_en=None,
-        lexical_keywords_en=[],
         intent=intent,
         retrieval_goal=goal,
         evidence_targets=targets,

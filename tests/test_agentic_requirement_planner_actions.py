@@ -203,11 +203,11 @@ def test_planner_rejects_plan_without_required_answer_obligation() -> None:
 @pytest.mark.parametrize(
     "decision",
     (
-        {"action": "search_papers", "searches": [{"paper_id": "A", "query": "Find wind speed forecasting methods used by this paper", "lexical_terms": ["wind speed forecasting"], "requirement_ids": ["R1"]}]},
-        {"action": "search_knowledge_base", "query": "Find papers that describe wind speed forecasting methods", "lexical_terms": ["wind speed forecasting"], "requirement_ids": ["R1"]},
-        {"action": "search_references", "paper_id": "A", "query": "Find cited prior work on wind speed forecasting methods", "lexical_terms": ["prior work", "wind speed forecasting"], "requirement_ids": ["R3"]},
-        {"action": "get_section_context", "paper_id": "A", "section_id": "methods", "requirement_ids": ["R1"]},
-        {"action": "get_paper_overview", "paper_id": "A", "requirement_ids": ["R1"]},
+        {"action": "search_papers", "requirement_id": "R1", "searches": [{"paper_id": "A", "semantic_query": "Find wind speed forecasting methods used by this paper", "lexical_terms": ["wind speed forecasting"]}]},
+        {"action": "search_knowledge_base", "requirement_id": "R1", "semantic_query": "Find papers that describe wind speed forecasting methods", "lexical_terms": ["wind speed forecasting"]},
+        {"action": "search_references", "requirement_id": "R3", "paper_id": "A", "semantic_query": "Find cited prior work on wind speed forecasting methods", "lexical_terms": ["prior work", "wind speed forecasting"]},
+        {"action": "get_section_context", "requirement_id": "R1", "paper_id": "A", "section_id": "methods"},
+        {"action": "get_paper_overview", "requirement_id": "R1", "paper_id": "A"},
         {"action": "try_answer", "reason": "The raw Evidence Pool is ready."},
     ),
 )
@@ -226,8 +226,8 @@ def test_agent_action_rejects_cross_tool_fields_and_unbound_search() -> None:
                     "decision": {
                         "action": "get_paper_overview",
                         "paper_id": "A",
-                        "query": "not allowed for overview",
-                        "requirement_ids": ["R1"],
+                        "semantic_query": "not allowed for overview",
+                        "requirement_id": "R1",
                     }
                 }
             )
@@ -238,13 +238,12 @@ def test_agent_action_rejects_cross_tool_fields_and_unbound_search() -> None:
                 {
                     "decision": {
                         "action": "search_papers",
+                        "requirement_id": "R1",
                         "searches": [
                             {
                                 "paper_id": "A",
-                                "query": "Find methods",
+                                "semantic_query": "Find methods",
                                 "lexical_terms": [],
-                                "evidence_targets": ["method"],
-                                "requirement_ids": [],
                             }
                         ],
                     }
@@ -282,25 +281,22 @@ def test_runtime_guard_requires_unresolved_requirement_and_rejects_satisfied_one
     assert rejected.accepted  # support_found does not close further research
 
 
-def test_decision_binds_baseline_and_prior_work_to_their_requirements() -> None:
+def test_decision_batches_multiple_papers_for_one_requirement() -> None:
     response = json.dumps(
         {
             "decision": {
                 "action": "search_papers",
+                "requirement_id": "R1",
                 "searches": [
                     {
                         "paper_id": "A",
-                        "query": "Identify the wind speed forecasting method proposed by paper A",
+                        "semantic_query": "Identify the wind speed forecasting method proposed by paper A",
                         "lexical_terms": ["wind speed forecasting", "proposed method"],
-                        "evidence_targets": ["method"],
-                        "requirement_ids": ["R1"],
                     },
                     {
                         "paper_id": "B",
-                        "query": "Identify baseline wind speed forecasting methods compared in paper B",
-                        "lexical_terms": ["baseline", "comparison"],
-                        "evidence_targets": ["method"],
-                        "requirement_ids": ["R2"],
+                        "semantic_query": "Identify the wind speed forecasting method proposed by paper B",
+                        "lexical_terms": ["wind speed forecasting", "proposed method"],
                     },
                 ],
             }
@@ -322,19 +318,19 @@ def test_decision_binds_baseline_and_prior_work_to_their_requirements() -> None:
     assert isinstance(action, SearchPapersAction)
     assert [(item.paper_id, item.lexical_terms) for item in action.searches] == [
         ("A", ("wind speed forecasting", "proposed method")),
-        ("B", ("baseline", "comparison")),
+        ("B", ("wind speed forecasting", "proposed method")),
     ]
-    assert [item.requirement_ids for item in action.searches] == [("R1",), ("R2",)]
+    assert [item.requirement_ids for item in action.searches] == [("R1",), ("R1",)]
     assert action.searches[0].query != action.searches[1].query
 
     prior_work_response = json.dumps(
         {
             "decision": {
                 "action": "search_references",
+                "requirement_id": "R3",
                 "paper_id": "A",
-                "query": "Find prior work methods discussed by paper A for wind speed forecasting",
+                "semantic_query": "Find prior work methods discussed by paper A for wind speed forecasting",
                 "lexical_terms": ["prior work", "wind speed forecasting"],
-                "requirement_ids": ["R3"],
             }
         }
     )

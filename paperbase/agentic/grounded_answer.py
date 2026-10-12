@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-import re
 from typing import Protocol, Sequence
 
 from pydantic import ValidationError
@@ -39,6 +38,7 @@ from .source_spans import (
     resolve_source_span_ids,
     source_spans_payload,
 )
+from .requirement_terms import explicit_requirement_terms, term_present
 
 
 class GroundedAnswerValidationError(ValueError):
@@ -412,10 +412,10 @@ def _convert_requirement_answer(
             f"answers[{index}].citations",
             "A Requirement answer may use at most eight contiguous citation anchors.",
         )
-    protected_terms = _protected_requirement_terms(requirement_description)
+    protected_terms = explicit_requirement_terms(requirement_description)
     cited_text = "\n".join(citation.source_excerpt for citation in citations)
     if answer and protected_terms and not any(
-        _term_is_anchored(term, cited_text) for term in protected_terms
+        term_present(term, cited_text) for term in protected_terms
     ):
         raise GroundedAnswerValidationError(
             "ANSWER_REQUIREMENT_TERM_UNANCHORED",
@@ -423,40 +423,6 @@ def _convert_requirement_answer(
             "A named symbol or method in the Requirement must occur in the cited source spans.",
         )
     return RequirementAnswer(item.requirement_id, answer, tuple(citations), gap)
-
-
-def _protected_requirement_terms(description: str) -> tuple[str, ...]:
-    """Return explicit identifiers that should be visible in direct support.
-
-    Ordinary prose is deliberately excluded.  The rule only covers tokens with
-    separators (``C_i``, ``MLE-QV``) or distinctive mixed-case abbreviations
-    (``MPIWcapt``), where accepting unrelated nearby prose is especially risky.
-    """
-    candidates = re.findall(
-        r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9]*(?:[_-][A-Za-z0-9]+)*(?![A-Za-z0-9])",
-        description,
-    )
-    return tuple(dict.fromkeys(
-        token for token in candidates
-        if "_" in token
-        or (sum(char.isupper() for char in token) >= 2
-            and ("-" in token or any(char.islower() for char in token)))
-    ))
-
-
-def _term_is_anchored(term: str, text: str) -> bool:
-    parts = tuple(part for part in re.split(r"[_-]+", term) if part)
-    if not parts:
-        return False
-    separator = r"(?:[\W_])*"
-    if "-" in term and all(part.isupper() for part in parts):
-        atoms = tuple(char for part in parts for char in part)
-    else:
-        atoms = parts
-    pattern = r"(?<![A-Za-z0-9])" + separator.join(
-        re.escape(atom) for atom in atoms
-    ) + r"(?![A-Za-z0-9])"
-    return re.search(pattern, text, re.IGNORECASE) is not None
 
 
 def _fill_unresolved_answers(

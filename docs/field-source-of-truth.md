@@ -1,13 +1,14 @@
 # 字段事实源与语义边界
 
-核对日期：2026-10-10。派生视图只用于传输或展示，不得成为第二份权威状态。
+核对日期：2026-10-12。派生视图只用于传输或展示，不得成为第二份权威状态。
 
 | 信息 | 权威字段 / 模块 | 含义与边界 |
 |---|---|---|
 | 原问题与范围 | 用户输入 + `ScopeResolver` | 模型不可扩大可信 corpus |
-| 冷启动理解 | `QueryContext` | advisory，不自动成为后续检索请求 |
+| 问题理解 | `QueryContext` | 规范化问题、意图、可信范围和证据类型；不保存检索 query/关键词 |
 | 回答义务 | `ResearchPlan.requirements` | `requirement_id/description/required/evidence_targets`；保持宽粒度 |
-| Decision 动作 | 校验后的 `AgentAction` | 一轮只选择一个工具或答案控制动作 |
+| Decision wire 动作 | `ActionDraft` Schema | 一轮一个工具；检索/扩展严格绑定单个 `requirement_id`，搜索文字使用 `semantic_query + lexical_terms` |
+| 内部 Decision 动作 | 校验后的 `AgentAction` | wire contract 编译后的执行对象；可用复数字段记录批次/历史，但当前检索动作仍须恰好一个 Requirement |
 | 实际检索请求 | `CanonicalSearchRequest` | effective query、lexical tokens、identity 的唯一事实源 |
 | 执行合法性与预算 | `GuardState` + receipts | 区分 attempted/executed/successful/failed |
 | 原始检索结果 | `RetrievedEvidence` | 保存正文、chunk/window、section/page 和 score 语义 |

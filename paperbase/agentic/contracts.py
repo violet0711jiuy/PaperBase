@@ -354,9 +354,6 @@ class QueryContext:
     scope_source: ScopeSource
     retrieval_goal: ResearchGoal
     default_evidence_targets: frozenset[EvidenceTarget]
-    # Advisory English cold-start concepts only; never implicit Retriever inputs.
-    semantic_query_en: str | None = None
-    lexical_keywords_en: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "original_query", _text(self.original_query, "original_query"))
@@ -371,7 +368,6 @@ class QueryContext:
         if not targets:
             raise ValueError("default_evidence_targets must not be empty.")
         object.__setattr__(self, "default_evidence_targets", targets)
-        object.__setattr__(self, "lexical_keywords_en", _unique_texts(self.lexical_keywords_en))
         if self.scope is QueryScope.SINGLE_PAPER and len(ids) != 1:
             raise ValueError("single_paper scope requires exactly one paper_id.")
         if self.scope is QueryScope.SELECTED_PAPERS and len(ids) < 2:

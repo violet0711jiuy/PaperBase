@@ -106,20 +106,21 @@ def _search(
     *,
     query: str = "method",
     lexical_terms: list[str] | None = None,
-    requirement_ids: list[str] | None = None,
 ) -> dict[str, object]:
     return {
         "paper_id": "A",
-        "query": query,
+        "semantic_query": query,
         "lexical_terms": lexical_terms if lexical_terms is not None else ["method"],
-        "evidence_targets": ["method"],
-        "requirement_ids": requirement_ids if requirement_ids is not None else ["R1"],
     }
 
 
-def _decision(search: dict[str, object]) -> str:
+def _decision(search: dict[str, object], requirement_id: str = "R1") -> str:
     return json.dumps(
-        {"decision": {"action": "search_papers", "searches": [search]}},
+        {"decision": {
+            "action": "search_papers",
+            "requirement_id": requirement_id,
+            "searches": [search],
+        }},
         ensure_ascii=False,
     )
 
@@ -162,22 +163,73 @@ def _record_with_section() -> EvidenceRecord:
 
 
 class ActionControlPlaneTests(unittest.TestCase):
-    def test_decision_receives_existing_english_retrieval_hints(self) -> None:
-        state = replace(
-            _state(),
-            context=replace(
-                _context(),
-                semantic_query_en="Shi Chengdu Chongqing atmospheric extinction 2019",
-                lexical_keywords_en=("Shi", "Chengdu", "Chongqing"),
+    def test_cross_requirement_identifier_is_repaired_before_tool_execution(self) -> None:
+        plan = ResearchPlan(
+            "Explain EMVE loss components",
+            requirements=(
+                ResearchRequirement(
+                    "R1", "Explain how MPIWcapt controls interval width in EMVE.",
+                    frozenset({EvidenceTarget.METHOD}),
+                ),
+                ResearchRequirement(
+                    "R2", "Explain how C_i controls coverage in EMVE.",
+                    frozenset({EvidenceTarget.METHOD}),
+                ),
             ),
         )
-
-        payload = json.loads(_state_prompt(state, []))
-
-        self.assertEqual(
-            payload["initial_search_hints"]["lexical_concepts"],
-            ["Shi", "Chengdu", "Chongqing"],
+        broad = _search(
+            query="How do MPIWcapt and C_i control width and coverage in EMVE?",
+            lexical_terms=["MPIWcapt", "C_i", "EMVE"],
         )
+        scoped = _search(
+            query="How does MPIWcapt control interval width in EMVE?",
+            lexical_terms=["MPIWcapt", "EMVE"],
+        )
+
+        result = LLMDecisionAgent(
+            _QueuedClient((_decision(broad), _decision(scoped)))
+        ).decide(replace(_state(), plan=plan))
+
+        self.assertEqual(result.llm_calls, 2)
+        diagnostic = result.llm_diagnostics[0].validation_diagnostics[0]
+        self.assertEqual(diagnostic.error_code, "CrossRequirementSearchScope")
+        self.assertEqual(diagnostic.field_path, "searches[0].semantic_query")
+        self.assertEqual(result.action.searches[0].requirement_ids, ("R1",))
+        self.assertNotIn("C_i", result.action.searches[0].query)
+
+    def test_shared_context_identifier_does_not_trigger_scope_repair(self) -> None:
+        plan = ResearchPlan(
+            "Explain EMVE loss components",
+            requirements=(
+                ResearchRequirement(
+                    "R1", "Explain MPIWcapt in LSTM-EMVE.",
+                    frozenset({EvidenceTarget.METHOD}),
+                ),
+                ResearchRequirement(
+                    "R2", "Explain C_i in LSTM-EMVE.",
+                    frozenset({EvidenceTarget.METHOD}),
+                ),
+            ),
+        )
+        scoped = _search(
+            query="How does MPIWcapt work in LSTM-EMVE?",
+            lexical_terms=["MPIWcapt", "LSTM-EMVE"],
+        )
+
+        result = LLMDecisionAgent(_QueuedClient((_decision(scoped),))).decide(
+            replace(_state(), plan=plan)
+        )
+
+        self.assertEqual(result.llm_calls, 1)
+        self.assertFalse(result.llm_diagnostics[0].validation_diagnostics)
+
+    def test_decision_view_omits_global_query_and_retrieval_hints(self) -> None:
+        payload = json.loads(_state_prompt(_state(), []))
+
+        self.assertNotIn("question", payload)
+        self.assertNotIn("research_goal", payload)
+        self.assertNotIn("initial_search_hints", payload)
+        self.assertNotIn("available_retrieval_targets", payload["requirements"][0])
         self.assertIn("最多选择少量", AGENT_DECISION_SYSTEM_PROMPT)
 
     def test_decision_sees_global_iteration_limit_and_remaining_rounds(self) -> None:
@@ -234,7 +286,7 @@ class ActionControlPlaneTests(unittest.TestCase):
 
     def test_schema_diagnostic_is_stable_and_repair_receives_field_constraint(self) -> None:
         invalid = _search()
-        del invalid["query"]
+        del invalid["semantic_query"]
         client = _QueuedClient((_decision(invalid), _decision(_search())))
 
         result = LLMDecisionAgent(client).decide(_state())
@@ -242,14 +294,14 @@ class ActionControlPlaneTests(unittest.TestCase):
         diagnostic = result.llm_diagnostics[0].validation_diagnostics[0]
         self.assertEqual(diagnostic.error_stage, "schema_validation")
         self.assertEqual(diagnostic.error_code, "MissingRequiredField")
-        self.assertEqual(diagnostic.field_path, "searches[0].query")
+        self.assertEqual(diagnostic.field_path, "searches[0].semantic_query")
         repair = json.loads(client.calls[1]["user_prompt"])
         self.assertEqual(repair["previous_validation_errors"][0]["error_code"], "MissingRequiredField")
-        self.assertEqual(repair["previous_validation_errors"][0]["field_path"], "searches[0].query")
+        self.assertEqual(repair["previous_validation_errors"][0]["field_path"], "searches[0].semantic_query")
 
     def test_domain_diagnostic_locates_invalid_requirement_id(self) -> None:
         client = _QueuedClient(
-            (_decision(_search(requirement_ids=["R9"])), _decision(_search()))
+            (_decision(_search(), "R9"), _decision(_search()))
         )
 
         result = LLMDecisionAgent(client).decide(_state())
@@ -257,7 +309,7 @@ class ActionControlPlaneTests(unittest.TestCase):
         diagnostic = result.llm_diagnostics[0].validation_diagnostics[0]
         self.assertEqual(diagnostic.error_stage, "domain_validation")
         self.assertEqual(diagnostic.error_code, "InvalidRequirementId")
-        self.assertEqual(diagnostic.field_path, "searches[0].requirement_ids[0]")
+        self.assertEqual(diagnostic.field_path, "requirement_id")
         self.assertEqual(diagnostic.actual_summary, "unknown_id=R9")
 
     def test_domain_diagnostic_locates_invalid_section_id(self) -> None:
@@ -267,7 +319,7 @@ class ActionControlPlaneTests(unittest.TestCase):
                     "action": "get_section_context",
                     "paper_id": "A",
                     "section_id": "invented",
-                    "requirement_ids": ["R1"],
+                    "requirement_id": "R1",
                 }
             }
         )
@@ -308,13 +360,13 @@ class ActionControlPlaneTests(unittest.TestCase):
         raw = {
             "decision": {
                 "action": "search_papers",
+                "requirement_id": " R9 ",
                 "target_subtask_id": "legacy",
                 "searches": [
                     {
                         **_search(
                             query="  method   details ",
                             lexical_terms=lexical_terms,
-                            requirement_ids=[" R1 ", "", "R1", "R9"],
                         ),
                         "missing_information": "legacy",
                     }
@@ -325,8 +377,8 @@ class ActionControlPlaneTests(unittest.TestCase):
         normalized, audit = ActionCanonicalizer().canonicalize(raw)
         search = normalized["decision"]["searches"][0]
 
-        self.assertEqual(search["query"], "method details")
-        self.assertEqual(search["requirement_ids"], ["R1", "R9"])
+        self.assertEqual(search["semantic_query"], "method details")
+        self.assertEqual(normalized["decision"]["requirement_id"], "R9")
         self.assertEqual(search["lexical_terms"], ["Method", "context", "a", "b", "c", "d", "e", "f", "g"])
         self.assertNotIn("target_subtask_id", normalized["decision"])
         self.assertNotIn("missing_information", search)
@@ -346,7 +398,7 @@ class ActionControlPlaneTests(unittest.TestCase):
     def test_unknown_requirement_survives_canonicalization_and_fails_domain_validation(self) -> None:
         with self.assertRaises(DecisionError) as raised:
             LLMDecisionAgent(
-                _QueuedClient((_decision(_search(requirement_ids=[" R9 ", "R9"])),)),
+                _QueuedClient((_decision(_search(), " R9 "),)),
                 max_attempts=1,
             ).decide(_state())
 
@@ -471,6 +523,7 @@ class ActionControlPlaneTests(unittest.TestCase):
             {
                 "decision": {
                     "action": "search_papers",
+                    "requirement_id": "R1",
                     "searches": [_search(), _search(query="experiment")],
                 }
             }
@@ -566,7 +619,7 @@ class ActionControlPlaneTests(unittest.TestCase):
             canonicalization,
         )
         invalid = _search()
-        del invalid["query"]
+        del invalid["semantic_query"]
         decision = LLMDecisionAgent(
             _QueuedClient((_decision(invalid), _decision(_search())))
         ).decide(_state())
@@ -592,7 +645,7 @@ class ActionControlPlaneTests(unittest.TestCase):
         audit = build_agentic_audit_snapshot(result)
 
         self.assertEqual(audit.validation_errors[0].error_stage, "schema_validation")
-        self.assertEqual(audit.validation_errors[0].field_path, "searches[0].query")
+        self.assertEqual(audit.validation_errors[0].field_path, "searches[0].semantic_query")
         self.assertNotIn("hidden-reasoning", audit.to_json())
 
 

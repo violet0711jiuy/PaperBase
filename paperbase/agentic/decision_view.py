@@ -12,7 +12,6 @@ from dataclasses import asdict, dataclass
 import json
 from typing import TYPE_CHECKING
 
-from .initial_search_hints import build_initial_search_hints
 from .requirement_targets import preferred_tools_for_targets
 
 if TYPE_CHECKING:
@@ -185,9 +184,6 @@ def build_compact_decision_view(
             "requirement_id": requirement.requirement_id,
             "description": requirement.description,
             "required": requirement.required,
-            "available_retrieval_targets": sorted(
-                target.value for target in requirement.evidence_targets
-            ),
             "preferred_tools": preferred_tools_for_targets(
                 requirement.evidence_targets, capabilities.available_tools
             ),
@@ -207,9 +203,7 @@ def build_compact_decision_view(
     )
     catalog_limit = max(1, limits.support_entries_per_requirement * 2)
     visible = ordered[:catalog_limit]
-    newest_iteration = max((record.last_seen_iteration for record in ordered), default=0)
     catalog: list[dict[str, object]] = []
-    latest_ids: list[str] = []
     for record in visible:
         source = record.evidence
         row = {
@@ -221,8 +215,6 @@ def build_compact_decision_view(
             "last_seen_iteration": record.last_seen_iteration,
         }
         catalog.append(row)
-        if record.last_seen_iteration == newest_iteration:
-            latest_ids.append(record.evidence_id)
 
     coverage = state.coverage
     events = build_recent_research_events(state)
@@ -239,14 +231,11 @@ def build_compact_decision_view(
         ]
     payload: dict[str, object] = {
         "view_type": "GroundedAnswerDecisionView",
-        "question": state.context.resolved_query,
-        "research_goal": state.plan.goal,
         "scope": state.context.scope.value,
         "trusted_paper_ids": state.context.target_paper_ids,
         "runtime_action_capabilities": _runtime_decision_view(capabilities),
         "action_recovery": recovery,
         "requirements": requirements,
-        "latest_tool_evidence_ids": latest_ids,
         "evidence_catalog": catalog,
         "evidence_catalog_omitted": max(0, len(ordered) - len(visible)),
         "recent_research_events": events[-max(
@@ -271,8 +260,6 @@ def build_compact_decision_view(
             else [_repair_payload(error) for error in errors[-1:]]
         ),
     }
-    if not state.observations and not state.action_rejections:
-        payload["initial_search_hints"] = build_initial_search_hints(state.context)
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=list)
     metrics = {
         "number_of_requirements": len(requirements),

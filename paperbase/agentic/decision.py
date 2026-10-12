@@ -62,6 +62,7 @@ from .guards import GuardDecision
 from paperbase.retrieval.requests import CanonicalSearchRequest
 from .decision_view import CompactDecisionLimits, build_compact_decision_view
 from .requirement_targets import targets_for_requirement_ids
+from .requirement_terms import foreign_requirement_terms, term_present
 
 
 class DecisionError(RuntimeError):
@@ -346,12 +347,13 @@ def _decision_json_schema(state: DecisionState) -> dict[str, object]:
     decision["discriminator"]["mapping"] = {
         tool: ref for tool, ref in mapping.items() if tool in available
     }
-    for name in ("SearchSpecDraft", "SearchKnowledgeBaseDraft", "SearchReferencesDraft",
+    for name in ("SearchPapersDraft", "SearchKnowledgeBaseDraft", "SearchReferencesDraft",
                  "GetSectionContextDraft", "GetPaperOverviewDraft"):
         # With no active binding only answer/stop actions are reachable.
         if capabilities.valid_requirement_ids:
-            definitions[name]["properties"]["requirement_ids"]["items"]["enum"] = list(
-                capabilities.valid_requirement_ids)
+            definitions[name]["properties"]["requirement_id"]["enum"] = list(
+                capabilities.valid_requirement_ids
+            )
     for name, paper_ids in (
         ("SearchSpecDraft", capabilities.search_paper_ids),
         ("SearchReferencesDraft", capabilities.reference_paper_ids),
@@ -398,37 +400,37 @@ def _to_action(draft: ActionDraft) -> AgentAction:
             searches=tuple(
                 PaperSearchSpec(
                     paper_id=item.paper_id,
-                    query=item.query,
+                    query=item.semantic_query,
                     lexical_terms=tuple(item.lexical_terms),
                     evidence_targets=frozenset(),
-                    requirement_ids=tuple(item.requirement_ids),
+                    requirement_ids=(draft.requirement_id,),
                 )
                 for item in draft.searches
             ),
         )
     if isinstance(draft, SearchKnowledgeBaseDraft):
         return SearchKnowledgeBaseAction(
-            query=draft.query,
+            query=draft.semantic_query,
             lexical_terms=tuple(draft.lexical_terms),
-            requirement_ids=tuple(draft.requirement_ids),
+            requirement_ids=(draft.requirement_id,),
         )
     if isinstance(draft, SearchReferencesDraft):
         return SearchReferencesAction(
             paper_id=draft.paper_id,
-            query=draft.query,
+            query=draft.semantic_query,
             lexical_terms=tuple(draft.lexical_terms),
-            requirement_ids=tuple(draft.requirement_ids),
+            requirement_ids=(draft.requirement_id,),
         )
     if isinstance(draft, GetSectionContextDraft):
         return GetSectionContextAction(
             paper_id=draft.paper_id,
             section_id=draft.section_id,
-            requirement_ids=tuple(draft.requirement_ids),
+            requirement_ids=(draft.requirement_id,),
         )
     if isinstance(draft, GetPaperOverviewDraft):
         return GetPaperOverviewAction(
             paper_id=draft.paper_id,
-            requirement_ids=tuple(draft.requirement_ids),
+            requirement_ids=(draft.requirement_id,),
         )
     if isinstance(draft, TryAnswerDraft):
         return TryAnswerAction(draft.reason)
@@ -560,11 +562,20 @@ def _validate_action_references(action: AgentAction, state: DecisionState) -> No
         if not requirement_ids:
             raise ActionDomainValidationError(
                 code="InvalidRequirementBinding",
-                field_path="requirement_ids",
+                field_path="requirement_id",
                 validator_name="requirement_binding_validator",
                 safe_reason="A retrieval Action must bind at least one Requirement.",
                 expected_constraint="at least one active requirement_id",
                 actual_summary="empty=true",
+            )
+        if len(requirement_ids) != 1:
+            raise ActionDomainValidationError(
+                code="InvalidRequirementBinding",
+                field_path="requirement_id",
+                validator_name="requirement_binding_validator",
+                safe_reason="Each retrieval Action must bind exactly one Requirement.",
+                expected_constraint="exactly one active requirement_id",
+                actual_summary=f"count={len(requirement_ids)}",
             )
         unknown = set(requirement_ids) - known_requirement_ids
         if unknown:
@@ -588,6 +599,7 @@ def _validate_action_references(action: AgentAction, state: DecisionState) -> No
                 expected_constraint="an active requirement_id",
                 actual_summary=f"terminal_id={terminal_id}",
             )
+        _validate_search_scope(action, state.plan)
     if isinstance(action, GetSectionContextAction):
         known_sections = {
             (paper_id, section_id)
@@ -645,16 +657,69 @@ def _action_requirement_ids(action: AgentAction) -> tuple[str, ...]:
 
 
 def _requirement_field_path(action: AgentAction, requirement_id: str) -> str:
+    del action, requirement_id
+    return "requirement_id"
+
+
+def _validate_search_scope(action: AgentAction, plan: ResearchPlan) -> None:
+    """Reject only explicit identifiers owned by another Requirement.
+
+    The check is intentionally lexical and narrow.  It prevents an Action
+    bound to R1 from copying a named R2 symbol into its retrieval request,
+    without pretending to judge broader semantic overlap.
+    """
+    requirement_ids = _action_requirement_ids(action)
+    if len(requirement_ids) != 1:
+        return
+    primary_id = requirement_ids[0]
+    foreign = foreign_requirement_terms(
+        (
+            (requirement.requirement_id, requirement.description)
+            for requirement in plan.requirements
+        ),
+        primary_id,
+    )
+    if not foreign:
+        return
+    searches: tuple[tuple[int | None, str, tuple[str, ...]], ...]
     if isinstance(action, SearchPapersAction):
-        for search_index, search in enumerate(action.searches):
-            for requirement_index, value in enumerate(search.requirement_ids):
-                if value == requirement_id:
-                    return f"searches[{search_index}].requirement_ids[{requirement_index}]"
-        return "searches.requirement_ids"
-    for index, value in enumerate(getattr(action, "requirement_ids", ())):
-        if value == requirement_id:
-            return f"requirement_ids[{index}]"
-    return "requirement_ids"
+        searches = tuple(
+            (index, search.query, search.lexical_terms)
+            for index, search in enumerate(action.searches)
+        )
+    elif isinstance(action, (SearchKnowledgeBaseAction, SearchReferencesAction)):
+        searches = ((None, action.query, action.lexical_terms),)
+    else:
+        return
+    for index, semantic_query, lexical_terms in searches:
+        query_hits = tuple(term for term in foreign if term_present(term, semantic_query))
+        lexical_text = "\n".join(lexical_terms)
+        lexical_hits = tuple(term for term in foreign if term_present(term, lexical_text))
+        if not query_hits and not lexical_hits:
+            continue
+        prefix = f"searches[{index}]." if index is not None else ""
+        field = "semantic_query" if query_hits else "lexical_terms"
+        raise ActionDomainValidationError(
+            code="CrossRequirementSearchScope",
+            field_path=f"{prefix}{field}",
+            validator_name="requirement_search_scope_validator",
+            safe_reason=(
+                "Search text contains an explicit identifier owned only by "
+                "another Requirement. Keep this Action scoped to requirement_id."
+            ),
+            expected_constraint=(
+                "semantic_query and lexical_terms contain no explicit identifiers "
+                "owned only by another Requirement"
+            ),
+            actual_summary=json.dumps(
+                {
+                    "requirement_id": primary_id,
+                    "foreign_query_terms": query_hits,
+                    "foreign_lexical_terms": lexical_hits,
+                },
+                ensure_ascii=False,
+            ),
+        )
 
 
 def _decision_validation_diagnostic(
@@ -758,7 +823,7 @@ def _schema_error_code(kind: str, location: tuple[object, ...]) -> str:
         return "UnknownField"
     if kind in {"union_tag_invalid", "union_tag_not_found"} or field_path == "action":
         return "InvalidActionType"
-    if "requirement_ids" in field_path and kind in {
+    if "requirement_id" in field_path and kind in {
         "too_short",
         "list_too_short",
         "string_too_short",
@@ -798,8 +863,8 @@ def _schema_expected_constraint(
         return "non-empty string"
     if "lexical_terms" in field_path and kind in {"too_long", "list_too_long"}:
         return f"at most {detail['ctx']['max_length']} lexical terms"
-    if "requirement_ids" in field_path and kind in {"too_short", "list_too_short"}:
-        return "at least one requirement_id"
+    if "requirement_id" in field_path and kind in {"too_short", "string_too_short"}:
+        return "one active requirement_id"
     if kind.endswith("_type"):
         return "declared field type"
     return "declared field constraint"

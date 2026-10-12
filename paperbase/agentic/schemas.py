@@ -6,7 +6,6 @@ from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter
 
-from paperbase.prompts.agentic_query_understanding import QUERY_UNDERSTANDING_MAX_LEXICAL_HINTS
 from .contracts import CandidateDisposition, EvidenceTarget, Intent, ResearchGoal
 
 
@@ -16,8 +15,6 @@ NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_lengt
 class QueryUnderstandingDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     resolved_query: NonEmptyText
-    semantic_query_en: NonEmptyText | None
-    lexical_keywords_en: list[NonEmptyText] = Field(max_length=QUERY_UNDERSTANDING_MAX_LEXICAL_HINTS)
     intent: Intent
     retrieval_goal: ResearchGoal
     evidence_targets: list[EvidenceTarget] = Field(min_length=1, max_length=8)
@@ -51,47 +48,47 @@ class CandidateSelectionDraft(BaseModel):
 class SearchSpecDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     paper_id: NonEmptyText
-    query: NonEmptyText
+    semantic_query: NonEmptyText
     lexical_terms: list[NonEmptyText] = Field(min_length=1, max_length=5)
-    requirement_ids: list[NonEmptyText] = Field(min_length=1, max_length=1)
 
 
 class SearchPapersDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Literal["search_papers"]
+    requirement_id: NonEmptyText
     searches: list[SearchSpecDraft] = Field(min_length=1, max_length=12)
 
 
 class SearchKnowledgeBaseDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Literal["search_knowledge_base"]
-    query: NonEmptyText
+    requirement_id: NonEmptyText
+    semantic_query: NonEmptyText
     lexical_terms: list[NonEmptyText] = Field(min_length=1, max_length=5)
-    requirement_ids: list[NonEmptyText] = Field(min_length=1, max_length=1)
 
 
 class SearchReferencesDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Literal["search_references"]
+    requirement_id: NonEmptyText
     paper_id: NonEmptyText
-    query: NonEmptyText
+    semantic_query: NonEmptyText
     lexical_terms: list[NonEmptyText] = Field(min_length=1, max_length=5)
-    requirement_ids: list[NonEmptyText] = Field(min_length=1, max_length=1)
 
 
 class GetSectionContextDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Literal["get_section_context"]
+    requirement_id: NonEmptyText
     paper_id: NonEmptyText
     section_id: NonEmptyText
-    requirement_ids: list[NonEmptyText] = Field(min_length=1, max_length=1)
 
 
 class GetPaperOverviewDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Literal["get_paper_overview"]
+    requirement_id: NonEmptyText
     paper_id: NonEmptyText
-    requirement_ids: list[NonEmptyText] = Field(min_length=1, max_length=1)
 
 
 class TryAnswerDraft(BaseModel):
