@@ -6,7 +6,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Mapping, Protocol
 
-EVALUATION_SCHEMA_VERSION = "agentic-grounded-answer-eval-v4"
+EVALUATION_SCHEMA_VERSION = "agentic-grounded-answer-eval-v5"
 
 
 def json_safe(value):

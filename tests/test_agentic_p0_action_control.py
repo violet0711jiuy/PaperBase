@@ -258,7 +258,7 @@ class ActionControlPlaneTests(unittest.TestCase):
         payload = json.loads(_state_prompt(state, []))
 
         # Retrieval state never becomes an accepted answer without Grounded Answer.
-        self.assertIsNone(payload["requirements"][0]["accepted_answer"])
+        self.assertIsNone(payload["requirements"][0]["answer_coverage"])
         self.assertNotIn("local_supports", payload["requirements"][0])
         self.assertNotIn("state_evidence_ids", payload["requirements"][0])
         self.assertNotIn("verified_support_evidence_ids", payload["requirements"][0])

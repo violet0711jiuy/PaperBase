@@ -115,7 +115,7 @@ class DecisionState:
     requirement_states: tuple[RequirementState, ...] = ()
     grounded_answer: GroundedAnswerAttempt | None = None
     # Complete Registry snapshot used by the last Grounded Answer attempt.
-    # GroundedAnswerAttempt.evidence_ids names cited Evidence only, so it cannot
+    # GroundedAnswerAttempt.citations names cited Evidence only, so it cannot
     # determine whether fresh uncited Evidence exists.
     answer_evidence_ids: tuple[str, ...] = ()
     answer_attempt_count: int = 0

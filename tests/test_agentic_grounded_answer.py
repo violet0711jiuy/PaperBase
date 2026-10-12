@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
-from paperbase.agentic.contracts import (
-    EvidenceRecord,
-    EvidenceTarget,
-    ResearchPlan,
-    ResearchRequirement,
-)
-from paperbase.agentic.grounded_answer import LLMGroundedAnswerer
+import pytest
+from paperbase.agentic.contracts import EvidenceRecord, EvidenceTarget, ResearchPlan, ResearchRequirement
+from paperbase.agentic.grounded_answer import LLMGroundedAnswerer, GroundedAnswerAttemptsExhausted, render_grounded_answer
 from paperbase.llm.client import LLMCompletion
 from paperbase.prompts.grounded_answer import GROUNDED_ANSWER_SYSTEM_PROMPT
 from paperbase.retrieval.contracts import EvidenceSourceType, RetrievedEvidence
@@ -16,242 +13,200 @@ from paperbase.retrieval.contracts import EvidenceSourceType, RetrievedEvidence
 
 class QueueClient:
     def __init__(self, *responses):
-        self.responses = list(responses)
-        self.calls = []
+        self.responses, self.calls = list(responses), []
 
     def complete_json_diagnostic(self, **kwargs):
         self.calls.append(kwargs)
-        return LLMCompletion(json.dumps(self.responses.pop(0), ensure_ascii=False))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return LLMCompletion(json.dumps(response, ensure_ascii=False))
 
 
 def plan():
     return ResearchPlan("Explain the method", (
-        ResearchRequirement("R1", "Explain MPIWcapt", frozenset({EvidenceTarget.METHOD})),
-        ResearchRequirement("R2", "Explain C_i", frozenset({EvidenceTarget.METHOD})),
+        ResearchRequirement("R1", "Explain width", frozenset({EvidenceTarget.METHOD})),
+        ResearchRequirement("R2", "Explain coverage", frozenset({EvidenceTarget.METHOD})),
     ))
 
 
-def evidence():
-    raw = RetrievedEvidence(
-        EvidenceSourceType.CONTENT,
-        "P1",
-        ("chunk_0030",),
-        ("chunk_0030", "chunk_0031", "chunk_0032"),
-        "MPIWcapt averages the widths only for intervals that capture the true value. "
-        "This avoids prematurely shrinking failed intervals. "
-        "C_i is the indicator that the ith interval captures the target.",
-        paper_title="Paper",
-        section="Method",
-    )
-    # The Evidence was found for R1.  Grounded Answer is intentionally allowed
-    # to use it for R2 as well.
-    return EvidenceRecord("E1", raw, ("MPIWcapt",), 1, 1, requested_requirement_ids=("R1",))
+def evidence(index=1):
+    raw = RetrievedEvidence(EvidenceSourceType.CONTENT, "P1", (f"chunk_{index}",),
+        (f"chunk_{index}",), "Width is compressed only for captured intervals.\n"
+        "Equation: loss = width + calibration.\nCoverage penalizes outside distance.",
+        paper_title="Paper", section="Method")
+    return EvidenceRecord(f"E{index}", raw, ("width",), 1, index, requested_requirement_ids=("R1",))
+
+
+def item(rid, ids=("E1",), gap=None):
+    return {"requirement_id": rid, "evidence_ids": list(ids), "remaining_gap": gap}
 
 
 def complete_payload():
-    return {"answers": [
-        {
-            "requirement_id": "R1",
-            "answer": "MPIWcapt averages only successfully covering intervals.",
-            "citations": [{"evidence_id": "E1", "source_span_ids": ["S1", "S2"]}],
-            "remaining_gap": None,
-        },
-        {
-            "requirement_id": "R2",
-            "answer": "C_i indicates whether interval i captures the target.",
-            "citations": [{"evidence_id": "E1", "source_span_ids": ["S3"]}],
-            "remaining_gap": None,
-        },
-    ]}
+    return {"answer": "Width and coverage work together through width compression and calibration. [E1]",
+            "citations": ["E1"], "requirements": [item("R1"), item("R2")]}
 
 
-def test_raw_evidence_can_answer_requirements_outside_original_query_binding():
+def run(client, records=None):
+    return LLMGroundedAnswerer(client).answer(question="How do width and coverage work together?",
+                                             plan=plan(), evidence=records if records is not None else (evidence(),))
+
+
+def test_intact_evidence_is_read_once_without_spans_query_binding_or_duplicate_text():
     client = QueueClient(complete_payload())
-    result = LLMGroundedAnswerer(client).answer(
-        question="How does the method work?", plan=plan(), evidence=(evidence(),)
-    )
-    assert result.complete
-    assert [item.requirement_id for item in result.requirements] == ["R1", "R2"]
-    assert result.requirements[1].citations[0].source_excerpt.startswith("C_i is")
-    assert len(client.calls) == 1
+    result = run(client)
     prompt = json.loads(client.calls[0]["user_prompt"])
-    assert "retrieved_by_queries" not in prompt["evidence"][0]
-    assert "requested_requirement_ids" not in prompt["evidence"][0]
-    assert evidence().supporting_queries == ("MPIWcapt",)
+    row = prompt["evidence"][0]
+    assert row["content"] == evidence().evidence.content
+    assert "source_spans" not in row and "retrieved_by_queries" not in row
+    assert "requested_requirement_ids" not in row
+    assert result.complete and result.requirements[1].evidence_ids == ("E1",)
+    assert result.answer == complete_payload()["answer"]
+    assert set(client.calls[0]["json_schema"]["properties"]) == {"answer", "citations", "requirements"}
 
 
-def test_prompt_requires_direct_support_for_relational_completion():
+def test_renderer_preserves_coherent_prose_instead_of_requirement_paragraphs():
+    result = run(QueueClient(complete_payload()))
+    rendered = render_grounded_answer(result, plan())
+    assert rendered.answer == complete_payload()["answer"]
+    assert rendered.requirement_coverage == result.requirements
+    assert not hasattr(rendered, "grounded_requirements")
+
+
+def test_prompt_requires_question_first_and_coverage_of_actual_written_answer():
+    assert "先围绕整个原问题组织一份连贯的 answer" in GROUNDED_ANSWER_SYSTEM_PROMPT
+    assert "正文实际没写的内容仍是缺口" in GROUNDED_ANSWER_SYSTEM_PROMPT
     assert "分别提到输入与输出不能推出二者之间的机制" in GROUNDED_ANSWER_SYSTEM_PROMPT
-    assert "列出模型具有哪些输出，不等于解释这些输出如何计算" in GROUNDED_ANSWER_SYSTEM_PROMPT
 
 
-def test_missing_requirement_is_repaired_against_the_same_raw_evidence():
-    incomplete = {"answers": [complete_payload()["answers"][1]]}
-    client = QueueClient(incomplete, complete_payload())
-    result = LLMGroundedAnswerer(client).answer(
-        question="How does the method work?", plan=plan(), evidence=(evidence(),)
-    )
-    assert result.complete
-    assert len(client.calls) == 2
-    repair_payload = json.loads(client.calls[1]["user_prompt"])
-    assert repair_payload["validation_errors"][0]["code"] == "ANSWER_REQUIREMENT_PARTITION_INVALID"
-    assert repair_payload["evidence"][0]["evidence_id"] == "E1"
-
-
-def test_invalid_requirement_is_repaired_without_regenerating_valid_sibling():
-    invalid = complete_payload()
-    invalid["answers"][0]["citations"] = []
-    repaired_r1 = {"answers": [complete_payload()["answers"][0]]}
-    client = QueueClient(invalid, repaired_r1)
-    result = LLMGroundedAnswerer(client).answer(
-        question="How does the method work?", plan=plan(), evidence=(evidence(),)
-    )
-
-    assert result.complete
-    assert len(client.calls) == 2
-    repair_payload = json.loads(client.calls[1]["user_prompt"])
-    assert [item["requirement_id"] for item in repair_payload["requirements"]] == ["R1"]
-    assert "accepted_answers" not in repair_payload
-
-
-def test_uncited_missing_evidence_prose_is_normalized_to_unanswered_gap():
-    partial = complete_payload()
-    partial["answers"][0] = {
-        "requirement_id": "R1",
-        "answer": "The current evidence does not explain MPIWcapt.",
-        "citations": [],
-        "remaining_gap": "Need the definition and role of MPIWcapt.",
-    }
-    client = QueueClient(partial)
-
-    result = LLMGroundedAnswerer(client).answer(
-        question="How does the method work?", plan=plan(), evidence=(evidence(),)
-    )
-
-    assert result.requirements[0].answer is None
-    assert result.requirements[0].citations == ()
-    assert result.requirements[0].remaining_gap == "Need the definition and role of MPIWcapt."
-    assert result.requirements[1].complete
-    assert len(client.calls) == 1
-
-
-def test_previously_accepted_requirement_is_preserved_without_model_repetition():
-    accepted_payload = {"answers": [complete_payload()["answers"][0]]}
-    accepted = LLMGroundedAnswerer(QueueClient(accepted_payload)).answer(
-        question="How does the method work?",
-        plan=ResearchPlan("Explain MPIWcapt", (plan().requirements[0],)),
-        evidence=(evidence(),),
-    ).requirements[0]
-    client = QueueClient({"answers": [complete_payload()["answers"][1]]})
-
-    result = LLMGroundedAnswerer(client).answer(
-        question="How does the method work?", plan=plan(), evidence=(evidence(),),
-        accepted_answers=(accepted,),
-    )
-
-    prompt = json.loads(client.calls[0]["user_prompt"])
-    assert [item["requirement_id"] for item in prompt["requirements"]] == ["R2"]
-    assert "accepted_answers" not in prompt
-    assert result.requirements == (accepted, result.requirements[1])
-    assert result.complete
-
-
-def test_named_requirement_term_must_appear_in_cited_source_spans():
-    invalid = complete_payload()
-    invalid["answers"][1] = {
-        "requirement_id": "R2",
-        "answer": "C_i is inferred from the interval-width behavior.",
-        "citations": [{"evidence_id": "E1", "source_span_ids": ["S1"]}],
-        "remaining_gap": "The cited span does not explicitly define C_i.",
-    }
-    repaired = {"answers": [{
-        "requirement_id": "R2",
-        "answer": None,
-        "citations": [],
-        "remaining_gap": "Need an explicit definition of C_i.",
-    }]}
-    client = QueueClient(invalid, repaired)
-
-    result = LLMGroundedAnswerer(client).answer(
-        question="How does the method work?", plan=plan(), evidence=(evidence(),)
-    )
-
-    assert result.requirements[0].complete
-    assert result.requirements[1].answer is None
-    repair_payload = json.loads(client.calls[1]["user_prompt"])
-    assert [item["requirement_id"] for item in repair_payload["requirements"]] == ["R2"]
-    assert repair_payload["validation_errors"][0]["code"] == "ANSWER_REQUIREMENT_TERM_UNANCHORED"
-
-
-def test_ordered_non_contiguous_spans_become_separate_exact_citations():
+def test_partial_coverage_keeps_answer_and_exposes_precise_gap():
     payload = complete_payload()
-    payload["answers"][0]["citations"] = [
-        {"evidence_id": "E1", "source_span_ids": ["S1", "S3"]}
-    ]
-    result = LLMGroundedAnswerer(QueueClient(payload)).answer(
-        question="How does the method work?", plan=plan(), evidence=(evidence(),)
-    )
-
-    citations = result.requirements[0].citations
-    assert [item.source_span_ids for item in citations] == [("S1",), ("S3",)]
-    assert citations[0].source_excerpt.startswith("MPIWcapt")
-    assert citations[1].source_excerpt.startswith("C_i")
+    payload["requirements"][1]["remaining_gap"] = "How does calibration change the interval?"
+    result = run(QueueClient(payload))
+    assert result.has_grounded_answer and not result.complete
+    assert result.requirements[1].status == "partial"
+    assert result.open_gaps == (("R2", "How does calibration change the interval?"),)
+    assert render_grounded_answer(result, plan()).partial_answer
 
 
-def test_unanswered_requirement_must_expose_a_gap():
-    partial = complete_payload()
-    partial["answers"][1] = {
-        "requirement_id": "R2", "answer": None, "citations": [],
-        "remaining_gap": "The current Evidence does not define C_i.",
-    }
-    result = LLMGroundedAnswerer(QueueClient(partial)).answer(
-        question="How does the method work?", plan=plan(), evidence=(evidence(),)
-    )
-    assert not result.complete
-    assert result.open_gaps == (("R2", "The current Evidence does not define C_i."),)
+def test_unanswered_coverage_is_not_complete_even_with_other_cited_answer():
+    payload = complete_payload()
+    payload["requirements"][1] = item("R2", (), "Need calibration evidence.")
+    result = run(QueueClient(payload))
+    assert not result.complete and result.requirements[1].status == "unsupported"
 
 
-def test_answerer_receives_every_registered_evidence_record_without_old_cap():
-    records = tuple(
-        EvidenceRecord(
-            f"E{index}",
-            RetrievedEvidence(
-                EvidenceSourceType.CONTENT,
-                "P1",
-                (f"chunk_{index:04d}",),
-                (f"chunk_{index:04d}",),
-                f"Evidence record {index} contains a distinct source fact.",
-                paper_title="Paper",
-                section="Method",
-            ),
-            (f"query {index}",),
-            1,
-            index,
-            requested_requirement_ids=("R1",),
-        )
-        for index in range(1, 13)
-    )
-    one_requirement_plan = ResearchPlan(
-        "Find the decisive fact",
-        (ResearchRequirement(
-            "R1", "Report the fact from record 12",
-            frozenset({EvidenceTarget.METHOD}),
-        ),),
-    )
-    client = QueueClient({"answers": [{
-        "requirement_id": "R1",
-        "answer": "Record 12 contains the decisive fact.",
-        "citations": [{"evidence_id": "E12", "source_span_ids": ["S1"]}],
-        "remaining_gap": None,
-    }]})
+def test_coverage_repair_preserves_prose_and_valid_sibling_requests_only_failed_item():
+    payload = complete_payload()
+    payload["requirements"][1]["evidence_ids"] = ["E99"]
+    client = QueueClient(payload, {"requirements": [item("R2")]})
+    result = run(client)
+    repair = json.loads(client.calls[1]["user_prompt"])
+    assert repair["validated_answer"] == {"answer": payload["answer"], "citations": ["E1"]}
+    assert [r["requirement_id"] for r in repair["requirements"]] == ["R2"]
+    assert set(client.calls[1]["json_schema"]["properties"]) == {"requirements"}
+    assert result.answer == payload["answer"] and result.complete
+    assert [d.success for d in result.llm_diagnostics] == [False, True]
+    diagnostic = result.llm_diagnostics[0].validation_diagnostics[0]
+    assert diagnostic.error_code == "ANSWER_COVERAGE_REFERENCES_INVALID"
+    assert diagnostic.requirement_id == "R2" and diagnostic.recovery_action == "repair_coverage"
+    assert result.llm_diagnostics[0].recovery_action == diagnostic.recovery_action
 
-    result = LLMGroundedAnswerer(client).answer(
-        question="What is the decisive fact?",
-        plan=one_requirement_plan,
-        evidence=records,
-    )
 
-    prompt = json.loads(client.calls[0]["user_prompt"])
-    assert len(prompt["evidence"]) == 12
-    assert prompt["evidence"][-1]["evidence_id"] == "E12"
-    assert result.evidence_ids == ("E12",)
+def test_coverage_repair_cannot_rewrite_validated_prose():
+    payload = complete_payload()
+    payload["requirements"][1]["evidence_ids"] = ["E99"]
+    result = run(QueueClient(payload, {"answer": "Injected answer", "requirements": [item("R2")]}))
+    assert result.answer == payload["answer"]
+    assert result.requirements[0].complete and not result.requirements[1].complete
+
+
+@pytest.mark.parametrize("response", [RuntimeError("transport"), {"requirements": [item("R2", ("E99",))]}])
+def test_failed_metadata_repair_keeps_valid_prose_and_sibling_without_fatal(response):
+    payload = complete_payload()
+    payload["requirements"][1]["evidence_ids"] = ["E99"]
+    result = run(QueueClient(payload, response))
+    assert result.answer == payload["answer"] and result.requirements[0].complete
+    assert not result.requirements[1].complete and result.requirements[1].remaining_gap
+    assert len(result.llm_diagnostics) == 2
+
+
+@pytest.mark.parametrize("partition", [[], [item("R2")], [item("R2"), item("R1")], [item("R1"), item("R1")]])
+def test_missing_extra_reordered_or_duplicate_partition_never_yields_complete(partition):
+    payload = complete_payload()
+    payload["requirements"] = partition
+    client = QueueClient(payload, {"requirements": [item("R1"), item("R2")]})
+    # An empty list fails schema before prose validation and requires full regeneration.
+    if not partition:
+        client.responses[1] = complete_payload()
+    result = run(client)
+    assert result.complete and len(client.calls) == 2
+
+
+@pytest.mark.parametrize("change", [
+    {"citations": ["E99"]}, {"citations": ["E1", "E1"]},
+    {"answer": "Uncited factual prose"}, {"answer": "Fake citation [E99]"},
+    {"answer": None}, {"citations": []},
+])
+def test_invalid_question_wide_references_retry_whole_draft_and_remain_auditable(change):
+    payload = complete_payload()
+    payload.update(change)
+    client = QueueClient(payload, complete_payload())
+    result = run(client)
+    assert result.complete and len(client.calls) == 2
+    assert "validated_answer" not in json.loads(client.calls[1]["user_prompt"])
+    assert [d.success for d in result.llm_diagnostics] == [False, True]
+
+
+def test_exhausted_invalid_prose_does_not_publish_unsupported_text():
+    payload = complete_payload()
+    payload["answer"] = "Invented prose [E99]"
+    with pytest.raises(GroundedAnswerAttemptsExhausted) as caught:
+        run(QueueClient(payload, deepcopy(payload)))
+    assert len(caught.value.diagnostics) == 2
+
+
+def test_uncited_lack_of_evidence_prose_normalizes_to_gaps_without_publishing():
+    payload = {"answer": "The evidence does not explain this.", "citations": [],
+               "requirements": [item("R1", (), "Need width mechanism."), item("R2", (), "Need coverage mechanism.")]}
+    client = QueueClient(payload)
+    result = run(client)
+    assert result.answer is None and result.citations == () and not result.complete
+    assert len(client.calls) == 1
+    assert "does not explain" not in render_grounded_answer(result, plan()).answer
+
+
+def test_no_evidence_exposes_gaps_without_calling_provider():
+    client = QueueClient()
+    result = run(client, ())
+    assert result.answer is None and len(result.open_gaps) == 2
+    assert client.calls == []
+
+
+def test_all_registered_evidence_reaches_answer_without_old_count_cap():
+    records = tuple(evidence(i) for i in range(1, 13))
+    client = QueueClient(complete_payload())
+    result = run(client, records)
+    payload = json.loads(client.calls[0]["user_prompt"])
+    assert len(payload["evidence"]) == 12
+    assert payload["evidence"][-1]["content"] == records[-1].evidence.content
+    assert result.citations == ("E1",)
+
+
+def test_optional_requirements_do_not_create_completion_obligations():
+    from dataclasses import replace
+    one = replace(plan(), requirements=(plan().requirements[0], replace(plan().requirements[1], required=False)))
+    payload = complete_payload()
+    payload["requirements"] = payload["requirements"][:1]
+    result = LLMGroundedAnswerer(QueueClient(payload)).answer(question="Explain width", plan=one, evidence=(evidence(),))
+    assert result.complete and render_grounded_answer(result, one).overall_status == "complete"
+
+
+def test_reference_metadata_uses_reference_identity_not_content_evidence_identity():
+    from dataclasses import replace
+    record = replace(evidence(), evidence_id="REF1")
+    payload = complete_payload()
+    payload["answer"] = "The reference metadata identifies the cited work. [REF1]"
+    payload["citations"] = ["REF1"]
+    payload["requirements"] = [item("R1", ("REF1",)), item("R2", ("REF1",))]
+    assert run(QueueClient(payload), (record,)).citations == ("REF1",)

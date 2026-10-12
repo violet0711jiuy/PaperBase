@@ -1,6 +1,6 @@
 # 评测设计与边界
 
-核对日期：2026-10-11。当前 Agentic 确定性评测契约是 `agentic-grounded-answer-eval-v4`。
+核对日期：2026-10-12。当前 Agentic 确定性评测契约是 `agentic-grounded-answer-eval-v5`，trace v3、public audit v2。整体答案直接读取完整 Evidence，Requirements 只检查覆盖和 gap；span 指标 N/A，不能冒充通过。必要内容复核仍独立于自报 complete 和引用可追溯性。
 
 ## 三层评测
 

@@ -12,7 +12,7 @@ from paperbase.agentic.checkpoint_serde import dump_contract, load_contract
 from paperbase.agentic.contracts import (
     ActionRejectionContext, BudgetUsage, CandidateAssessment, CandidateDisposition,
     CandidateSelection, CorpusScopeSnapshot, GroundedAnswerAttempt, RegistryState,
-    RequirementAnswer, ResearchObservation,
+    RequirementCoverage, ResearchObservation,
     RequirementState, RequirementStatus, RuntimeActionCapabilities,
     RuntimeUnavailablePaperQuery, QueryScope,
 )
@@ -254,10 +254,10 @@ def test_requirement_status_semantics_unchanged_and_empty_domain_stop_only():
 def test_try_answer_is_only_available_for_bounded_same_snapshot_reread():
     s = state()
     evidence_ids = tuple(record.evidence_id for record in s.evidence)
-    partial = GroundedAnswerAttempt((
-        RequirementAnswer("R1", None, remaining_gap="Need a focused reread."),
-        RequirementAnswer("R2", None, remaining_gap="Need a focused reread."),
-    ), ())
+    partial = GroundedAnswerAttempt(None, (), (
+        RequirementCoverage("R1", (), remaining_gap="Need a focused reread."),
+        RequirementCoverage("R2", (), remaining_gap="Need a focused reread."),
+    ))
     fresh = replace(
         s, grounded_answer=partial, answer_evidence_ids=evidence_ids,
         answer_attempt_count=1,

@@ -9,7 +9,6 @@ from hashlib import sha256
 from typing import TypeAlias
 
 from paperbase.llm.client import LLMCallRecord
-from paperbase.generation.answer_coverage import AnswerRequirementCoverage
 from paperbase.retrieval.contracts import PaperSearchSpec, RetrievedEvidence, ToolStatus, ScoreKind, ScoreDirection
 from paperbase.retrieval.evidence_fingerprint import build_evidence_fingerprint
 
@@ -538,55 +537,38 @@ AgentAction: TypeAlias = (
 
 
 @dataclass(frozen=True)
-class GroundedCitation:
-    """A provider-selected source range restored from one raw Evidence item."""
-
-    evidence_id: str
-    source_span_ids: tuple[str, ...]
-    source_excerpt: str
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "evidence_id", _text(self.evidence_id, "evidence_id"))
-        object.__setattr__(self, "source_span_ids", _unique_texts(self.source_span_ids))
-        if not self.source_span_ids:
-            raise ValueError("GroundedCitation requires at least one source span ID.")
-        object.__setattr__(self, "source_excerpt", _text(self.source_excerpt, "source_excerpt"))
-
-
-@dataclass(frozen=True)
-class RequirementAnswer:
-    """One Requirement's answer state; the cited claim and its gap stay together."""
+class RequirementCoverage:
+    """Coverage of the question-wide answer, not a separate paragraph to author."""
 
     requirement_id: str
-    answer: str | None
-    citations: tuple[GroundedCitation, ...] = ()
+    evidence_ids: tuple[str, ...] = ()
     remaining_gap: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "requirement_id", _text(self.requirement_id, "requirement_id"))
-        answer = self.answer.strip() if isinstance(self.answer, str) else None
         gap = self.remaining_gap.strip() if isinstance(self.remaining_gap, str) else None
-        object.__setattr__(self, "answer", answer or None)
         object.__setattr__(self, "remaining_gap", gap or None)
-        object.__setattr__(self, "citations", tuple(self.citations))
-        if self.answer is None:
-            if self.citations or self.remaining_gap is None:
-                raise ValueError("An unanswered Requirement needs an explicit remaining_gap and no citations.")
-        elif not self.citations:
-            raise ValueError("A Requirement answer must cite at least one validated source span.")
+        object.__setattr__(self, "evidence_ids", _unique_texts(self.evidence_ids))
+        if not self.evidence_ids and self.remaining_gap is None:
+            raise ValueError("Uncovered Requirements need an explicit remaining_gap.")
 
     @property
     def complete(self) -> bool:
-        return self.answer is not None and self.remaining_gap is None
+        return bool(self.evidence_ids) and self.remaining_gap is None
+
+    @property
+    def status(self) -> str:
+        return "complete" if self.complete else "partial" if self.evidence_ids else "unsupported"
 
 
 @dataclass(frozen=True)
 class GroundedAnswerAttempt:
-    """The single semantic answer authority for one try_answer operation."""
+    """The single semantic answer authority for one cumulative Evidence pass."""
 
-    requirements: tuple[RequirementAnswer, ...]
-    # Evidence actually cited by Requirement answers, not the whole input pack.
-    evidence_ids: tuple[str, ...]
+    answer: str | None
+    # Actual Evidence-level references in the coherent answer, not the input pack.
+    citations: tuple[str, ...]
+    requirements: tuple[RequirementCoverage, ...]
     llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
     def __post_init__(self) -> None:
@@ -595,15 +577,21 @@ class GroundedAnswerAttempt:
         if len(ids) != len(set(ids)):
             raise ValueError("Grounded answer Requirement IDs must be unique.")
         object.__setattr__(self, "requirements", requirements)
-        object.__setattr__(self, "evidence_ids", _unique_texts(self.evidence_ids))
+        answer = self.answer.strip() if isinstance(self.answer, str) else None
+        object.__setattr__(self, "answer", answer or None)
+        object.__setattr__(self, "citations", _unique_texts(self.citations))
+        if bool(self.answer) != bool(self.citations):
+            raise ValueError("A grounded answer needs Evidence citations; an absent answer cannot cite.")
+        if any(set(item.evidence_ids) - set(self.citations) for item in requirements):
+            raise ValueError("Requirement coverage must reference Evidence cited in the answer.")
 
     @property
     def complete(self) -> bool:
-        return bool(self.requirements) and all(item.complete for item in self.requirements)
+        return self.has_grounded_answer and bool(self.requirements) and all(item.complete for item in self.requirements)
 
     @property
     def has_grounded_answer(self) -> bool:
-        return any(item.answer is not None for item in self.requirements)
+        return self.answer is not None
 
     @property
     def open_gaps(self) -> tuple[tuple[str, str], ...]:
@@ -771,8 +759,7 @@ class ResearchAnswer:
     insufficient_evidence: bool = False
     partial_answer: bool = False
     coverage_note: str | None = None
-    requirement_coverage: tuple[AnswerRequirementCoverage, ...] = ()
-    grounded_requirements: tuple[RequirementAnswer, ...] = ()
+    requirement_coverage: tuple[RequirementCoverage, ...] = ()
     overall_status: str | None = None
     llm_diagnostics: tuple[LLMCallRecord, ...] = ()
 
@@ -783,7 +770,7 @@ class ResearchAnswer:
         # 回答正文可能包含 Markdown 标题和段落，不能像标识符一样折叠全部空白。
         object.__setattr__(self, "answer", self.answer.strip())
         object.__setattr__(self, "citations", _unique_texts(self.citations))
-        object.__setattr__(self, "grounded_requirements", tuple(self.grounded_requirements))
+        object.__setattr__(self, "requirement_coverage", tuple(self.requirement_coverage))
 
 
 @dataclass(frozen=True)

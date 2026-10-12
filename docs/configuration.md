@@ -65,7 +65,7 @@ Agentic Grounded Answerer始终读取 Registry 中全部去重 Evidence，因此
 - `projector_temperature`
 - `decision_view_mode`
 
-不要在新配置、代码或文档中重新使用这些字段。当前 checkpoint authority 是 `paperbase-agentic-grounded-answer-v1`；旧 checkpoint 不恢复执行。
+不要在新配置、代码或文档中重新使用这些字段。当前 checkpoint namespace 是 `paperbase-agentic-grounded-answer-v2`，semantic authority 为 `whole-evidence-grounded-answer-v2`；旧 checkpoint 不恢复执行。此架构变更不修改 Qwen 配置或采样参数。
 
 ## Classic 与检索配置
 

@@ -135,7 +135,7 @@ class AgentGraphState(TypedDict, total=False):
     llm_diagnostics: CheckpointValue
 
 
-_SEMANTIC_AUTHORITY_VERSION = "raw-evidence-grounded-answer-v1"
+_SEMANTIC_AUTHORITY_VERSION = "whole-evidence-grounded-answer-v2"
 
 
 def _require_current_semantic_authority(values: dict[str, object]) -> None:
@@ -144,7 +144,7 @@ def _require_current_semantic_authority(values: dict[str, object]) -> None:
             "Incompatible checkpoint semantic authority: "
             f"{values.get('semantic_authority_version')!r}; expected "
             f"{_SEMANTIC_AUTHORITY_VERSION!r}. Grounded Answer state "
-            "cannot safely reuse legacy Projector checkpoints; start a new research thread "
+            "cannot safely reuse obsolete Projector or per-Requirement answer checkpoints; start a new research thread "
             "instead of resuming it."
         )
 
@@ -1215,30 +1215,14 @@ def _generate_answer(
         )
         return {"answer": dump_contract(answer, ResearchAnswer), "next_node": "finish_run"}
 
-    previous = (load_contract(state["grounded_answer_attempt"], GroundedAnswerAttempt)
-                if state.get("grounded_answer_attempt") is not None else None)
     current_evidence_ids = tuple(record.evidence_id for record in registry.records)
-    previous_evidence_ids = tuple(state.get("answer_evidence_ids", ()))
-    # A validated sibling is stable only while the semantic input snapshot is
-    # unchanged.  Once new Evidence arrives, every required Requirement must
-    # be reassessed: a formerly plausible "complete" answer may have hidden a
-    # retrieval gap that the expanded pool now makes visible.  Requirement-
-    # scoped repair inside LLMGroundedAnswerer still preserves valid siblings.
-    same_evidence_snapshot = (
-        previous is not None
-        and previous_evidence_ids == current_evidence_ids
-    )
-    accepted = (
-        tuple(item for item in previous.requirements if item.complete)
-        if same_evidence_snapshot
-        else ()
-    )
+    # Every semantic pass authors one coherent answer and checks the full plan.
+    # Only metadata repair within that call preserves validated prose/coverage.
     try:
         attempt = runtime.context.grounded_answerer.answer(
             question=context.resolved_query,
             plan=plan,
             evidence=registry.records,
-            accepted_answers=accepted,
         )
         tracker.record_preparation_llm_calls(len(attempt.llm_diagnostics))
         answer = render_grounded_answer(attempt, plan)
@@ -1250,7 +1234,7 @@ def _generate_answer(
             status="fallback",
             answer="回答生成未完成；系统保留了已检索到的原始论文证据，供重新尝试。",
             insufficient_evidence=True,
-            coverage_note="Grounded Answer 未通过结构或 source-span 引用校验。",
+            coverage_note="Grounded Answer 未通过结构或 Evidence 引用校验。",
         )
         return {
             "answer": dump_contract(fallback, ResearchAnswer),
@@ -1268,7 +1252,7 @@ def _generate_answer(
         }
 
     by_id = {record.evidence_id: record for record in registry.records}
-    selected = tuple(by_id[eid] for eid in attempt.evidence_ids if eid in by_id)
+    selected = tuple(by_id[eid] for eid in attempt.citations if eid in by_id)
     terminal_requested = (
         state.get("answer_mode") == "stop_research"
         or state.get("terminal_status") is not None
@@ -1316,9 +1300,7 @@ def _states_from_grounded_answer(
     states = []
     for requirement in plan.requirements:
         answer = by_id.get(requirement.requirement_id)
-        evidence_ids = tuple(dict.fromkeys(
-            citation.evidence_id for citation in answer.citations
-        )) if answer else ()
+        evidence_ids = answer.evidence_ids if answer else ()
         if answer is not None and answer.complete:
             status = RequirementStatus.SATISFIED
         elif terminal:

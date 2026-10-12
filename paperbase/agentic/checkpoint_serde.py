@@ -44,7 +44,7 @@ from .contracts import (
 from .scope_resolver import TrustedWorkspaceScope
 
 
-AGENTIC_CHECKPOINT_NAMESPACE = "paperbase-agentic-grounded-answer-v1"
+AGENTIC_CHECKPOINT_NAMESPACE = "paperbase-agentic-grounded-answer-v2"
 
 
 def checkpoint_thread_id(thread_id: str) -> str:

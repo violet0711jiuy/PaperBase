@@ -7,7 +7,7 @@ import json
 from typing import Mapping
 
 
-AUDIT_SCHEMA_VERSION = "grounded-answer-v1"
+AUDIT_SCHEMA_VERSION = "grounded-answer-v2"
 
 
 @dataclass(frozen=True)
@@ -96,7 +96,6 @@ class EvidenceDigestAudit:
     requested_requirement_ids: tuple[str, ...]
     selected: bool
     cited: bool
-    citation_span_ids: tuple[str, ...] = ()
     source_preview: str = ""
 
 
@@ -148,9 +147,7 @@ class RequirementAudit:
     required: bool
     status: str
     evidence_ids: tuple[str, ...] = ()
-    answer: str | None = None
     remaining_gap: str | None = None
-    citations: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -210,14 +207,9 @@ def build_agentic_audit_snapshot(
     ))
     selected_id_set = set(selected_ids)
     answer = getattr(result, "answer", None)
-    grounded = tuple(getattr(answer, "grounded_requirements", ()) or ())
-    citation_rows: dict[str, list[tuple[str, ...]]] = {}
-    answer_by_requirement = {}
-    for requirement_answer in grounded:
-        answer_by_requirement[requirement_answer.requirement_id] = requirement_answer
-        for citation in requirement_answer.citations:
-            citation_rows.setdefault(citation.evidence_id, []).append(tuple(citation.source_span_ids))
-    cited_ids = tuple(citation_rows)
+    grounded = tuple(getattr(answer, "requirement_coverage", ()) or ())
+    answer_by_requirement = {item.requirement_id: item for item in grounded}
+    cited_ids = tuple(getattr(answer, "citations", ()) or ())
     cited_id_set = set(cited_ids)
 
     for record in (*records, *selected):
@@ -240,12 +232,7 @@ def build_agentic_audit_snapshot(
             required=requirement.required,
             status=_enum_text(getattr(state, "status", "pending")),
             evidence_ids=tuple(getattr(state, "evidence_ids", ()) or ()),
-            answer=getattr(grounded_answer, "answer", None),
             remaining_gap=getattr(grounded_answer, "remaining_gap", None),
-            citations=tuple({
-                "evidence_id": citation.evidence_id,
-                "source_span_ids": tuple(citation.source_span_ids),
-            } for citation in tuple(getattr(grounded_answer, "citations", ()) or ())),
         ))
 
     observations = tuple(getattr(result, "observations", ()) or ())
@@ -264,7 +251,7 @@ def build_agentic_audit_snapshot(
         for item in tuple(getattr(candidate_selection, "assessments", ()) or ())
     )
     evidence = tuple(
-        _evidence_audit(record, titles, selected_id_set, cited_id_set, citation_rows)
+        _evidence_audit(record, titles, selected_id_set, cited_id_set)
         for record in records
     )
     calls = tuple(_llm_call(item) for item in tuple(getattr(result, "llm_diagnostics", ()) or ()))
@@ -279,6 +266,7 @@ def build_agentic_audit_snapshot(
             "requirement_id": item.requirement_id,
             "status": item.status,
             "evidence_ids": tuple(item.evidence_ids),
+            "remaining_gap": item.remaining_gap,
         }
         for item in tuple(getattr(answer, "requirement_coverage", ()) or ())
     )
@@ -379,13 +367,8 @@ def _paper_audit(item, records, titles) -> PaperResearchAudit:
     )
 
 
-def _evidence_audit(record, titles, selected_ids, cited_ids, citation_rows) -> EvidenceDigestAudit:
+def _evidence_audit(record, titles, selected_ids, cited_ids) -> EvidenceDigestAudit:
     source = record.evidence
-    span_ids = tuple(dict.fromkeys(
-        span_id
-        for group in citation_rows.get(record.evidence_id, ())
-        for span_id in group
-    ))
     preview = " ".join(source.content.split())[:500]
     return EvidenceDigestAudit(
         record.evidence_id,
@@ -399,7 +382,6 @@ def _evidence_audit(record, titles, selected_ids, cited_ids, citation_rows) -> E
         tuple(getattr(record, "requested_requirement_ids", ()) or ()),
         record.evidence_id in selected_ids,
         record.evidence_id in cited_ids,
-        span_ids,
         preview,
     )
 
@@ -477,23 +459,22 @@ def _snapshot_from_dict(payload: dict[str, object]) -> AgenticAuditSnapshot:
     values["candidates"] = tuple(CandidateAuditItem(**item) for item in values.get("candidates", ()))
     values["papers"] = tuple(PaperResearchAudit(**_tupleize(item, {"queries_tried", "evidence_ids", "covered_targets", "remaining_targets", "sections_seen"})) for item in values.get("papers", ()))
     values["steps"] = tuple(_step_from_dict(item) for item in values.get("steps", ()))
-    values["evidence"] = tuple(EvidenceDigestAudit(**_tupleize(item, {"source_chunk_ids", "supporting_queries", "requested_requirement_ids", "citation_span_ids"})) for item in values.get("evidence", ()))
+    values["evidence"] = tuple(EvidenceDigestAudit(**_tupleize(item, {"source_chunk_ids", "supporting_queries", "requested_requirement_ids"})) for item in values.get("evidence", ()))
     values["budget"] = BudgetAudit(**_tupleize(values.get("budget", {}), {"queries_per_paper"}))
     values["llm_calls"] = tuple(LLMCallAudit(**item) for item in values.get("llm_calls", ()))
     values["validation_errors"] = tuple(ValidationErrorAudit(**item) for item in values.get("validation_errors", ()))
     requirement_rows = []
     for item in values.get("requirements", ()):
-        row = _tupleize(item, {"evidence_ids", "citations"})
-        row["citations"] = tuple(
-            {**citation, "source_span_ids": tuple(citation.get("source_span_ids", ()))}
-            for citation in row["citations"]
-        )
+        row = _tupleize(item, {"evidence_ids"})
         requirement_rows.append(RequirementAudit(**row))
     values["requirements"] = tuple(requirement_rows)
     values["rejected_actions"] = tuple(RejectedActionAudit(**_tupleize(item, {"requirement_ids", "blockers"})) for item in values.get("rejected_actions", ()))
     for name in ("error_codes", "selected_evidence_ids", "cited_evidence_ids",
                  "answer_input_evidence_ids", "answer_requirement_coverage"):
         values[name] = tuple(values.get(name, ()))
+    values["answer_requirement_coverage"] = tuple(
+        _tupleize(item, {"evidence_ids"}) for item in values["answer_requirement_coverage"]
+    )
     return AgenticAuditSnapshot(**values)
 
 

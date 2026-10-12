@@ -3,8 +3,7 @@ from __future__ import annotations
 from paperbase.agentic.contracts import (
     EvidenceTarget,
     GroundedAnswerAttempt,
-    GroundedCitation,
-    RequirementAnswer,
+    RequirementCoverage,
     ResearchPlan,
     ResearchRequirement,
     ResearchRunStatus,
@@ -71,22 +70,15 @@ class _Answerer:
         self.gap_first = gap_first
         self.calls = []
 
-    def answer(self, *, question, plan, evidence, accepted_answers=()):
-        self.calls.append((tuple(record.evidence_id for record in evidence), tuple(accepted_answers)))
+    def answer(self, *, question, plan, evidence):
+        self.calls.append(tuple(record.evidence_id for record in evidence))
         rid = plan.requirements[0].requirement_id
         if self.gap_first and len(self.calls) == 1:
-            return GroundedAnswerAttempt((
-                RequirementAnswer(rid, None, remaining_gap="Re-read the retrieved method evidence."),
-            ), tuple(record.evidence_id for record in evidence))
-        return GroundedAnswerAttempt((
-            RequirementAnswer(
-                rid, "MPIWcapt averages intervals that capture the target.",
-                (GroundedCitation(
-                    "E1", ("S1",),
-                    "MPIWcapt averages intervals that capture the target.",
-                ),),
-            ),
-        ), tuple(record.evidence_id for record in evidence))
+            return GroundedAnswerAttempt(None, (), (
+                RequirementCoverage(rid, (), "Re-read the retrieved method evidence."),
+            ))
+        return GroundedAnswerAttempt("MPIWcapt averages intervals that capture the target. [E1]",
+                                    ("E1",), (RequirementCoverage(rid, ("E1",)),))
 
 
 def _search(
@@ -121,7 +113,7 @@ def test_graph_runs_raw_evidence_to_grounded_complete_answer() -> None:
     assert [record.evidence_id for record in result.evidence] == ["E1"]
     assert [record.evidence_id for record in result.selected_evidence] == ["E1"]
     assert result.answer is not None and result.answer.overall_status == "complete"
-    assert answerer.calls == [(('E1',), ())]
+    assert answerer.calls == [("E1",)]
     assert result.budget_usage.llm_calls == 1
 
 
@@ -132,7 +124,7 @@ def test_answer_gap_gets_one_same_pool_reread_before_more_retrieval() -> None:
         answerer,
     ).run("Paper One 的方法是什么？", selected_paper_ids=("P1",))
     assert result.status is ResearchRunStatus.COMPLETED
-    assert [call[0] for call in answerer.calls] == [("E1",), ("E1",)]
+    assert answerer.calls == [("E1",), ("E1",)]
     assert len(result.observations) == 1
 
 
@@ -148,7 +140,7 @@ def test_reused_only_tool_result_returns_to_decision_without_automatic_answer() 
     ).run("Paper One 的方法是什么？", selected_paper_ids=("P1",))
 
     assert result.status is ResearchRunStatus.COMPLETED
-    assert [call[0] for call in answerer.calls] == [("E1",), ("E1",)]
+    assert answerer.calls == [("E1",), ("E1",)]
     assert len(result.observations) == 2
     assert result.observations[1].added_evidence_ids == ()
     assert result.observations[1].reused_evidence_ids == ("E1",)
@@ -194,27 +186,15 @@ def test_new_evidence_after_gap_reassesses_all_requirements() -> None:
         def __init__(self):
             self.calls = []
 
-        def answer(self, *, question, plan, evidence, accepted_answers=()):
-            self.calls.append((
-                tuple(record.evidence_id for record in evidence),
-                tuple(item.requirement_id for item in accepted_answers),
-            ))
-            r1 = RequirementAnswer(
-                "R1", "MPIWcapt narrows captured intervals.",
-                (GroundedCitation("E1", ("S1",), "MPIWcapt narrows captured intervals."),),
-            )
+        def answer(self, *, question, plan, evidence):
+            self.calls.append(tuple(record.evidence_id for record in evidence))
+            r1 = RequirementCoverage("R1", ("E1",))
             if len(evidence) == 1:
-                return GroundedAnswerAttempt((
-                    r1, RequirementAnswer("R2", None, remaining_gap="Need C_i coverage evidence."),
-                ), ("E1",))
-            return GroundedAnswerAttempt((
-                r1,
-                RequirementAnswer(
-                    "R2", "C_i penalizes interval misses.",
-                    (GroundedCitation("E2", ("S1",),
-                                      "C_i penalizes misses outside the interval."),),
-                ),
-            ), ("E1", "E2"))
+                return GroundedAnswerAttempt("MPIWcapt narrows captured intervals. [E1]", ("E1",), (
+                    r1, RequirementCoverage("R2", (), "Need C_i coverage evidence."),
+                ))
+            return GroundedAnswerAttempt("Width compression [E1] and miss penalties [E2] work together.",
+                ("E1", "E2"), (r1, RequirementCoverage("R2", ("E2",))))
 
     answerer = Answerer()
     result = _workflow(
@@ -231,12 +211,12 @@ def test_new_evidence_after_gap_reassesses_all_requirements() -> None:
     ).run("Explain width and coverage", selected_paper_ids=("P1",))
 
     assert result.status is ResearchRunStatus.COMPLETED
-    assert answerer.calls == [(('E1',), ()), (('E1', 'E2'), ())]
+    assert answerer.calls == [("E1",), ("E1", "E2")]
     assert result.answer_input_evidence_ids == ("E1", "E2")
     assert result.budget_usage.llm_calls == 2
 
 
-def test_same_evidence_reread_preserves_complete_siblings() -> None:
+def test_same_evidence_reread_reassesses_whole_answer_without_freezing_old_paragraphs() -> None:
     plan = ResearchPlan("Explain width and coverage", (
         ResearchRequirement("R1", "Explain width", frozenset({EvidenceTarget.METHOD})),
         ResearchRequirement("R2", "Explain coverage", frozenset({EvidenceTarget.METHOD})),
@@ -250,30 +230,15 @@ def test_same_evidence_reread_preserves_complete_siblings() -> None:
         def __init__(self):
             self.calls = []
 
-        def answer(self, *, question, plan, evidence, accepted_answers=()):
-            self.calls.append(tuple(item.requirement_id for item in accepted_answers))
-            r1 = RequirementAnswer(
-                "R1", "MPIWcapt narrows captured intervals.",
-                (GroundedCitation(
-                    "E1", ("S1",),
-                    "MPIWcapt averages intervals that capture the target.",
-                ),),
-            )
+        def answer(self, *, question, plan, evidence):
+            self.calls.append(tuple(item.requirement_id for item in plan.requirements))
+            r1 = RequirementCoverage("R1", ("E1",))
             if len(self.calls) == 1:
-                return GroundedAnswerAttempt((
-                    r1,
-                    RequirementAnswer("R2", None, remaining_gap="Need coverage evidence."),
-                ), ("E1",))
-            return GroundedAnswerAttempt((
-                r1,
-                RequirementAnswer(
-                    "R2", "The same evidence describes target capture.",
-                    (GroundedCitation(
-                        "E1", ("S1",),
-                        "MPIWcapt averages intervals that capture the target.",
-                    ),),
-                ),
-            ), ("E1",))
+                return GroundedAnswerAttempt("MPIWcapt narrows captured intervals. [E1]", ("E1",), (
+                    r1, RequirementCoverage("R2", (), "Need coverage evidence."),
+                ))
+            return GroundedAnswerAttempt("The whole method connects width and target capture. [E1]",
+                ("E1",), (r1, RequirementCoverage("R2", ("E1",))))
 
     answerer = Answerer()
     result = _workflow(
@@ -283,16 +248,15 @@ def test_same_evidence_reread_preserves_complete_siblings() -> None:
     ).run("Explain width and coverage", selected_paper_ids=("P1",))
 
     assert result.status is ResearchRunStatus.COMPLETED
-    assert answerer.calls == [(), ("R1",)]
+    assert answerer.calls == [("R1", "R2"), ("R1", "R2")]
 
 
 def test_stop_research_uses_answerer_to_return_explicit_gap() -> None:
     class GapAnswerer:
-        def answer(self, *, question, plan, evidence, accepted_answers=()):
-            return GroundedAnswerAttempt((
-                RequirementAnswer(plan.requirements[0].requirement_id, None,
-                                  remaining_gap="No evidence was retrieved."),
-            ), ())
+        def answer(self, *, question, plan, evidence):
+            return GroundedAnswerAttempt(None, (), (
+                RequirementCoverage(plan.requirements[0].requirement_id, (), "No evidence was retrieved."),
+            ))
 
     result = _workflow((StopResearchAction("nothing useful to search"),), GapAnswerer()).run(
         "Paper One 的方法是什么？", selected_paper_ids=("P1",)
@@ -303,7 +267,7 @@ def test_stop_research_uses_answerer_to_return_explicit_gap() -> None:
 
 def test_failed_answer_attempts_remain_auditable_without_selecting_all_evidence() -> None:
     class InvalidAnswerer:
-        def answer(self, *, question, plan, evidence, accepted_answers=()):
+        def answer(self, *, question, plan, evidence):
             diagnostic = LLMCallRecord(
                 node="grounded_answer", attempt=2, success=False,
                 error_stage="domain_validation", recovery_action="fallback",

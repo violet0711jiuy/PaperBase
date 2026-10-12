@@ -1031,7 +1031,7 @@ class PaperBaseService:
                     "overall_answer_status": getattr(answer, "overall_status", None),
                     "answer_requirement_coverage": [
                         {"requirement_id": item.requirement_id, "status": item.status,
-                         "evidence_ids": list(item.evidence_ids)}
+                         "evidence_ids": list(item.evidence_ids), "remaining_gap": item.remaining_gap}
                         for item in getattr(answer, "requirement_coverage", ())
                     ],
                     "mode": "agentic",

@@ -12,7 +12,7 @@ from .contracts import (
 SEARCH_TOOLS = frozenset({"search_papers", "search_references", "search_knowledge_base"})
 CONTEXT_TOOLS = frozenset({"get_section_context", "get_paper_overview"})
 RETRIEVAL_TOOLS = SEARCH_TOOLS | CONTEXT_TOOLS
-TRACE_SCHEMA_VERSION = "case-trace-grounded-answer-v2"
+TRACE_SCHEMA_VERSION = "case-trace-grounded-answer-v3"
 
 
 def _ids(value):
@@ -29,8 +29,10 @@ def trace_from_artifacts(result: dict, audit: dict, *, legacy_ranked_chunk_ids=N
     answer_input = set(audit.get("answer_input_evidence_ids", ())) if "answer_input_evidence_ids" in audit else None
     cited_by_requirement: dict[str, list[str]] = {}
     for requirement in audit.get("requirements", ()):
-        for citation in requirement.get("citations", ()):
-            cited_by_requirement.setdefault(str(citation.get("evidence_id")), []).append(
+        ids = (requirement.get("evidence_ids", ()) if audit.get("schema_version") == "grounded-answer-v2"
+               else [citation.get("evidence_id") for citation in requirement.get("citations", ())])
+        for evidence_id in ids:
+            cited_by_requirement.setdefault(str(evidence_id), []).append(
                 str(requirement.get("requirement_id"))
             )
     cited_ids = set(audit.get("cited_evidence_ids", ())) if "cited_evidence_ids" in audit else None
@@ -67,8 +69,10 @@ def trace_from_artifacts(result: dict, audit: dict, *, legacy_ranked_chunk_ids=N
         requirements = tuple(RequirementTrace(
             str(row["requirement_id"]), str(row.get("description", "")),
             row.get("required") is True, row.get("status"),
-            bool(row.get("answer")) if "answer" in row else None,
-            _ids(c.get("evidence_id") for c in row.get("citations", ())) if "citations" in row else None,
+            (bool(row.get("evidence_ids")) if audit.get("schema_version") == "grounded-answer-v2"
+             else bool(row.get("answer")) if "answer" in row else None),
+            (_ids(row.get("evidence_ids", ())) if audit.get("schema_version") == "grounded-answer-v2"
+             else _ids(c.get("evidence_id") for c in row.get("citations", ())) if "citations" in row else None),
             row.get("remaining_gap"),
         ) for row in audit["requirements"])
 
@@ -108,18 +112,19 @@ def trace_from_artifacts(result: dict, audit: dict, *, legacy_ranked_chunk_ids=N
 def trace_from_result(result) -> CaseTrace:
     selected_ids = tuple(record.evidence_id for record in result.selected_evidence)
     answer_input_ids = set(result.answer_input_evidence_ids)
-    grounded = tuple(result.answer.grounded_requirements) if result.answer else ()
+    grounded = tuple(result.answer.requirement_coverage) if result.answer else ()
+    cited = tuple(result.answer.citations) if result.answer else ()
     cited_by_evidence: dict[str, list[str]] = {}
     for requirement in grounded:
-        for citation in requirement.citations:
-            cited_by_evidence.setdefault(citation.evidence_id, []).append(requirement.requirement_id)
+        for evidence_id in requirement.evidence_ids:
+            cited_by_evidence.setdefault(evidence_id, []).append(requirement.requirement_id)
     evidence = tuple(EvidenceTrace(
         record.evidence_id, record.evidence.paper_id,
         tuple(record.evidence.source_chunk_ids), tuple(record.evidence.seed_chunk_ids),
         record.evidence_id in answer_input_ids,
         tuple(dict.fromkeys(cited_by_evidence.get(record.evidence_id, ()))),
         record.evidence_id in selected_ids,
-        record.evidence_id in cited_by_evidence,
+        record.evidence_id in cited,
     ) for record in result.evidence)
 
     gaps = []
@@ -153,9 +158,9 @@ def trace_from_result(result) -> CaseTrace:
     requirements = tuple(RequirementTrace(
         requirement.requirement_id, requirement.description, requirement.required,
         states.get(requirement.requirement_id),
-        (answer_by_id[requirement.requirement_id].answer is not None
+        (bool(answer_by_id[requirement.requirement_id].evidence_ids)
          if requirement.requirement_id in answer_by_id else False),
-        (tuple(dict.fromkeys(c.evidence_id for c in answer_by_id[requirement.requirement_id].citations))
+        (answer_by_id[requirement.requirement_id].evidence_ids
          if requirement.requirement_id in answer_by_id else ()),
         (answer_by_id[requirement.requirement_id].remaining_gap
          if requirement.requirement_id in answer_by_id else None),

@@ -14,15 +14,16 @@
 | 原始检索结果 | `RetrievedEvidence` | 保存正文、chunk/window、section/page 和 score 语义 |
 | Evidence 身份与 provenance | `EvidenceRegistry` / `EvidenceRecord` | E#/REF#、检索 query、请求绑定和首次出现；不判断支持 |
 | Answerer 完整输入 | `ResearchRunResult.answer_input_evidence_ids` | 某次答案阶段看到的整个 Registry 快照 |
-| Requirement 答案 | `GroundedAnswerAttempt.requirements` | 有引用的完整/部分 answer 与尚未回答的具体 remaining_gap；citation 合法不代表内容完整 |
-| 引用锚点 | `GroundedCitation` | Evidence ID + source span IDs；excerpt 由程序恢复 |
-| 实际引用集 | `GroundedAnswerAttempt.evidence_ids` | 只含真正被答案引用的 Evidence |
-| accepted answers | Graph state | 同一 Evidence 快照内用于 scoped repair/聚焦重读的合法完成项；新 Evidence 到达后不跨快照冻结 |
+| 整体答案 | `GroundedAnswerAttempt.answer` | 围绕原问题的单份正文，不是 Requirement 段落拼接 |
+| Requirement 覆盖 | `GroundedAnswerAttempt.requirements` | `RequirementCoverage` 的 requirement_id/evidence_ids/remaining_gap；只描述整体正文实际覆盖，complete/status 派生 |
+| 实际引用集 | `GroundedAnswerAttempt.citations` | 正文 [E#]/[REF#] 标记对应的完整 Evidence ID；不声称句子级 span 精度 |
+| 覆盖修复 | Answerer 调用内 | 固定合法整体正文，只修复失败覆盖项；下一次语义重读不继承旧 complete |
 | Requirement 状态 | `RequirementState` | satisfied 只表示已有已校验答案；否则按实际 gap/尝试状态派生 |
-| 对外答案 | `ResearchAnswer` | renderer 从已校验 RequirementAnswer 确定性生成 |
-| 当前 checkpoint | `paperbase-agentic-grounded-answer-v1` | 旧语义版本不迁移执行 |
-| 完成回合审计 | `AgenticAuditSnapshot` | `grounded-answer-v1`，包含 retrieval、answer input、citation 与成本信息 |
+| 对外答案 | `ResearchAnswer` | 保留整体正文，requirement_coverage 是同一覆盖权威的展示投影，仅附 gap 提示 |
+| Decision 覆盖视图 | `requirements[].answer_coverage` | 覆盖状态、Evidence IDs、gap，不重复正文，不是独立 Requirement 答案 |
+| 当前 checkpoint | `paperbase-agentic-grounded-answer-v2` | 旧语义版本不迁移执行 |
+| 完成回合审计 | `AgenticAuditSnapshot` | `grounded-answer-v2`，包含 retrieval、answer input、Evidence 引用与成本信息 |
 
-关键区别：`requested_requirement_ids` 不是支持；`answer_input_evidence_ids` 不是引用；`selected_evidence` 当前等于实际引用 Evidence；span 校验通过只证明引用可追溯，不证明自然语言推断必然正确。
+关键区别：requested_requirement_ids 不是支持；answer_input_evidence_ids 不是引用；selected_evidence 等于整体正文实际引用 Evidence；Evidence 引用合法不代表整窗每个 chunk 已被回答。GroundedCitation、RequirementAnswer、accepted_answers、grounded_requirements 已废除，不以同名不同义字段兼容旧 checkpoint。
 
 实现入口：[retrieval contracts](../paperbase/retrieval/contracts.py)、[canonical requests](../paperbase/retrieval/requests.py)、[Registry](../paperbase/agentic/evidence_registry.py)、[Grounded Answerer](../paperbase/agentic/grounded_answer.py)、[Graph](../paperbase/agentic/graph.py)、[Audit](../paperbase/agentic/audit.py)。

@@ -7,7 +7,8 @@ from paperbase.evaluation.contracts import (
 )
 from paperbase.evaluation.diagnostic import evaluate_agentic_case
 from paperbase.evaluation.run_agentic_e1 import safe_model_summary
-from paperbase.evaluation.trace import trace_from_result
+from paperbase.evaluation.trace import trace_from_result, trace_from_artifacts
+from paperbase.agentic.audit import build_agentic_audit_snapshot
 from test_agentic_audit import _result
 
 
@@ -96,6 +97,26 @@ def test_current_public_result_trace_uses_citation_only_selection() -> None:
     assert trace.evidence[0].presented_to_answerer is True
     assert trace.evidence[0].cited_requirement_ids == ("R1",)
     assert trace.selected_evidence_ids == ("E1",)
+
+
+def test_current_evidence_coverage_audit_roundtrips_to_offline_metrics_without_independent_prose():
+    from paperbase.evaluation.run_agentic_eval import _result_payload
+    result = replace(_result(), answer_input_evidence_ids=("E1",))
+    audit = build_agentic_audit_snapshot(result).to_dict()
+    restored = trace_from_artifacts(_result_payload(result), audit)
+    assert restored.requirements[0].answer_present is True
+    assert restored.requirements[0].citation_evidence_ids == ("E1",)
+    assert restored.evidence[0].cited_requirement_ids == ("R1",)
+
+
+def test_global_citation_is_not_lost_when_coverage_metadata_failed():
+    from paperbase.agentic.contracts import RequirementCoverage
+    result = _result()
+    answer = replace(result.answer, requirement_coverage=(RequirementCoverage("R1", (), "Need coverage reassessment."),))
+    trace = trace_from_result(replace(result, answer=answer))
+    assert trace.evidence[0].cited is True
+    assert trace.evidence[0].cited_requirement_ids == ()
+    assert trace.requirements[0].answer_present is False
 
 
 def test_manifest_model_summary_never_serializes_secrets() -> None:

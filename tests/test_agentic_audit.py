@@ -9,10 +9,9 @@ from paperbase.agentic.contracts import (
     BudgetUsage,
     EvidenceRecord,
     EvidenceTarget,
-    GroundedCitation,
     QueryContext,
     QueryScope,
-    RequirementAnswer,
+    RequirementCoverage,
     RequirementState,
     RequirementStatus,
     ResearchAnswer,
@@ -39,13 +38,10 @@ def _result() -> ResearchRunResult:
         requested_requirement_ids=("R1",),
     )
     requirement = ResearchRequirement("R1", "Explain C_i", frozenset({EvidenceTarget.METHOD}))
-    grounded = RequirementAnswer(
-        "R1", "C_i is a capture indicator.",
-        (GroundedCitation("E1", ("S1",), source.content),),
-    )
+    grounded = RequirementCoverage("R1", ("E1",))
     answer = ResearchAnswer(
         "success", "C_i is a capture indicator. [E1]", ("E1",),
-        grounded_requirements=(grounded,), overall_status="complete",
+        requirement_coverage=(grounded,), overall_status="complete",
     )
     context = QueryContext(
         "Explain C_i", "Explain C_i", "explain", QueryScope.SINGLE_PAPER,
@@ -66,8 +62,9 @@ def test_grounded_audit_round_trips_without_projector_or_hidden_content() -> Non
     assert restored == snapshot
     assert restored.schema_version == AUDIT_SCHEMA_VERSION
     assert restored.selected_evidence_ids == restored.cited_evidence_ids == ("E1",)
-    assert restored.evidence[0].citation_span_ids == ("S1",)
-    assert restored.requirements[0].answer == "C_i is a capture indicator."
+    assert restored.requirements[0].evidence_ids == ("E1",)
+    assert "citation_span_ids" not in snapshot.to_dict()["evidence"][0]
+    assert "answer" not in snapshot.to_dict()["requirements"][0]
     payload = snapshot.to_dict()
     assert "projection_type" not in payload["evidence"][0]
     assert "analysis_status" not in payload["evidence"][0]
@@ -84,4 +81,4 @@ def test_requirement_status_and_grounded_citation_share_one_authority() -> None:
     requirement = snapshot.requirements[0]
     assert requirement.status == "satisfied"
     assert requirement.evidence_ids == ("E1",)
-    assert requirement.citations == ({"evidence_id": "E1", "source_span_ids": ("S1",)},)
+    assert requirement.remaining_gap is None

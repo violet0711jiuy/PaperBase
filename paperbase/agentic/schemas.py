@@ -123,20 +123,21 @@ class AgentDecisionDraft(BaseModel):
 AGENT_DECISION_ADAPTER = TypeAdapter(AgentDecisionDraft)
 
 
-class GroundedCitationDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    evidence_id: NonEmptyText
-    source_span_ids: list[NonEmptyText] = Field(min_length=1, max_length=16)
-
-
-class GroundedRequirementAnswerDraft(BaseModel):
+class RequirementCoverageDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     requirement_id: NonEmptyText
-    answer: NonEmptyText | None
-    citations: list[GroundedCitationDraft] = Field(max_length=8)
+    evidence_ids: list[NonEmptyText]
     remaining_gap: NonEmptyText | None
 
 
 class GroundedAnswerDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    answers: list[GroundedRequirementAnswerDraft] = Field(min_length=1, max_length=8)
+    answer: NonEmptyText | None
+    citations: list[NonEmptyText]
+    requirements: list[RequirementCoverageDraft] = Field(min_length=1, max_length=8)
+
+
+class CoverageRepairDraft(BaseModel):
+    """Repair coverage metadata without regenerating valid question-wide prose."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    requirements: list[RequirementCoverageDraft] = Field(min_length=1, max_length=8)

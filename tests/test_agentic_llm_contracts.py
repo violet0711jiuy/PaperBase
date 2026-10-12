@@ -121,7 +121,8 @@ def test_prompts_expose_try_answer_and_one_grounded_semantic_authority() -> None
     assert "try_answer" in AGENT_DECISION_SYSTEM_PROMPT
     assert "stop_research" in AGENT_DECISION_SYSTEM_PROMPT
     assert "finish" not in AGENT_DECISION_SYSTEM_PROMPT.casefold()
-    assert "source_span_ids" in GROUNDED_ANSWER_SYSTEM_PROMPT
+    assert "Evidence.content" in GROUNDED_ANSWER_SYSTEM_PROMPT
+    assert "source_span_ids" not in GROUNDED_ANSWER_SYSTEM_PROMPT
     assert "Projector" not in GROUNDED_ANSWER_SYSTEM_PROMPT
 
 

@@ -25,10 +25,15 @@ from test_agentic_langgraph import _Database
 
 def item(rid, answer, eid, gap=None):
     return {
-        "requirement_id": rid, "answer": answer,
-        "citations": [{"evidence_id": eid, "source_span_ids": ["S1"]}],
+        "requirement_id": rid, "evidence_ids": [eid],
         "remaining_gap": gap,
     }
+
+
+def draft(answer, coverage):
+    ids = list(dict.fromkeys(eid for item in coverage for eid in item["evidence_ids"]))
+    return {"answer": answer + " " + "".join(f"[{eid}]" for eid in ids),
+            "citations": ids, "requirements": coverage}
 
 
 class PoolExecutor:
@@ -113,19 +118,19 @@ def test_cited_partial_gap_drives_search_then_all_requirements_see_cumulative_po
         descriptions = ("Explain both path roles and how their outputs are computed",)
         first = [item("R1", overview, "E1", gap)]
         final_item = item("R1", overview + " " + mechanism, "E1")
-        final_item["citations"].append({"evidence_id": "E2", "source_span_ids": ["S1"]})
+        final_item["evidence_ids"].append("E2")
         final = [final_item]
 
     result, client, decision, executor, question = run_loop(
-        descriptions, (overview, mechanism), ({"answers": first}, {"answers": final}),
+        descriptions, (overview, mechanism), (draft(overview, first), draft(overview + " " + mechanism, final)),
     )
 
     assert result.status is ResearchRunStatus.COMPLETED
     assert len(decision.states) == len(executor.calls) == len(client.calls) == 2
     intermediate = decision.states[1].grounded_answer
     assert not intermediate.complete
-    assert intermediate.requirements[-1].answer is not None
-    assert intermediate.requirements[-1].citations
+    assert intermediate.answer is not None
+    assert intermediate.requirements[-1].evidence_ids
     assert intermediate.open_gaps == (("R2" if split else "R1", gap),)
     assert executor.calls[1].searches[0].query == gap
     # Both searches target the gap; earlier evidence remains usable by every item.
@@ -151,7 +156,9 @@ def test_fresh_evidence_can_reopen_complete_requirement_and_drive_another_search
         ("The example has two processing paths and reports a forecast.",
          "The two-path diagram is illustrative and uncertainty uses ensemble averaging.",
          "The general construction specifies the required processing paths."),
-        ({"answers": initial}, {"answers": reassessed}, {"answers": final}),
+        (draft("The example has two paths and reports a forecast.", initial),
+         draft("The diagram is illustrative; uncertainty averages the ensemble.", reassessed),
+         draft("The general construction specifies paths and uncertainty averages the ensemble.", final)),
     )
 
     assert result.status is ResearchRunStatus.COMPLETED
@@ -173,11 +180,10 @@ def test_expanded_window_with_new_chunk_reaches_answer_and_closes_gap():
     gap = "What combination rule computes the uncertainty estimate?"
     first = item("R1", overview, "E1", gap)
     final = item("R1", overview + " " + detail, "E2")
-    final["citations"][0]["source_span_ids"] = ["S1", "S2"]
     result, client, decision, _, _ = run_loop(
         ("Explain how uncertainty is computed",),
         (overview, overview + " " + detail),
-        ({"answers": [first]}, {"answers": [final]}),
+        (draft(overview, [first]), draft(overview + " " + detail, [final])),
         chunk_windows=(("c1", "c2", "c3"), ("c1", "c2", "c3", "c4")),
     )
     assert len(decision.states) == 2
@@ -187,4 +193,5 @@ def test_expanded_window_with_new_chunk_reaches_answer_and_closes_gap():
     assert result.answer_input_evidence_ids == ("E1", "E2")
     payload = json.loads(client.calls[-1]["user_prompt"])
     assert payload["evidence"][1]["source_chunk_ids"] == ["c1", "c2", "c3", "c4"]
-    assert detail in result.answer.grounded_requirements[0].citations[0].source_excerpt
+    assert detail in payload["evidence"][1]["content"]
+    assert detail in result.answer.answer

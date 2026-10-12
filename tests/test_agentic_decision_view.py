@@ -5,11 +5,10 @@ from paperbase.agentic.contracts import (
     EvidenceRecord,
     EvidenceTarget,
     GroundedAnswerAttempt,
-    GroundedCitation,
     Intent,
     QueryContext,
     QueryScope,
-    RequirementAnswer,
+    RequirementCoverage,
     ResearchGoal,
     ResearchObservation,
     ResearchPlan,
@@ -68,20 +67,18 @@ def test_decision_view_is_atomic_and_does_not_include_evidence_bodies() -> None:
 
 
 def test_decision_sees_validated_answer_and_only_the_remaining_gap() -> None:
-    attempt = GroundedAnswerAttempt((
-        RequirementAnswer("R1", "MPIWcapt averages captured intervals.", (
-            GroundedCitation("E1", ("S1",), "MPIWcapt evidence."),
-        )),
-        RequirementAnswer("R2", None, remaining_gap="Need the definition of C_i."),
-    ), ("E1",))
+    attempt = GroundedAnswerAttempt("MPIWcapt averages captured intervals. [E1]", ("E1",), (
+        RequirementCoverage("R1", ("E1",)),
+        RequirementCoverage("R2", (), remaining_gap="Need the definition of C_i."),
+    ))
     requirements = build_compact_decision_view(
         _state(evidence=(record(),), grounded_answer=attempt)
     ).to_dict()["requirements"]
-    assert requirements[0]["accepted_answer"] == {
-        "status": "complete", "cited_evidence_ids": ("E1",), "remaining_gap": None,
+    assert requirements[0]["answer_coverage"] == {
+        "status": "complete", "evidence_ids": ("E1",), "remaining_gap": None,
     }
-    assert requirements[1]["accepted_answer"]["remaining_gap"] == "Need the definition of C_i."
-    assert "text" not in requirements[1]["accepted_answer"]
+    assert requirements[1]["answer_coverage"]["remaining_gap"] == "Need the definition of C_i."
+    assert "text" not in requirements[1]["answer_coverage"]
 
 
 def test_compact_retry_limits_reduce_catalog_and_recent_history() -> None:

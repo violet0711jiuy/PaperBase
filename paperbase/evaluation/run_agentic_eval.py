@@ -57,7 +57,7 @@ def _result_payload(result: object) -> dict[str, Any]:
                         "overall_status": result.answer.overall_status,
                         "requirement_coverage": [
                             {"requirement_id": item.requirement_id, "status": item.status,
-                             "evidence_ids": list(item.evidence_ids)}
+                             "evidence_ids": list(item.evidence_ids), "remaining_gap": item.remaining_gap}
                             for item in result.answer.requirement_coverage
                         ]} if result.answer else {}),
             "selected_evidence_ids": [item.evidence_id for item in result.selected_evidence],

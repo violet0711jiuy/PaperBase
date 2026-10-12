@@ -187,12 +187,9 @@ def build_compact_decision_view(
             "preferred_tools": preferred_tools_for_targets(
                 requirement.evidence_targets, capabilities.available_tools
             ),
-            "accepted_answer": ({
-                "status": ("complete" if answer.complete else
-                           "partial" if answer.answer is not None else "gap"),
-                "cited_evidence_ids": tuple(dict.fromkeys(
-                    citation.evidence_id for citation in answer.citations
-                )),
+            "answer_coverage": ({
+                "status": answer.status,
+                "evidence_ids": answer.evidence_ids,
                 "remaining_gap": answer.remaining_gap,
             } if answer is not None else None),
         })

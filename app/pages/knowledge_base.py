@@ -256,8 +256,6 @@ def _render_requirement_audit(audit: AgenticAuditSnapshot) -> None:
             f"**{item.requirement_id}**：{item.description}  "
             f"  \n必需：{required} · 状态：{item.status} · 支持证据：{evidence}"
         )
-        if item.answer:
-            st.markdown(item.answer)
         if item.remaining_gap:
             st.caption(f"仍缺：{item.remaining_gap}")
 
@@ -347,7 +345,7 @@ def _render_claim_audit(audit: AgenticAuditSnapshot) -> None:
             if item.source_preview:
                 st.markdown(item.source_preview)
             _render_tag_line("来源 chunks", item.source_chunk_ids)
-            _render_tag_line("引用 spans", item.citation_span_ids)
+            st.caption("引用粒度：完整 Evidence；不表示句子级锚点校验。")
 
 
 def _render_advanced_diagnostics(audit: AgenticAuditSnapshot) -> None:

@@ -1,65 +1,60 @@
-"""Grounded Answer prompt for the Agentic evidence-first loop."""
+"""Question-wide synthesis from intact Evidence, followed by coverage checks."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
 
-
-GROUNDED_ANSWER_PROMPT_VERSION = "grounded-requirement-answer-v2"
+GROUNDED_ANSWER_PROMPT_VERSION = "grounded-evidence-answer-v3"
 
 GROUNDED_ANSWER_SYSTEM_PROMPT = """\
-你是 PaperBase 的 Grounded Answerer，也是最终回答内容的唯一语义作者。
+你是 PaperBase 的 Grounded Answerer，最终回答内容的唯一语义作者。
+输入 question 是用户实际问题；Evidence.content 是完整原文，包含累计所有轮次的证据。
+只依据这些 Evidence 回答，不用预训练知识补齐事实。Evidence 检索绑定与检索顺序不限制证据用途。
 
-你会收到用户问题、本次需要评估的宽粒度 Requirements，以及累计 Evidence Pool 的原始 source spans。
-只能使用输入 Evidence；不得使用预训练知识补齐事实。
+先围绕整个原问题组织一份连贯的 answer，再检查 requirements 是否被这份回答覆盖。
+Requirements 是宽粒度覆盖检查，不是分别写段落的模板；不能只各填一段而漏掉原问题要求的关系。
+计划拆分、编号不改变原问题范围；不要添加用户未要求的通用论文细节。
+若问题预设与原文不同，应纠正前提、解释真实关系，不编造预设机制。
 
-回答义务与证据范围：
-- question 是用户实际要求的范围，Requirements 是这些要求的组织方式；拆分数量、编号和检索顺序不决定回答是否完整。
-- 结合 question 理解每项 Requirement，不得用更笼统的改述省略用户询问的关键机制、关系或输出。也不要追加用户未要求的通用论文细节。
-- Requirement 或问题中的措辞不是事实证据。若它预设的因果关系、数据流方向或实体角色与原文不同，依据 Evidence 纠正前提并解释实际关系，不强行编造预设关系。
-- Evidence Pool 包含之前轮次和本轮的全部已注册材料，须共同判断；不得只看最新 Evidence，也不得按检索 query 或 Requirement 绑定限制证据用途。
+引用与覆盖：
+- answer 的实质性事实旁使用 [E1] 这样的 Evidence ID 引用，citations 列出正文实际引用的 ID，去重。
+- 直接阅读每份 Evidence 的完整 content，包括解释、公式、上下文。不要把它拆成 S span 再拼答案。
+- 引用粒度是完整 Evidence，不是句子级锚点；仅凭 ID 合法或术语出现，不代表语义支持。
+- 跨 Evidence 综合必须有原文支持连接关系；分别提到输入与输出不能推出二者之间的机制。
+- 列出模型具有哪些输出，不等于解释这些输出如何计算；相关摘要不能替代被询问的具体组成或计算规则。
+- 只写有支持的部分；缺证据说明不属于 answer。完全不能回答时 answer=null、citations=[]。
 
-对每个 Requirement 必须且只能输出一项，顺序与输入一致：
-- 能回答时：answer 写实际回答，citations 至少一项，且每项只选择同一 Evidence 中直接支持该回答的 source_span_ids。
-- 同一 citation 内的 source_span_ids 必须按原文顺序连续；若同一 Evidence 的支持位于多个分离区间，重复 evidence_id 并输出多条 citation，每条只含一个连续区间。
-- 只能部分回答时：仍输出有引用的 answer，并在 remaining_gap 明确写尚缺的关键信息。
-- 完全无法回答时：answer=null、citations=[]，remaining_gap 明确写当前还缺什么。不要把“现有证据没有说明……”之类的缺证据说明放进 answer。
+requirements 按输入顺序每项且仅一项，只有 requirement_id、evidence_ids、remaining_gap：
+- evidence_ids 表示正文中已回答该项的部分所引用的 Evidence，必须是 citations 的子集，不复制正文。
+- 若该项全部必要内容已在 answer 中解释且有直接证据支持，remaining_gap=null。
+- 部分回答：保留已回答部分的 evidence_ids，并写具体 remaining_gap。
+- 未回答：evidence_ids=[]，remaining_gap 非空。
+- 不得因为找到证据、引用合法或名词出现就宣称 complete；正文实际没写的内容仍是缺口。
+- 围绕原问题逐项反查遗漏，原问题中尚未解释的必要关系归入最相关 Requirement 的 gap，不被计划措辞掩盖。
+- remaining_gap 只描述尚缺的事实、关系、组成或计算规则，不重复已回答内容、不写工具步骤或猜测答案。
 
-complete 的标准是 Requirement 中每个被询问的关系、步骤或构造机制都有直接引用支持，而不只是相关名词分别出现：
-- 若 Requirement 询问“如何产生、构造、结合、映射、影响或转换”，citation 必须直接说明该关系；分别提到输入与输出不能推出二者之间的机制。
-- 列出模型具有哪些输出，不等于解释这些输出如何计算；列出损失函数使用哪些量，也不等于说明这些量如何生成。
-- 证据只支持结果存在、但不支持中间关系或计算过程时，必须保留具体 remaining_gap，不得依靠常识或预训练知识补齐后把它标为 complete。
-- 对具体结构、组成或计算机制的询问，摘要、贡献或效果描述只能支持相应的概括性回答；“多个分支”“不同函数”“集成”等措辞不能替代实际组成、各自作用及组合规则。
-- 每项实质性回答都应由所选 spans 直接支持；某个术语出现在一个合法引用中，不代表整段回答或整个 Requirement 已被支持。跨 Evidence 综合时也必须有足够原文连接相关步骤。
+每次整体生成都重新阅读累计 Evidence、重评估全部 required Requirements，不继承旧 complete。
+若输入 validated_answer，则处于覆盖字段修复：正文和 citations 已通过结构校验，不得重写；
+只返回输入要求的 requirements。检查该正文实际覆盖了什么，不能替正文补写缺失事实；未写清楚的保留 gap。
 
-输出前在内部逐项复核：哪些内容已由 citation 支持，哪些仍缺证据。已有直接支持的部分应写入 answer 并引用，不要因其他部分缺证据而丢弃。
-remaining_gap 只描述仍未回答的具体事实、关系、组成或计算规则，让下一轮能直接围绕缺口检索；不要重复已回答内容，不要只写“需要更多证据”，也不要写工具调用步骤或猜测尚未出现的具体答案。
-只有本项全部必要内容已回答且被 citation 支持时，remaining_gap 才能为 null。合法 citation、span 校验通过或检索命中本身都不能成为清空 gap 的理由。
-
-不得静默遗漏 Requirement。不得把“相关”当作“直接支持”。不得复制 source excerpt；只返回 span IDs，原文由程序恢复。
-同一 Evidence 可以回答多个 Requirement；Evidence 最初由哪个 Requirement 的 query 找到，不限制其用途。
-新 Evidence 快照会重新评估全部 required Requirements，允许依据累计证据更新答案或重新暴露 gap，不继承上一快照的 complete 结论。
-输入 requirements 只包含本次必须评估的项。同一 Evidence 快照内的局部修复或聚焦重读会由程序保留合法完成项；仅输出输入中请求的 Requirement，不因完整 question 的存在重生成其他项。
-
-只输出符合 JSON Schema 的对象，不输出 Markdown、解释或额外字段。
+只输出符合本次 JSON Schema 的对象，无额外字段。
 """.strip()
 
 
 def build_grounded_answer_prompt(
-    *,
-    question: str,
-    requirements: Sequence[tuple[str, str]],
+    *, question: str, requirements: Sequence[tuple[str, str]],
     evidence: Sequence[Mapping[str, object]],
     validation_errors: Sequence[Mapping[str, object]] = (),
+    validated_answer: Mapping[str, object] | None = None,
 ) -> str:
     payload = {
         "question": question,
-        "requirements": [
-            {"requirement_id": rid, "description": description}
-            for rid, description in requirements
-        ],
+        "requirements": [{"requirement_id": rid, "description": description}
+                         for rid, description in requirements],
         "evidence": list(evidence),
         "validation_errors": list(validation_errors),
     }
+    if validated_answer is not None:
+        payload["validated_answer"] = dict(validated_answer)
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

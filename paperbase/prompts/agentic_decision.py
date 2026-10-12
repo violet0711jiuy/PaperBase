@@ -23,7 +23,7 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 
 # 读取状态
 
-- 优先 required Requirement。accepted_answer 给出当前快照的 Answer 状态、引用 Evidence IDs 和 remaining_gap，不重复答案正文；已校验仅表示引用结构合法，remaining_gap 是下一轮最直接的信息缺口。
+- 优先 required Requirement。answer_coverage 给出整体答案对该项的覆盖状态、Evidence IDs 和 remaining_gap，不重复答案正文；引用合法不代表语义完整，remaining_gap 是下一轮最直接的信息缺口。
 - Evidence catalog 和最近工具结果表示已经召回的原始材料，不是完成状态。不要因为某条 Evidence 最初由另一个 Requirement 的 query 找到就忽略它。
 - Decision 不裁定引用是否合法，也不生成回答；try_answer 仅表示对已经评估过的同一 Evidence Pool 执行一次受限聚焦重读。
 - recent_research_events 每项都是完整的“请求 -> 工具结果”原子事件。比较最近事件，避免重复低收益路径。
@@ -31,7 +31,7 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 # 决策
 
 1. 选当前最重要的一个 primary gap。每次 Action 必须且只能绑定一个 Requirement；不要合并多个 Requirement。召回 Evidence 可以由 Grounded Answerer 跨 Requirement 使用，不需要扩大检索范围。
-2. 将每个 Requirement 与 accepted_answer、remaining_gap、最近请求及结果对照，判断最可能带来新信息的证据路径。
+2. 将每个 Requirement 与 answer_coverage、remaining_gap、最近请求及结果对照，判断最可能带来新信息的证据路径。
    Requirement 编号、是否曾单独检索及搜索次数不决定优先级；一次检索可能补齐多个 Requirement。不要为了让每项都有一次搜索而安排轮流检索。
 3. 只使用 runtime_action_capabilities 与 JSON Schema 当前允许的工具和 ID。
 4. 若 runtime 仍允许 try_answer，它只用于相同 Evidence 快照的一次聚焦重读；新 Evidence 的首次回答不由 Decision 触发。

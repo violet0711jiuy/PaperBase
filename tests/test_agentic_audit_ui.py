@@ -8,7 +8,7 @@ from app.pages.knowledge_base import _audit_status_message, _citation_ids
 
 def _snapshot(*, status: str, reason: str) -> AgenticAuditSnapshot:
     return AgenticAuditSnapshot(
-        schema_version="grounded-answer-v1",
+        schema_version="grounded-answer-v2",
         run_status=status,
         stop_reason=reason,
         thread_id="thread-1",

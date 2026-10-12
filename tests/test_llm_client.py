@@ -154,15 +154,15 @@ class NonStreamExtractionTests(unittest.TestCase):
         from paperbase.llm.client import _strict_response_schema
         from paperbase.agentic.schemas import GroundedAnswerDraft
         schema=GroundedAnswerDraft.model_json_schema()
-        original_required=list(schema['$defs']['GroundedRequirementAnswerDraft']['required'])
+        original_required=list(schema['$defs']['RequirementCoverageDraft']['required'])
         strict=_strict_response_schema(schema)
         self.assertIn('remaining_gap', original_required)
         self.assertEqual(
-            strict['$defs']['GroundedRequirementAnswerDraft']['required'],
+            strict['$defs']['RequirementCoverageDraft']['required'],
             original_required,
         )
         self.assertEqual(
-            schema['$defs']['GroundedRequirementAnswerDraft']['required'],
+            schema['$defs']['RequirementCoverageDraft']['required'],
             original_required,
         )
 

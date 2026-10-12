@@ -1,8 +1,9 @@
-"""Deterministic, evidence-local source spans for Grounded Answer citations.
+"""Evidence-local span utilities for offline diagnostics and historical replay.
 
 The provider selects opaque span IDs.  Only this module turns those IDs back
 into exact source text, so copied/paraphrased provider excerpts never become
-the provenance authority.
+the provenance authority. Current Agentic Answer uses intact Evidence-level
+citations and does not call this module or expose these spans to its model.
 """
 
 from __future__ import annotations
