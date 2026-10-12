@@ -33,7 +33,7 @@ flowchart TD
 | Canonical compiler + Guard | Action | 唯一 effective request/identity，检查范围、重复与预算 |
 | Tools | canonical request | 原始 `RetrievedEvidence` 与真实执行回执 |
 | Evidence Registry | Tool Evidence | 稳定 E#/REF#、provenance、检索来源和 Requirement 请求绑定；不判断语义支持 |
-| Grounded Answerer | 原问题、全部 Registry Evidence、本次尚需处理的 required Requirements | 每项 `answer + citations` 或 `remaining_gap`；已接受项由程序保留，不要求模型重复输出 |
+| Grounded Answerer | 原问题、全部累计 Registry Evidence、本次需评估的 required Requirements | 每项有引用的完整/部分 answer 与具体 gap；新快照重评全部 required 项，同快照局部修复保留合法兄弟项 |
 | Answer validator | RequirementAnswer draft | 逐 Requirement 校验 citation/span；缺证据说明归一化为 gap，失败项单独修复，合法兄弟项立即保留 |
 | Span validator | citation IDs | 检查 Evidence 存在、span 存在与顺序；有序稀疏选择拆为多个连续 anchor，恢复逐字原文；明确符号/方法名须出现在引用原文中 |
 | Graph | Answer attempt | complete 时结束；有 gap 时反馈 Decision；同一 Evidence 快照最多一次聚焦重读 |
@@ -45,14 +45,17 @@ flowchart TD
 2. Decision 每轮只看完成下一步所需的原子视图，选择搜索、章节扩展、overview、受限聚焦重读或 `stop_research`。
 3. 工具结果经 Evidence Admission 和去重后进入 Registry；原始正文一直保留。Registry 快照只要出现尚未评估的新 Evidence，Graph 就直接进入 Grounded Answer，不让 metadata-only Decision 猜测证据是否充分。
 4. Grounded Answerer读取当前 Registry 的全部 Evidence。不存在旧的最终 Evidence 数量上限；`try_answer` 只保留为相同 Evidence 快照的一次受限聚焦重读。
-5. Answerer 只输出本次仍待处理的 required Requirement：能回答则引用 source spans；不能回答则输出具体 gap。若模型把“现有证据没有说明”写入无引用 answer，程序丢弃该段文字并保留 gap。
+5. Answerer 结合原问题理解宽粒度 Requirements，检查引用是否支持所问的具体事实与机制。已有证据支持的部分保留在 answer；仍未回答的关系、组成或计算规则放进 `remaining_gap`。概括性描述和合法 span 不意味着内容完整。若模型把“现有证据没有说明”写入无引用 answer，程序丢弃该段文字并保留 gap。
 6. 校验和提交以 Requirement 为单位。同一次 Answer 调用的 repair 只包含失败项，合法兄弟项不会因局部结构错误而丢失；相同 Evidence 快照的聚焦重读也可保留已完成项。
-7. Registry 一旦新增 Evidence，上一快照的 complete 只是暂定结果，全部 required Requirements 必须重新评估。这样新证据可以暴露先前被遗漏的关系或构造机制，不能因一次过早 complete 永久冻结。若仍有 gap，Decision 只围绕实际 gap 决定是否继续检索；再无进展则必须检索或停止。
+7. Registry 一旦新增 Evidence，上一快照的 complete 只是暂定结果，全部 required Requirements 必须基于累计证据重新评估，允许重新暴露 gap。若仍有 gap，Decision 聚焦缺失内容选择检索路径；不按 Requirement 编号轮流搜索，也不要求每项都被独立检索过。全部 required 项有引用答案且无 gap 时结束；无合法有效路径或预算耗尽时保留 partial/insufficient。
 
 ## 关键契约
 
 - `ResearchRequirement` 保持宽粒度。`evidence_targets` 是检索意图提示，不是支持结论。
+- 原问题规定回答范围，Requirements 负责组织义务。Planner 不预设未经证据确认的数据流/因果方向；Answerer 根据原文纠正错误前提，不按某种固定 Plan 或检索顺序判断完成。
 - `EvidenceRecord.requested_requirement_ids` 只记录这条 Evidence 因何被找到；Answerer 可以把它用于任何 Requirement。
+- Admission 的窗口重叠去重只能丢弃已被保留窗口完全覆盖的候选；Registry 跨轮仅复用已覆盖的窗口。任何含新 chunk 的扩展窗口须进入累计 Pool 并触发 Answer，新旧 Evidence 保持独立稳定 ID，避免改变既有 span 锚点。
+- Answer 输入只传证据身份、文档位置和原始 source spans，不重复历史检索 query；检索 provenance 继续保留在 Registry 和 audit 中。
 - `GroundedCitation` 保存 `evidence_id`、连续 `source_span_ids` 和程序恢复的 `source_excerpt`。模型若在同一 Evidence 中选择多个有序但分离的区间，程序只按 gap 拆成多条 citation；不扩张、重排或补 span。未知、重复、乱序及过度碎片化仍为硬失败。
 - `RequirementAnswer` 二选一：有 answer 时必须有 citation；无 answer 时必须有非空 `remaining_gap` 且不能带 citation。
 - Requirement 中明确命名的符号或方法标识符（例如 `C_i`、`MLE-QV`、`MPIWcapt`）必须在至少一个引用原文 span 中出现。该规则只验证直接词面锚点，不替代语义 entailment 判断。
@@ -70,7 +73,7 @@ LLM-facing Action 使用单数 `requirement_id`，每次严格绑定一个 activ
 
 ## Checkpoint 与版本
 
-当前 checkpoint semantic authority 是 `paperbase-agentic-grounded-answer-v1`。旧 Projector checkpoint 不迁移、不恢复执行；应新建研究线程。公开审计版本是 `grounded-answer-v1`。Decision wire contract 的评测由独立 v1.5 observer 读取，不回写历史 v1.4 产物。
+当前 checkpoint semantic authority 是 `paperbase-agentic-grounded-answer-v1`。旧 Projector checkpoint 不迁移、不恢复执行；应新建研究线程。公开审计版本是 `grounded-answer-v1`。Answer prompt 版本为 `grounded-requirement-answer-v2`，输出字段和 SDK schema name 保持兼容。独立 observer 读取运行记录，不回写历史产物。
 
 ## 安全边界
 

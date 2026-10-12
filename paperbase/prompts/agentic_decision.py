@@ -13,6 +13,7 @@ _SEARCH_FOCUS = """\
 - Search 的 semantic_query 与 lexical_terms 只能表达所绑定 primary Requirement 的信息需求。即使原问题包含多个术语，也不要把其他 Requirement 的术语顺带塞入本轮检索。
 - Search 必须对应具体 retrieval hypothesis：这次预期找到什么信息。
 - 新增 Evidence 会由 Graph 自动交给 Grounded Answerer；Decision 只处理已经评估后的真实 gap。
+- 有 remaining_gap 时，query 聚焦该 gap 中尚未回答的内容，不重新检索整个宽粒度 Requirement 或已经回答的部分；首次尚无 Answer 时才根据 Requirement 形成检索假设。
 - 上次工具没有新增信息时，只有出现新术语、符号、公式或 section 线索才值得继续同一路径；否则换工具、换 Requirement、执行允许的一次聚焦重读或 stop_research。仅改写同义词不算新策略。
 """
 
@@ -22,7 +23,7 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 
 # 读取状态
 
-- 优先 required Requirement。accepted_answer 只给出已校验状态、引用 Evidence IDs 和 remaining_gap，不重复答案正文；remaining_gap 是下一轮最直接的信息缺口。
+- 优先 required Requirement。accepted_answer 给出当前快照的 Answer 状态、引用 Evidence IDs 和 remaining_gap，不重复答案正文；已校验仅表示引用结构合法，remaining_gap 是下一轮最直接的信息缺口。
 - Evidence catalog 和最近工具结果表示已经召回的原始材料，不是完成状态。不要因为某条 Evidence 最初由另一个 Requirement 的 query 找到就忽略它。
 - Decision 不裁定引用是否合法，也不生成回答；try_answer 仅表示对已经评估过的同一 Evidence Pool 执行一次受限聚焦重读。
 - recent_research_events 每项都是完整的“请求 -> 工具结果”原子事件。比较最近事件，避免重复低收益路径。
@@ -31,6 +32,7 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 
 1. 选当前最重要的一个 primary gap。每次 Action 必须且只能绑定一个 Requirement；不要合并多个 Requirement。召回 Evidence 可以由 Grounded Answerer 跨 Requirement 使用，不需要扩大检索范围。
 2. 将每个 Requirement 与 accepted_answer、remaining_gap、最近请求及结果对照，判断最可能带来新信息的证据路径。
+   Requirement 编号、是否曾单独检索及搜索次数不决定优先级；一次检索可能补齐多个 Requirement。不要为了让每项都有一次搜索而安排轮流检索。
 3. 只使用 runtime_action_capabilities 与 JSON Schema 当前允许的工具和 ID。
 4. 若 runtime 仍允许 try_answer，它只用于相同 Evidence 快照的一次聚焦重读；新 Evidence 的首次回答不由 Decision 触发。
 5. 已无新的、有价值且合法的检索路径时选择 stop_research；系统仍会用现有 Evidence 生成 partial/insufficient 结果。
@@ -56,7 +58,7 @@ AGENT_DECISION_SYSTEM_PROMPT = """\
 
 若有 action_recovery 或 previous_validation_errors，遵守拒绝原因，不原样重复动作。DuplicateAction / DuplicatePaperQuery 必须改变研究假设、证据路径或工具，而不是只改空格或措辞。
 
-论文实体、方法名、数据集、baseline、公式和符号只能来自问题、Requirement、已暴露 Evidence、entity_hints、研究历史或 metadata；不得凭自身知识补造。
+论文实体、方法名、数据集、baseline、公式和符号只能来自 Requirement、remaining_gap、研究历史或已暴露的证据元数据；不得凭自身知识补造。
 
 # 输出
 

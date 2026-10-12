@@ -74,6 +74,10 @@ def test_raw_evidence_can_answer_requirements_outside_original_query_binding():
     assert [item.requirement_id for item in result.requirements] == ["R1", "R2"]
     assert result.requirements[1].citations[0].source_excerpt.startswith("C_i is")
     assert len(client.calls) == 1
+    prompt = json.loads(client.calls[0]["user_prompt"])
+    assert "retrieved_by_queries" not in prompt["evidence"][0]
+    assert "requested_requirement_ids" not in prompt["evidence"][0]
+    assert evidence().supporting_queries == ("MPIWcapt",)
 
 
 def test_prompt_requires_direct_support_for_relational_completion():

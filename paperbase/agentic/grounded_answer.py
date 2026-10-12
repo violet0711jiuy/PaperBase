@@ -325,7 +325,6 @@ def _evidence_payload(record: EvidenceRecord) -> dict[str, object]:
         "section": source.section,
         "pages": [source.page_start, source.page_end],
         "source_chunk_ids": list(source.source_chunk_ids),
-        "retrieved_by_queries": list(record.supporting_queries),
         "source_spans": source_spans_payload(source.content),
     }
 

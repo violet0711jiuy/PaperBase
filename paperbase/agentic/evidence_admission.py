@@ -146,6 +146,7 @@ class EvidenceAdmissionFilter:
                     for kept in by_fingerprint.values()
                     if _source_overlap(candidate, kept)
                     >= self._source_overlap_threshold
+                    and set(candidate.source_chunk_ids) <= set(kept.source_chunk_ids)
                 ),
                 None,
             )

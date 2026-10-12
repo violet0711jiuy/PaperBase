@@ -62,7 +62,7 @@ def test_registry_keeps_raw_evidence_and_merges_retrieval_provenance() -> None:
     assert record.requested_evidence_targets == frozenset({EvidenceTarget.METHOD, EvidenceTarget.RESULT})
 
 
-def test_registry_reuses_overlapping_expansion_windows_without_semantic_judgment() -> None:
+def test_registry_preserves_new_chunks_in_overlapping_expansion_windows() -> None:
     registry = EvidenceRegistry()
     registry.register_tool_result(
         _result("first", ("c1", "c2", "c3")),
@@ -72,5 +72,25 @@ def test_registry_reuses_overlapping_expansion_windows_without_semantic_judgment
         _result("expanded", ("c1", "c2", "c3", "c4")),
         action=_action("expanded", "R1"), iteration=2, plan=_plan(),
     )
+    assert delta.added_ids == ("E2",)
+    assert delta.reused_ids == ()
+    assert len(registry.records) == 2
+    assert registry.get("E1").evidence.source_chunk_ids == ("c1", "c2", "c3")
+    assert registry.get("E2").evidence.source_chunk_ids == ("c1", "c2", "c3", "c4")
+
+
+def test_registry_reuses_fully_covered_window_and_keeps_existing_spans_stable() -> None:
+    registry = EvidenceRegistry()
+    registry.register_tool_result(
+        _result("first", ("c1", "c2", "c3", "c4")),
+        action=_action("first", "R1"), iteration=1, plan=_plan(),
+    )
+    original = registry.get("E1").evidence
+    delta = registry.register_tool_result(
+        _result("subset", ("c2", "c3")),
+        action=_action("subset", "R2"), iteration=2, plan=_plan(),
+    )
+    assert delta.added_ids == ()
     assert delta.reused_ids == ("E1",)
-    assert len(registry.records) == 1
+    assert registry.get("E1").evidence == original
+    assert registry.get("E1").requested_requirement_ids == ("R1", "R2")

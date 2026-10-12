@@ -22,7 +22,7 @@ from .requirement_targets import targets_for_requirement_ids, requirement_target
 
 
 class EvidenceRegistry:
-    """按来源身份精确去重，并跨轮复用高度重叠的扩展窗口。"""
+    """按来源身份去重，只跨轮复用已完全覆盖的扩展窗口。"""
 
     def __init__(self, state: RegistryState | None = None) -> None:
         snapshot = state or RegistryState()
@@ -196,7 +196,7 @@ def _same_evidence_window(left: object, right: object) -> bool:
     right_ids = set(right.source_chunk_ids)
     if not left_ids or not right_ids:
         return False
-    intersection = len(left_ids & right_ids)
-    containment = intersection / min(len(left_ids), len(right_ids))
-    jaccard = intersection / len(left_ids | right_ids)
-    return containment >= 0.8 and jaccard >= 0.5
+    # Reuse must not hide newly retrieved chunks. Keep existing records and
+    # their citation spans immutable; an expanded or shifted window containing
+    # any new chunk gets its own Evidence ID and triggers Answer reassessment.
+    return right_ids <= left_ids

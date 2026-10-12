@@ -114,6 +114,20 @@ class EvidenceAdmissionTests(unittest.TestCase):
             ("result_table_rescued",),
         )
 
+    def test_overlap_does_not_discard_lower_ranked_candidate_with_new_chunks(self) -> None:
+        stronger = _evidence(("c1", "c2", "c3"), "overview", 0.8)
+        expanded = _evidence(("c1", "c2", "c3", "c4"), "overview plus mechanism", 0.3, rank=2)
+        shifted = _evidence(("c2", "c3", "c4"), "additional mechanism", 0.2, rank=3)
+        admission = EvidenceAdmissionFilter(source_overlap_threshold=0.5).apply(
+            _result((stronger, expanded, shifted))
+        )
+        kept = admission.tool_result.payload.paper_results[0].evidence_candidates
+        self.assertEqual(kept, (stronger, expanded))
+        self.assertEqual(
+            set().union(*(set(item.source_chunk_ids) for item in kept)),
+            {"c1", "c2", "c3", "c4"},
+        )
+
     def test_table_for_non_result_target_is_kept_but_deprioritized(self) -> None:
         table = _evidence(
             ("table-1",),
