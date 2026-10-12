@@ -19,10 +19,18 @@ REQUEST_ERROR_STAGES = frozenset(
 )
 
 
+def request_is_nonretryable(error: Exception) -> bool:
+    """Request rejection cannot be repaired by regenerating model output."""
+    return isinstance(error, LLMRequestError) and (
+        error.error_stage == "invalid_request"
+        or error.status_code in {400, 401, 403, 404, 405, 413, 415, 422}
+    )
+
+
 def classify_llm_error(error: Exception) -> str:
     """把外部/语法/Schema/领域失败分开，避免上层重复同一种请求。"""
     if isinstance(error, LLMRequestError):
-        return error.error_stage
+        return "invalid_request" if request_is_nonretryable(error) else error.error_stage
     if isinstance(error, JSONDecodeError):
         return "invalid_json"
     if isinstance(error, ValidationError):
@@ -38,7 +46,7 @@ def classify_llm_error(error: Exception) -> str:
 
 def recovery_action_for(error: Exception, *, can_retry: bool) -> str | None:
     """根据错误类别决定下一次输入如何变化；无重试额度时明确停止。"""
-    if not can_retry:
+    if not can_retry or request_is_nonretryable(error):
         return None
     stage = classify_llm_error(error)
     if (
@@ -111,12 +119,27 @@ def failure_record(
     validation_diagnostics: tuple[ValidationDiagnostic, ...] = (),
 ) -> LLMCallRecord:
     """从异常或已返回 completion 中提取安全统计，不保存错误正文。"""
+    can_retry = can_retry and not request_is_nonretryable(error)
+    recovery = recovery_action_for(error, can_retry=can_retry)
     if isinstance(error, LLMRequestError):
         finish_reason = error.finish_reason
         prompt_tokens = error.prompt_tokens
         completion_tokens = error.completion_tokens
         content_chars = error.content_chars
         reasoning_chars = error.reasoning_chars
+        if error.status_code is not None or error.error_code or error.field_path:
+            summary = f"HTTP {error.status_code}" if error.status_code is not None else "Provider request rejected"
+            if error.schema_keywords:
+                summary += "; schema_keywords=" + ",".join(error.schema_keywords)
+            validation_diagnostics = (*validation_diagnostics, ValidationDiagnostic(
+                node=node, attempt=attempt, error_stage=classify_llm_error(error),
+                error_code=error.error_code or "ProviderRequestRejected",
+                field_path=error.field_path or "request",
+                validator_name="provider_request_validator",
+                safe_reason="Provider rejected the request; no model output was available to repair.",
+                expected_constraint="Request parameters must be accepted by the configured provider.",
+                actual_summary=summary, recovery_action=recovery,
+            ))
     else:
         finish_reason = completion.finish_reason if completion else None
         prompt_tokens = completion.prompt_tokens if completion else None
@@ -133,7 +156,7 @@ def failure_record(
         content_chars=content_chars,
         reasoning_chars=reasoning_chars,
         error_stage=classify_llm_error(error),
-        recovery_action=recovery_action_for(error, can_retry=can_retry),
+        recovery_action=recovery,
         validation_summary=safe_validation_summary(error),
         validation_diagnostics=validation_diagnostics,
     )

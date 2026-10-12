@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -29,6 +30,10 @@ class LLMRequestError(RuntimeError):
         completion_tokens: int | None = None,
         content_chars: int = 0,
         reasoning_chars: int = 0,
+        status_code: int | None = None,
+        error_code: str | None = None,
+        field_path: str | None = None,
+        schema_keywords: tuple[str, ...] = (),
     ) -> None:
         super().__init__(message)
         self.error_stage = error_stage
@@ -37,6 +42,11 @@ class LLMRequestError(RuntimeError):
         self.completion_tokens = completion_tokens
         self.content_chars = content_chars
         self.reasoning_chars = reasoning_chars
+        # Operational metadata only; never retain arbitrary provider text.
+        self.status_code = status_code
+        self.error_code = error_code
+        self.field_path = field_path
+        self.schema_keywords = tuple(schema_keywords)
 
 
 @dataclass(frozen=True)
@@ -300,7 +310,7 @@ def structured_client_view(
 def _strict_response_schema(schema: dict[str, Any]) -> dict[str, Any]:
     """Materialize defaulted fields on the wire, without changing DTO semantics.
 
-    Native strict decoding must also request support_candidates/coverage fields
+    Native strict decoding must also request defaulted coverage fields
     that Pydantic accepts as omitted defaults. Nullable values remain nullable.
     """
     def visit(value):
@@ -467,10 +477,7 @@ class OpenAICompatibleChatClient:
             raise
         except Exception as error:
             # 不把底层异常文本向上原样传播，避免某些 SDK/代理错误中意外包含请求凭证。
-            raise LLMRequestError(
-                f"LLM request failed: {type(error).__name__}",
-                error_stage=_request_error_stage(error),
-            ) from error
+            raise _provider_request_error(error, "LLM request failed") from error
         return content.strip()
 
     def complete_json(
@@ -555,10 +562,7 @@ class OpenAICompatibleChatClient:
         except LLMRequestError:
             raise
         except Exception as error:
-            raise LLMRequestError(
-                f"LLM structured request failed: {type(error).__name__}",
-                error_stage=_request_error_stage(error),
-            ) from error
+            raise _provider_request_error(error, "LLM structured request failed") from error
         return completion
 
 
@@ -721,16 +725,15 @@ class ZhipuAIChatClient:
         except LLMRequestError:
             raise
         except Exception as error:
-            raise LLMRequestError(
-                f"ZhipuAI request failed: {type(error).__name__}",
-                error_stage=_request_error_stage(error),
-            ) from error
+            raise _provider_request_error(error, "ZhipuAI request failed") from error
 
 
 def _request_error_stage(error: Exception) -> str:
     """只记录安全错误类别，不持久化供应商响应正文或凭证。"""
     name = type(error).__name__.casefold()
     status_code = getattr(error, "status_code", None)
+    if status_code in {400, 401, 403, 404, 405, 413, 415, 422}:
+        return "invalid_request"
     if "timeout" in name:
         return "timeout"
     if status_code == 429 or any(
@@ -742,6 +745,61 @@ def _request_error_stage(error: Exception) -> str:
     if any(value in name for value in ("connection", "connect", "network")):
         return "connection_error"
     return "request_error"
+
+
+_SAFE_PROVIDER_CODES = frozenset({
+    "invalid_parameter_error", "invalid_request_error", "invalid_json_schema",
+    "unsupported_schema", "unsupported_parameter", "context_length_exceeded",
+    "authentication_error", "invalid_api_key", "permission_denied",
+    "rate_limit_exceeded", "insufficient_quota", "server_error", "internal_error",
+})
+_SAFE_REQUEST_FIELDS = (
+    "response_format.json_schema.schema", "response_format.json_schema",
+    "response_format", "max_tokens", "temperature", "top_p", "presence_penalty",
+    "model", "messages", "stream", "enable_thinking", "top_k", "min_p", "repetition_penalty",
+)
+_SAFE_SCHEMA_KEYWORDS = (
+    "uniqueItems", "contains", "minContains", "maxContains", "minItems", "maxItems",
+    "minLength", "maxLength", "pattern", "format", "allOf", "oneOf", "anyOf",
+    "additionalProperties", "$ref",
+)
+
+
+def _provider_request_error(error: Exception, context: str) -> LLMRequestError:
+    """Project SDK errors to finite, allowlisted facts, not redacted raw prose.
+
+    Even a credential-looking code or a message echoing a paper/prompt cannot
+    become an audit field. Unknown codes/paths are omitted, never copied.
+    """
+    body = getattr(error, "body", None)
+    detail = body.get("error", body) if isinstance(body, dict) else {}
+    detail = detail if isinstance(detail, dict) else {}
+    code = detail.get("code", getattr(error, "code", None))
+    code = code if isinstance(code, str) and code in _SAFE_PROVIDER_CODES else None
+    param = detail.get("param", getattr(error, "param", None))
+    param = param if isinstance(param, str) and param in _SAFE_REQUEST_FIELDS else None
+    message = detail.get("message") or getattr(error, "message", None)
+    message = message if isinstance(message, str) else ""
+    if param is None:
+        param = next((
+            field for field in _SAFE_REQUEST_FIELDS
+            if re.search(r"(?<![\w.])" + re.escape(field) + r"(?![\w.])", message)
+        ), None)
+    # Only extract constraint names when the error actually identifies a schema
+    # rejection. This is diagnostic context, not the entire error body.
+    keywords = ()
+    if param and param.startswith("response_format"):
+        keywords = tuple(
+            key for key in _SAFE_SCHEMA_KEYWORDS
+            if re.search(r"(?<![\w.])" + re.escape(key) + r"(?![\w.])", message)
+        )
+    status = getattr(error, "status_code", None)
+    status = status if type(status) is int and 100 <= status <= 599 else None
+    return LLMRequestError(
+        f"{context}: {type(error).__name__}", error_stage=_request_error_stage(error),
+        status_code=status, error_code=code, field_path=param,
+        schema_keywords=keywords,
+    )
 
 
 def _extract_non_stream_content(response: Any) -> str:

@@ -12,7 +12,7 @@ from paperbase.llm.client import (
     ChatCompletionClient, LLMCallRecord, LLMCompletion, ValidationDiagnostic,
     complete_json_with_diagnostics, structured_client_view,
 )
-from paperbase.llm.diagnostics import classify_llm_error, failure_record, success_record
+from paperbase.llm.diagnostics import classify_llm_error, failure_record, success_record, request_is_nonretryable
 from paperbase.prompts.grounded_answer import (
     GROUNDED_ANSWER_PROMPT_VERSION, GROUNDED_ANSWER_SYSTEM_PROMPT,
     build_grounded_answer_prompt,
@@ -130,9 +130,10 @@ class LLMGroundedAnswerer:
                 diagnostics.append(success_record(node="grounded_answer", attempt=attempt, completion=completion))
                 return GroundedAnswerAttempt(body, citations, tuple(coverage[rid] for rid, _ in requirements), tuple(diagnostics))
             except Exception as error:
-                retry = attempt < self._max_attempts
-                errors = current_errors or [_safe_error(error)]
+                retry = attempt < self._max_attempts and not request_is_nonretryable(error)
                 stage = classify_llm_error(error)
+                if stage in {"invalid_json", "schema_validation", "domain_validation"}:
+                    errors = current_errors or [_safe_error(error)]
                 validation = tuple(ValidationDiagnostic(
                     node="grounded_answer", attempt=attempt, error_stage=stage,
                     error_code=str(row["code"]), field_path=str(row["field_path"]),
@@ -142,12 +143,11 @@ class LLMGroundedAnswerer:
                     recovery_action=("repair_coverage" if body_validated else "regenerate_answer") if retry else None,
                     requirement_id=row.get("requirement_id"),
                 ) for row in errors) if stage in {"invalid_json", "schema_validation", "domain_validation"} else ()
-                recovery = ("repair_coverage" if body_validated else "regenerate_answer") if retry else None
-                diagnostics.append(replace(
-                    failure_record(node="grounded_answer", attempt=attempt, error=error,
-                                   completion=completion, can_retry=retry, validation_diagnostics=validation),
-                    recovery_action=recovery,
-                ))
+                record = failure_record(node="grounded_answer", attempt=attempt, error=error,
+                                        completion=completion, can_retry=retry, validation_diagnostics=validation)
+                if stage in {"invalid_json", "schema_validation", "domain_validation", "empty_content"}:
+                    record = replace(record, recovery_action=("repair_coverage" if body_validated else "regenerate_answer") if retry else None)
+                diagnostics.append(record)
                 if not retry:
                     if not body_validated:
                         raise GroundedAnswerAttemptsExhausted(error, diagnostics) from error
@@ -200,11 +200,13 @@ def _response_schema(requirements, pack: EvidencePack, *, repair=False, citation
     definition = schema["$defs"]["RequirementCoverageDraft"]["properties"]
     definition["requirement_id"] = {"type": "string", "enum": ids}
     allowed = list(citations if repair else pack.evidence_ids)
-    definition["evidence_ids"].update(uniqueItems=True, maxItems=len(allowed))
+    # The provider rejects uniqueItems on arrays; duplicate IDs are still
+    # rejected by _validate_body/_validate_coverage, not silently normalized.
+    definition["evidence_ids"].update(maxItems=len(allowed))
     if allowed:
         definition["evidence_ids"]["items"] = {"type": "string", "enum": allowed}
     if not repair:
-        schema["properties"]["citations"].update(uniqueItems=True, maxItems=len(pack.records),
+        schema["properties"]["citations"].update(maxItems=len(pack.records),
             items={"type": "string", "enum": list(pack.evidence_ids)})
     return schema
 

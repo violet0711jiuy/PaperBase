@@ -44,6 +44,8 @@ gold chunks
 
 本地校验要求引用属于实际输入 Evidence、ID 去重、正文 [E#]/[REF#] 标记与 citations 一致、覆盖引用是正文引用子集。新输入必须逐份 content 与 Registry 原文完全一致且没有重复 source_spans 文本。正文引用失败重试整体；覆盖字段失败只修复失败项，不重写合法正文，不把元数据修复当作新增答案内容。
 
+`invalid_request` 表示供应商拒绝请求，不是模型 JSON/领域校验失败；没有返回模型输出时引用与必要内容为未验证。Observer 的 SDK/audit 对齐应把该阶段计入 transport failure，而不是返回了答案但业务拒绝；零响应对应零可捕获输出，不得将空捕获文件误报为漏捕获。安全 provider 诊断使用现有 validation_diagnostics 字段，不把它计作模型修复成功。
+
 Span validation 为 N/A，不计为通过，也不与旧 span 成功率比较。被引 Evidence 包含一个 gold chunk，不代表那个 chunk 的必要事实已经写入答案；仍需独立 content_review。不得只因 whole-Evidence 引用扩宽了 gold_cited 集就宣称质量提升。
 
 ## 解释边界

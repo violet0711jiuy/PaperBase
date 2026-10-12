@@ -23,7 +23,7 @@ from .contracts import (
     CorpusScopeSnapshot,
     LLMCallRecord,
 )
-from paperbase.llm.diagnostics import failure_record, repair_hint, success_record
+from paperbase.llm.diagnostics import failure_record, repair_hint, success_record, request_is_nonretryable
 from .schemas import CandidateSelectionDraft
 
 
@@ -136,6 +136,7 @@ class LLMCandidateSelector:
             errors: list[str] = []
             accepted: CandidateSelection | None = None
             compact_context = False
+            rejected_request = False
             for attempt in range(1, self._max_attempts + 1):
                 llm_calls += 1
                 completion: LLMCompletion | None = None
@@ -178,6 +179,9 @@ class LLMCandidateSelector:
                         can_retry=attempt < self._max_attempts,
                     )
                     diagnostics.append(record)
+                    if request_is_nonretryable(error):
+                        rejected_request = True
+                        break
                     errors.append(repair_hint(error))
                     compact_context = record.recovery_action == "compact_context"
             if accepted is not None:
@@ -192,6 +196,14 @@ class LLMCandidateSelector:
                 )
                 for paper_id in expected_ids
             )
+            if rejected_request:
+                # An invalid provider request is not repaired by another batch.
+                # Preserve the scope partition conservatively without more API calls.
+                assessments.extend(CandidateAssessment(
+                    item.paper_id, CandidateDisposition.UNCERTAIN,
+                    "供应商拒绝筛选请求，尚未完成元数据评估。",
+                ) for item in metadata[offset + len(batch):])
+                break
         selection = CandidateSelection(
             scope_paper_ids=snapshot.paper_ids,
             assessments=tuple(assessments),

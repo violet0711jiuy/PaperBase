@@ -44,7 +44,7 @@ from .contracts import (
     RuntimeUnavailableAction,
 )
 from paperbase.llm.client import ValidationDiagnostic
-from paperbase.llm.diagnostics import failure_record, success_record
+from paperbase.llm.diagnostics import failure_record, success_record, request_is_nonretryable
 from .schemas import (
     AGENT_DECISION_ADAPTER,
     ActionDraft,
@@ -293,6 +293,8 @@ class LLMDecisionAgent:
                 record = replace(record, decision_iteration=state.budget_usage.agent_iterations + 1,
                                  decision_view_metrics=metrics)
                 diagnostics.append(record)
+                if request_is_nonretryable(error):
+                    break
                 if diagnostic is not None:
                     errors.append(diagnostic)
                 if record.recovery_action == "compact_context" or record.error_stage == "timeout":

@@ -23,6 +23,7 @@
 | Decision 覆盖视图 | `requirements[].answer_coverage` | 覆盖状态、Evidence IDs、gap，不重复正文，不是独立 Requirement 答案 |
 | 当前 checkpoint | `paperbase-agentic-grounded-answer-v2` | 旧语义版本不迁移执行 |
 | 完成回合审计 | `AgenticAuditSnapshot` | `grounded-answer-v2`，包含 retrieval、answer input、Evidence 引用与成本信息 |
+| 供应商请求拒绝 | `LLMRequestError` → `LLMCallRecord.validation_diagnostics` | `invalid_request` 区分参数/权限等不可原样重试的拒绝；只保存有限安全代码、参数路径与 HTTP/关键词摘要，不保存原始错误体 |
 
 关键区别：requested_requirement_ids 不是支持；answer_input_evidence_ids 不是引用；selected_evidence 等于整体正文实际引用 Evidence；Evidence 引用合法不代表整窗每个 chunk 已被回答。GroundedCitation、RequirementAnswer、accepted_answers、grounded_requirements 已废除，不以同名不同义字段兼容旧 checkpoint。
 

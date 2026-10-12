@@ -26,6 +26,7 @@ from paperbase.llm.diagnostics import (
     REQUEST_ERROR_STAGES,
     classify_llm_error,
     failure_record,
+    request_is_nonretryable,
     success_record,
 )
 from paperbase.prompts.answer_generation import (
@@ -231,22 +232,28 @@ class GroundedAnswerGenerator:
                 retryable_request = (
                     isinstance(error, LLMRequestError)
                     and error.error_stage in REQUEST_ERROR_STAGES
+                    and not request_is_nonretryable(error)
                     and request_retries < self._settings.request_error_retries
                 )
                 recovery = "retry_request" if retryable_request else "fallback"
-                diagnostics.append(
-                    replace(failure_record(
-                        node="generate_answer",
-                        attempt=attempt,
-                        error=error,
-                        completion=completion,
-                        can_retry=retryable_request,
-                        validation_diagnostics=_answer_validation_diagnostics(
-                            error, attempt=attempt,
-                            recovery_action=recovery,
-                        ),
-                    ), recovery_action=recovery)
+                record = failure_record(
+                    node="generate_answer",
+                    attempt=attempt,
+                    error=error,
+                    completion=completion,
+                    can_retry=retryable_request,
+                    validation_diagnostics=_answer_validation_diagnostics(
+                        error, attempt=attempt, recovery_action=recovery,
+                    ),
                 )
+                diagnostics.append(replace(
+                    record,
+                    recovery_action=recovery,
+                    validation_diagnostics=tuple(
+                        replace(item, recovery_action=recovery)
+                        for item in record.validation_diagnostics
+                    ),
+                ))
                 if retryable_request:
                     request_retries += 1
                     time.sleep(0.5 * (2 ** (attempt - 1)))

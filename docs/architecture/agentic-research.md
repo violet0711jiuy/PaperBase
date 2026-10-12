@@ -60,6 +60,9 @@ flowchart TD
 - `RequirementCoverage` 仅含 `requirement_id/evidence_ids/remaining_gap`：evidence_ids 是整体正文已回答该项所用的引用，必须是 citations 子集；无引用覆盖必须有 gap。status/complete 由这三个字段派生，不额外存储。
 - `RequirementAnswer`、`GroundedCitation`、per-Requirement answer/citations、`accepted_answers` 已废除。source_spans 工具仅供历史诊断，不参与当前模型输入、输出或完成判断；不再把词面术语匹配当作回答支持门。
 - `GroundedAnswerAttempt.citations` 不是完整输入集；完整快照另存于 `ResearchRunResult.answer_input_evidence_ids`。
+- 两种 Answer wire Schema 不发送服务端不支持的数组 `uniqueItems`；重复引用/覆盖 ID 仍由本地 validator 拒绝，不能静默去重后当作有效回答。
+- 请求拒绝与模型输出错误分开：明确不可重试的 400/401/403/404/405/413/415/422 标为 `invalid_request`，不原样重发，也不作为答案修复提示。Decision、Answer、Candidate Selection 与独立生成入口共用这一边界；Planner/Query Understanding 原有的请求失败降级策略保留。429、5xx、connection_error、timeout 仍保留各节点原有的有界恢复策略。
+- 供应商请求诊断复用 `LLMCallRecord.validation_diagnostics`：HTTP 状态、白名单 code、参数路径、关键词上下文，不保存任意外部错误正文。结构化业务输出字段、Qwen 参数、预算和 Golden 不因兼容修复改变。
 - `selected_evidence` 是实际引用集，不再表示一个独立 Selector 的产物。
 - `RequirementState.SATISFIED` 仅由当前 Evidence 快照上已校验的 Grounded Answer 产生；新 Evidence 会触发全量 Requirement 重评估。
 
