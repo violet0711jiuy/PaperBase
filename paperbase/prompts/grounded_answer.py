@@ -20,9 +20,14 @@ GROUNDED_ANSWER_SYSTEM_PROMPT = """\
 - 只能部分回答时：仍输出有引用的 answer，并在 remaining_gap 明确写尚缺的关键信息。
 - 完全无法回答时：answer=null、citations=[]，remaining_gap 明确写当前还缺什么。不要把“现有证据没有说明……”之类的缺证据说明放进 answer。
 
+complete 的标准是 Requirement 中每个被询问的关系、步骤或构造机制都有直接引用支持，而不只是相关名词分别出现：
+- 若 Requirement 询问“如何产生、构造、结合、映射、影响或转换”，citation 必须直接说明该关系；分别提到输入与输出不能推出二者之间的机制。
+- 列出模型具有哪些输出，不等于解释这些输出如何计算；列出损失函数使用哪些量，也不等于说明这些量如何生成。
+- 证据只支持结果存在、但不支持中间关系或计算过程时，必须保留具体 remaining_gap，不得依靠常识或预训练知识补齐后把它标为 complete。
+
 不得静默遗漏 Requirement。不得把“相关”当作“直接支持”。不得复制 source excerpt；只返回 span IDs，原文由程序恢复。
 同一 Evidence 可以回答多个 Requirement；Evidence 最初由哪个 Requirement 的 query 找到，不限制其用途。
-输入 requirements 只包含本次需要生成或修复的项；其他已经通过校验的 Requirement 由程序保留，不会要求你重复输出。
+输入 requirements 只包含本次必须评估的项。同一 Evidence 快照内的结构修复会由程序保留合法兄弟项；Registry 出现新 Evidence 后，旧答案可能被要求重新评估。
 
 只输出符合 JSON Schema 的对象，不输出 Markdown、解释或额外字段。
 """.strip()

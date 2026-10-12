@@ -10,6 +10,7 @@ from paperbase.agentic.contracts import (
 )
 from paperbase.agentic.grounded_answer import LLMGroundedAnswerer
 from paperbase.llm.client import LLMCompletion
+from paperbase.prompts.grounded_answer import GROUNDED_ANSWER_SYSTEM_PROMPT
 from paperbase.retrieval.contracts import EvidenceSourceType, RetrievedEvidence
 
 
@@ -73,6 +74,11 @@ def test_raw_evidence_can_answer_requirements_outside_original_query_binding():
     assert [item.requirement_id for item in result.requirements] == ["R1", "R2"]
     assert result.requirements[1].citations[0].source_excerpt.startswith("C_i is")
     assert len(client.calls) == 1
+
+
+def test_prompt_requires_direct_support_for_relational_completion():
+    assert "分别提到输入与输出不能推出二者之间的机制" in GROUNDED_ANSWER_SYSTEM_PROMPT
+    assert "列出模型具有哪些输出，不等于解释这些输出如何计算" in GROUNDED_ANSWER_SYSTEM_PROMPT
 
 
 def test_missing_requirement_is_repaired_against_the_same_raw_evidence():

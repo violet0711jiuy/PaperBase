@@ -17,7 +17,7 @@
 | Requirement 答案 | `GroundedAnswerAttempt.requirements` | 每项 answer+citation 或 remaining_gap |
 | 引用锚点 | `GroundedCitation` | Evidence ID + source span IDs；excerpt 由程序恢复 |
 | 实际引用集 | `GroundedAnswerAttempt.evidence_ids` | 只含真正被答案引用的 Evidence |
-| accepted answers | Graph state | 已通过本地引用校验的完成项，后续尝试不得修改 |
+| accepted answers | Graph state | 同一 Evidence 快照内用于 scoped repair/聚焦重读的合法完成项；新 Evidence 到达后不跨快照冻结 |
 | Requirement 状态 | `RequirementState` | satisfied 只表示已有已校验答案；否则按实际 gap/尝试状态派生 |
 | 对外答案 | `ResearchAnswer` | renderer 从已校验 RequirementAnswer 确定性生成 |
 | 当前 checkpoint | `paperbase-agentic-grounded-answer-v1` | 旧语义版本不迁移执行 |

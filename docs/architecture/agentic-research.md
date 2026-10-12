@@ -46,8 +46,8 @@ flowchart TD
 3. 工具结果经 Evidence Admission 和去重后进入 Registry；原始正文一直保留。Registry 快照只要出现尚未评估的新 Evidence，Graph 就直接进入 Grounded Answer，不让 metadata-only Decision 猜测证据是否充分。
 4. Grounded Answerer读取当前 Registry 的全部 Evidence。不存在旧的最终 Evidence 数量上限；`try_answer` 只保留为相同 Evidence 快照的一次受限聚焦重读。
 5. Answerer 只输出本次仍待处理的 required Requirement：能回答则引用 source spans；不能回答则输出具体 gap。若模型把“现有证据没有说明”写入无引用 answer，程序丢弃该段文字并保留 gap。
-6. 校验和提交以 Requirement 为单位。合法项立即进入本地 accepted 集合；repair 的 Schema 与 Prompt 只包含失败项，已接受项不再发送给模型，也不会因兄弟项失败而丢失。
-7. 若仍有 gap，Decision 只围绕实际 gap 决定是否继续检索。相同 Evidence Pool 允许一次聚焦重读，防止模型偶发漏读；再无进展则必须检索或停止。
+6. 校验和提交以 Requirement 为单位。同一次 Answer 调用的 repair 只包含失败项，合法兄弟项不会因局部结构错误而丢失；相同 Evidence 快照的聚焦重读也可保留已完成项。
+7. Registry 一旦新增 Evidence，上一快照的 complete 只是暂定结果，全部 required Requirements 必须重新评估。这样新证据可以暴露先前被遗漏的关系或构造机制，不能因一次过早 complete 永久冻结。若仍有 gap，Decision 只围绕实际 gap 决定是否继续检索；再无进展则必须检索或停止。
 
 ## 关键契约
 
@@ -58,7 +58,7 @@ flowchart TD
 - Requirement 中明确命名的符号或方法标识符（例如 `C_i`、`MLE-QV`、`MPIWcapt`）必须在至少一个引用原文 span 中出现。该规则只验证直接词面锚点，不替代语义 entailment 判断。
 - `GroundedAnswerAttempt.evidence_ids` 仅表示实际引用的 Evidence；完整输入快照另存于 `ResearchRunResult.answer_input_evidence_ids`。
 - `selected_evidence` 是实际引用集，不再表示一个独立 Selector 的产物。
-- `RequirementState.SATISFIED` 仅由已校验的 Grounded Answer 产生。
+- `RequirementState.SATISFIED` 仅由当前 Evidence 快照上已校验的 Grounded Answer 产生；新 Evidence 会触发全量 Requirement 重评估。
 
 ## Decision 输入
 

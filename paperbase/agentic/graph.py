@@ -1217,7 +1217,22 @@ def _generate_answer(
 
     previous = (load_contract(state["grounded_answer_attempt"], GroundedAnswerAttempt)
                 if state.get("grounded_answer_attempt") is not None else None)
-    accepted = tuple(item for item in previous.requirements if item.complete) if previous else ()
+    current_evidence_ids = tuple(record.evidence_id for record in registry.records)
+    previous_evidence_ids = tuple(state.get("answer_evidence_ids", ()))
+    # A validated sibling is stable only while the semantic input snapshot is
+    # unchanged.  Once new Evidence arrives, every required Requirement must
+    # be reassessed: a formerly plausible "complete" answer may have hidden a
+    # retrieval gap that the expanded pool now makes visible.  Requirement-
+    # scoped repair inside LLMGroundedAnswerer still preserves valid siblings.
+    same_evidence_snapshot = (
+        previous is not None
+        and previous_evidence_ids == current_evidence_ids
+    )
+    accepted = (
+        tuple(item for item in previous.requirements if item.complete)
+        if same_evidence_snapshot
+        else ()
+    )
     try:
         attempt = runtime.context.grounded_answerer.answer(
             question=context.resolved_query,
@@ -1240,7 +1255,7 @@ def _generate_answer(
         return {
             "answer": dump_contract(fallback, ResearchAnswer),
             "selected_evidence": dump_contract((), tuple[EvidenceRecord, ...]),
-            "answer_evidence_ids": [record.evidence_id for record in registry.records],
+            "answer_evidence_ids": list(current_evidence_ids),
             "llm_diagnostics": _append_llm_diagnostics(state, diagnostics),
             "error_codes": list(dict.fromkeys(
                 (*state.get("error_codes", []),
@@ -1262,11 +1277,11 @@ def _generate_answer(
     requirement_states = _states_from_grounded_answer(plan, attempt, terminal=terminal_requested)
     update: AgentGraphState = {
         "grounded_answer_attempt": dump_contract(attempt, GroundedAnswerAttempt),
-        "answer_evidence_ids": [record.evidence_id for record in registry.records],
+        "answer_evidence_ids": list(current_evidence_ids),
         "answer_attempt_count": (
             int(state.get("answer_attempt_count", 0)) + 1
             if tuple(state.get("answer_evidence_ids", ()))
-            == tuple(record.evidence_id for record in registry.records)
+            == current_evidence_ids
             else 1
         ),
         "answer": dump_contract(answer, ResearchAnswer),

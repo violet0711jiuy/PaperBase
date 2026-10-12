@@ -155,7 +155,7 @@ def test_reused_only_tool_result_returns_to_decision_without_automatic_answer() 
     assert result.budget_usage.llm_calls == 3
 
 
-def test_new_evidence_after_gap_is_answered_and_preserves_accepted_requirement() -> None:
+def test_new_evidence_after_gap_reassesses_all_requirements() -> None:
     plan = ResearchPlan("Explain width and coverage", (
         ResearchRequirement("R1", "Explain width", frozenset({EvidenceTarget.METHOD})),
         ResearchRequirement("R2", "Explain coverage", frozenset({EvidenceTarget.METHOD})),
@@ -231,9 +231,59 @@ def test_new_evidence_after_gap_is_answered_and_preserves_accepted_requirement()
     ).run("Explain width and coverage", selected_paper_ids=("P1",))
 
     assert result.status is ResearchRunStatus.COMPLETED
-    assert answerer.calls == [(('E1',), ()), (('E1', 'E2'), ('R1',))]
+    assert answerer.calls == [(('E1',), ()), (('E1', 'E2'), ())]
     assert result.answer_input_evidence_ids == ("E1", "E2")
     assert result.budget_usage.llm_calls == 2
+
+
+def test_same_evidence_reread_preserves_complete_siblings() -> None:
+    plan = ResearchPlan("Explain width and coverage", (
+        ResearchRequirement("R1", "Explain width", frozenset({EvidenceTarget.METHOD})),
+        ResearchRequirement("R2", "Explain coverage", frozenset({EvidenceTarget.METHOD})),
+    ))
+
+    class Planner:
+        def plan(self, context):
+            return PlannerResult(plan, False, 0)
+
+    class Answerer:
+        def __init__(self):
+            self.calls = []
+
+        def answer(self, *, question, plan, evidence, accepted_answers=()):
+            self.calls.append(tuple(item.requirement_id for item in accepted_answers))
+            r1 = RequirementAnswer(
+                "R1", "MPIWcapt narrows captured intervals.",
+                (GroundedCitation(
+                    "E1", ("S1",),
+                    "MPIWcapt averages intervals that capture the target.",
+                ),),
+            )
+            if len(self.calls) == 1:
+                return GroundedAnswerAttempt((
+                    r1,
+                    RequirementAnswer("R2", None, remaining_gap="Need coverage evidence."),
+                ), ("E1",))
+            return GroundedAnswerAttempt((
+                r1,
+                RequirementAnswer(
+                    "R2", "The same evidence describes target capture.",
+                    (GroundedCitation(
+                        "E1", ("S1",),
+                        "MPIWcapt averages intervals that capture the target.",
+                    ),),
+                ),
+            ), ("E1",))
+
+    answerer = Answerer()
+    result = _workflow(
+        (_search(), TryAnswerAction("focused reread")),
+        answerer,
+        planner=Planner(),
+    ).run("Explain width and coverage", selected_paper_ids=("P1",))
+
+    assert result.status is ResearchRunStatus.COMPLETED
+    assert answerer.calls == [(), ("R1",)]
 
 
 def test_stop_research_uses_answerer_to_return_explicit_gap() -> None:
